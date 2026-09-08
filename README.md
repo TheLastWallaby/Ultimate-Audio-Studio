@@ -37,6 +37,16 @@ pip install -r requirements.txt
 python simple_audio_clipper.py
 ```
 
+## Building the Executable
+
+To package a standalone Windows executable (`dist\Ultimate Audio Studio.exe`) locally using PyInstaller:
+
+```powershell
+.\build_exe.ps1
+```
+
+> **Note**: Requires genuine `ffmpeg.exe` and `ffprobe.exe` binaries (>10 MB) in the repository root or system PATH so PyInstaller can bundle them.
+
 ## License
 
 This project is licensed under the terms of the GNU General Public License v3 (GPL-3.0). See the [LICENSE](LICENSE) file for details.
