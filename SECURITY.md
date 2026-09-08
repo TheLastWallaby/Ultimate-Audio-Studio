@@ -6,18 +6,7 @@ This document outlines the security policies, architectural threat model, and in
 
 ---
 
-## 1. Supported Versions
-
-Only the current major/minor release series receives active security updates and dependency patches:
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.1.x   | :white_check_mark: |
-| < 1.1.0 | :x:                |
-
----
-
-## 2. Privacy & Data Governance (Zero-Telemetry)
+## 1. Privacy & Data Governance (Zero-Telemetry)
 
 Ultimate Audio Studio is designed with a strict offline-first, local-only architecture:
 - **Zero Telemetry / Analytics:** The application contains no tracking scripts, telemetry, or user behavior analytics.
@@ -26,7 +15,7 @@ Ultimate Audio Studio is designed with a strict offline-first, local-only archit
 
 ---
 
-## 3. Public Repository Auto-Update Architecture (Zero-Setup Updates)
+## 2. Public Repository Auto-Update Architecture (Zero-Setup Updates)
 
 ### Architectural Context
 Ultimate Audio Studio is hosted as an open-source public GitHub repository and distributed as a standalone Windows desktop executable. To deliver seamless in-place updates without requiring end users to reinstall software or manage dependencies manually:
@@ -43,14 +32,14 @@ To safeguard this update mechanism, the following mitigations are enforced:
 
 ---
 
-## 4. Subprocess Isolation & File Security
+## 3. Subprocess Isolation & File Security
 
 - **No Shell Execution:** All external tools (`ffmpeg`, `ffprobe`, `yt-dlp`) are invoked using explicit argument arrays (`shell=False`) with `CREATE_NO_WINDOW`, preventing command injection vulnerabilities.
 - **Path Traversal Sanitization:** Filenames from remote sources and user input are sanitized against path traversal (`..`), invalid NTFS/FAT32 characters, and Windows DOS reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
 
 ---
 
-## 5. Reporting a Vulnerability
+## 4. Reporting a Vulnerability
 
 If you discover a potential security vulnerability, please report it responsibly:
 
@@ -58,3 +47,4 @@ If you discover a potential security vulnerability, please report it responsibly
 - **Alternative:** Contact the repository maintainer directly via GitHub profile contact options.
 
 Please **do not** open public GitHub issues or discussions for sensitive security reports until they have been reviewed and resolved.
+
