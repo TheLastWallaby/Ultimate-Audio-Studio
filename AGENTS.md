@@ -134,11 +134,24 @@ flowchart LR
 - **Background Workflows**: Network downloads (`yt-dlp`) and audio encoding (`pydub.export`) must always run on background threads; never block the Tkinter main loop.
 
 ### C. Build & Packaging Requirements
+- **Local Executable Build**: Build a standalone Windows executable (`dist\Ultimate Audio Studio.exe`) via `.\build_exe.ps1`.
 - **Frozen Environment Support**: `pydub` and `yt-dlp` must locate bundled `ffmpeg.exe` and `ffprobe.exe` via `sys._MEIPASS` when frozen.
 - **PyInstaller Flags**: Build with `build_exe.ps1` using PyInstaller onefile, `--hidden-import audioop`, `collect_all` for `yt_dlp`, `upx=False`, and bundled `certifi` for SSL certs.
 - **Python 3.13 Support**: Requires `audioop-lts` and explicit `--hidden-import audioop`.
 
-### D. Auto-Updater & Security Governance
+### D. Release & Publishing Workflow
+- **Automated CI/CD Pipeline**: Releases are built and published automatically via GitHub Actions (`.github/workflows/release.yml`) on pushing a version tag.
+- **Step-by-Step Publishing**:
+  1. Update `app_version` in `app/core/config.py` (e.g. `app_version: str = Field(default="1.1.4")`).
+  2. Commit and push the version bump to `main`.
+  3. Create and push a matching Git tag:
+     ```bash
+     git tag v1.1.4
+     git push origin v1.1.4
+     ```
+  4. The release workflow installs dependencies, bundles real `ffmpeg.exe`/`ffprobe.exe`, packages `Ultimate Audio Studio.exe`, and drafts/publishes the GitHub Release with the executable attached.
+
+### E. Auto-Updater & Security Governance
 - **Non-blocking Startup**: Auto-update check (`check_latest_release()`) must run on a background thread on launch; never delay GUI presentation or audio playback.
 - **Public Asset Streaming**: Stream release assets via GitHub API `/releases/assets/{id}` or release download URLs. Always strip any `Authorization` headers when redirected to external S3 storage URLs.
 - **In-Place Executable Swap**: Rename running `sys.executable` to `.old`, move the new binary into place, spawn the updated `.exe`, and exit. Always clean up leftover `.old` binaries on subsequent launches.
