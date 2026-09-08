@@ -29,11 +29,10 @@ Ultimate Audio Studio is designed with a strict offline-first, local-only archit
 ## 3. Public Repository Auto-Update Architecture (Zero-Setup Updates)
 
 ### Architectural Context
-Ultimate Audio Studio is hosted as an open public GitHub repository and distributed as a standalone Windows desktop executable to non-technical users. To deliver seamless in-place updates without requiring end users to manually reinstall or configure Git/CLI tools:
+Ultimate Audio Studio is hosted as an open-source public GitHub repository and distributed as a standalone Windows desktop executable. To deliver seamless in-place updates without requiring end users to reinstall software or manage dependencies manually:
 
-- The application checks for new releases using GitHub's public REST API (`/releases/latest`).
-- **Zero Authentication Required:** Because the repository is public, release queries and asset downloads do not require Personal Access Tokens (PAT) or credentials.
-- Client executables can self-update out of the box on any Windows computer with zero configuration.
+- The application queries GitHub's public REST API (`/releases/latest`) over secure HTTPS to detect new releases.
+- Client executables automatically check for updates and self-update out of the box on Windows with zero setup or configuration required.
 
 ### Defense-in-Depth Safeguards
 To safeguard this update mechanism, the following mitigations are enforced:
