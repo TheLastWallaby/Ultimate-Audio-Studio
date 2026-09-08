@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultimate-audio-studio"
+version = "1.1.2"
+description = "Senior-friendly, linear-workflow desktop audio workstation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0" }
+dependencies = [
+    "pygame>=2.6",
+    "pydub>=0.25",
+    "yt-dlp>=2026.8.19",
+    "tinytag>=2.1",
+    "certifi",
+    "audioop-lts>=0.2.1; python_version>='3.13'",
+    "send2trash>=1.8",
+    "pyinstaller>=6.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = ["E501", "B008", "UP007"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

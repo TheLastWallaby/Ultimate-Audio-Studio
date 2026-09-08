@@ -1,0 +1,56 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install FFmpeg
+        run: |
+          choco install ffmpeg --no-progress
+          $realFfmpeg = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\ffmpeg" -Filter "ffmpeg.exe" -Recurse | Where-Object { $_.Length -gt 10MB } | Select-Object -First 1).FullName
+          $realFfprobe = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\ffmpeg" -Filter "ffprobe.exe" -Recurse | Where-Object { $_.Length -gt 10MB } | Select-Object -First 1).FullName
+          if (-not $realFfmpeg -or -not $realFfprobe) {
+            throw "Failed to locate genuine FFmpeg/FFprobe binaries in Chocolatey lib."
+          }
+          Copy-Item $realFfmpeg .\ffmpeg.exe -Force
+          Copy-Item $realFfprobe .\ffprobe.exe -Force
+          Write-Host "FFmpeg size: $((Get-Item .\ffmpeg.exe).Length)"
+          Write-Host "FFprobe size: $((Get-Item .\ffprobe.exe).Length)"
+
+      - name: Build Standalone Executable
+        run: |
+          .\build_exe.ps1
+
+      - name: Create GitHub Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Ultimate Audio Studio.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
