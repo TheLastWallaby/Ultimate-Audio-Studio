@@ -1,0 +1,10 @@
+pygame>=2.6
+pydub>=0.25
+yt-dlp>=2026.8.19
+tinytag>=2.1
+certifi
+audioop-lts>=0.2.1; python_version>='3.13'
+send2trash>=1.8
+pyinstaller>=6.0
+pydantic>=2.7.0
+pydantic-settings>=2.0.0

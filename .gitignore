@@ -1,0 +1,45 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*.class
+
+# PyInstaller / Build outputs
+build/
+dist/
+*.spec.bak
+*.bak
+
+# Large bundled binaries
+ffmpeg.exe
+ffprobe.exe
+*.zip
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs and local artifacts
+*.log
+.coverage
+.pytest_cache/
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+*.token
+app/update_auth.py
