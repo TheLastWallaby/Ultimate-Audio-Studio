@@ -11,7 +11,9 @@ hiddenimports = [
     'app.services.updater', 'app.ui.update_dialog', 'app.core.cache_manager',
     'app.controllers', 'app.controllers.library_controller', 'app.controllers.playback_controller',
     'app.controllers.playlist_controller', 'app.controllers.export_controller',
-    'app.controllers.download_controller', 'app.controllers.update_controller'
+    'app.controllers.download_controller', 'app.controllers.update_controller',
+    # app.main imports this dynamically to close the splash; PyInstaller only bundles it when listed.
+    'pyi_splash',
 ]
 
 for pkg in ('yt_dlp', 'yt_dlp_ejs', 'certifi', 'tinytag'):
@@ -35,9 +37,21 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Shown by the bootloader while the one-file .exe unpacks (several seconds on older PCs), so a
+# double-click gives immediate feedback instead of a second launch and an "Already running" message.
+# No live text: in one-file mode it would list every file being unpacked. app.main closes it.
+splash = Splash(
+    'assets/splash.png',
+    binaries=a.binaries,
+    datas=a.datas,
+    minify_script=True,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
+    splash.binaries,
     a.binaries,
     a.datas,
     [],

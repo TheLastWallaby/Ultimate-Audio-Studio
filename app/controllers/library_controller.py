@@ -55,7 +55,8 @@ class LibraryController:
 
     def __init__(self, app):
         self.app = app
-        self._pending_delete = None  # (orig_path, staging_path, filename, affected_playlists)
+        # Each entry: (orig_path, staging_path, filename, [(playlist_name, [indices])])
+        self._pending_deletes: list[tuple[str, str, str, list[tuple[str, list[int]]]]] = []
         self._search_index = {}
 
     def scan_files(self, folder):
@@ -66,10 +67,7 @@ class LibraryController:
             except Exception:
                 return []
         try:
-            return sorted(
-                [f for f in os.listdir(folder) if f.lower().endswith(AUDIO_EXTS)],
-                key=lambda s: s.lower()
-            )
+            return sorted([f for f in os.listdir(folder) if f.lower().endswith(AUDIO_EXTS)], key=lambda s: s.lower())
         except Exception as e:
             log_error(f"LibraryController.scan_files: {e}")
             return []
@@ -163,13 +161,36 @@ class LibraryController:
                     tracks[idx] = new_path
         return new_path
 
-    def stage_delete_with_undo(self, filepath, playlists):
-        """Stage file deletion by moving to a hidden undo directory so user can undo immediately.
+    def stage_delete_with_undo(self, filepath: str, playlists: dict[str, list[str]]) -> str:
+        """Stage one file for deletion (see ``stage_delete_many``); returns its file name."""
+        self.flush_pending_trash()
+        return self._stage_one_delete(filepath, playlists)
+
+    def stage_delete_many(
+        self, filepaths: list[str], playlists: dict[str, list[str]]
+    ) -> tuple[list[str], list[tuple[str, OSError]]]:
+        """Stage several files for deletion as one undoable batch.
+
+        Returns the staged file names and ``(file name, error)`` for files that could not be moved
+        (for example because another program has them open); those stay in the Library untouched.
+        """
+        self.flush_pending_trash()
+        staged: list[str] = []
+        failed: list[tuple[str, OSError]] = []
+        for filepath in filepaths:
+            try:
+                staged.append(self._stage_one_delete(filepath, playlists))
+            except OSError as e:
+                log_error(f"stage delete {filepath}: {e}")
+                failed.append((os.path.basename(filepath), e))
+        return staged, failed
+
+    def _stage_one_delete(self, filepath: str, playlists: dict[str, list[str]]) -> str:
+        """Move a file into a hidden undo area and take it out of the playlists (restorable by undo).
 
         The file keeps its real name inside a unique sub-folder, and is moved back to its original
         location before going to the Recycle Bin, so a later 'Restore' from the Bin works normally.
         """
-        self.flush_pending_trash()
         folder = os.path.dirname(filepath)
         filename = os.path.basename(filepath)
         staging_dir = os.path.join(folder, UNDO_DIR_NAME, uuid.uuid4().hex)
@@ -177,51 +198,58 @@ class LibraryController:
         _hide_path(os.path.join(folder, UNDO_DIR_NAME))
         staging_path = os.path.join(staging_dir, filename)
 
+        # Move first: if the file is locked, playlists must stay as they were.
+        try:
+            shutil.move(filepath, staging_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.rmdir(staging_dir)
+            raise
+
         # Remember playlists where this track was present
+        target = os.path.abspath(filepath).lower()
         affected_playlists = []
         for pl_name, tracks in playlists.items():
-            indices = [i for i, t in enumerate(tracks) if os.path.abspath(t).lower() == os.path.abspath(filepath).lower()]
+            indices = [i for i, t in enumerate(tracks) if os.path.abspath(t).lower() == target]
             if indices:
                 affected_playlists.append((pl_name, indices))
-                playlists[pl_name] = [t for t in tracks if os.path.abspath(t).lower() != os.path.abspath(filepath).lower()]
+                playlists[pl_name] = [t for t in tracks if os.path.abspath(t).lower() != target]
 
-        shutil.move(filepath, staging_path)
         self.invalidate_search_index(filepath)
-        self._pending_delete = (filepath, staging_path, filename, affected_playlists)
+        self._pending_deletes.append((filepath, staging_path, filename, affected_playlists))
         return filename
 
-    def undo_delete(self, playlists):
-        """Restore staged deleted file back to library and playlists."""
-        if not self._pending_delete:
+    def undo_delete(self, playlists: dict[str, list[str]]) -> bool:
+        """Restore the staged deleted file(s) back to the library and playlists."""
+        if not self._pending_deletes:
             return False
-        orig_path, staging_path, filename, affected_playlists = self._pending_delete
-        self._pending_delete = None
-        try:
-            if os.path.exists(staging_path):
-                shutil.move(staging_path, orig_path)
-                with contextlib.suppress(OSError):
-                    os.rmdir(os.path.dirname(staging_path))
-            self.invalidate_search_index(orig_path)
-            # Restore into playlists
-            for pl_name, indices in affected_playlists:
-                if pl_name in playlists:
-                    for idx in indices:
-                        if idx <= len(playlists[pl_name]):
-                            playlists[pl_name].insert(idx, orig_path)
-                        else:
-                            playlists[pl_name].append(orig_path)
-            return True
-        except Exception as e:
-            log_error(f"undo_delete: {e}")
-            return False
+        pending, self._pending_deletes = self._pending_deletes, []
+        restored = False
+        # Newest first, so playlist positions are restored in the reverse order they were removed.
+        for orig_path, staging_path, _filename, affected_playlists in reversed(pending):
+            try:
+                if os.path.exists(staging_path):
+                    shutil.move(staging_path, orig_path)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(os.path.dirname(staging_path))
+                self.invalidate_search_index(orig_path)
+                for pl_name, indices in affected_playlists:
+                    if pl_name in playlists:
+                        for idx in indices:
+                            if idx <= len(playlists[pl_name]):
+                                playlists[pl_name].insert(idx, orig_path)
+                            else:
+                                playlists[pl_name].append(orig_path)
+                restored = True
+            except Exception as e:
+                log_error(f"undo_delete: {e}")
+        return restored
 
-    def flush_pending_trash(self):
-        """Commit pending staged delete to Windows Recycle Bin."""
-        if not self._pending_delete:
-            return
-        orig_path, staging_path, _fname, _aff = self._pending_delete
-        self._pending_delete = None
-        _trash_staged_file(staging_path, orig_path)
+    def flush_pending_trash(self) -> None:
+        """Commit pending staged deletes to the Windows Recycle Bin."""
+        pending, self._pending_deletes = self._pending_deletes, []
+        for orig_path, staging_path, _fname, _aff in pending:
+            _trash_staged_file(staging_path, orig_path)
 
     @staticmethod
     def recover_stranded_deletes(folder):
@@ -244,6 +272,7 @@ class LibraryController:
 
     def import_external_files(self, planned_copies, is_shutting_down_fn, on_done):
         """Copy external files into library folder in background thread."""
+
         def _worker():
             copied = 0
             for src, dest in planned_copies:

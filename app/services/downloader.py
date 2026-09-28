@@ -47,7 +47,7 @@ def _js_runtime_opts() -> dict[str, Any]:
     return {"js_runtimes": {"deno": {"path": deno_bin}}} if deno_bin else {}
 
 
-def resolve_download_query(query):
+def resolve_download_query(query: str) -> tuple[str, bool]:
     """Detect whether input is a direct URL or a search phrase."""
     q = query.strip()
     if not YOUTUBE_RE.search(q) and not q.lower().startswith(("http://", "https://")):
@@ -55,7 +55,7 @@ def resolve_download_query(query):
     return q, False
 
 
-def is_playlist_url(query):
+def is_playlist_url(query: str) -> bool:
     """Check if query is a YouTube URL referencing a playlist."""
     q = query.strip()
     if not (YOUTUBE_RE.search(q) or q.lower().startswith(("http://", "https://"))):
@@ -63,7 +63,7 @@ def is_playlist_url(query):
     return "list=" in q or "/playlist" in q
 
 
-def probe_playlist_info(url):
+def probe_playlist_info(url: str) -> dict[str, Any] | None:
     """Retrieve playlist title and item count using flat metadata extraction."""
     ydl_opts = {
         "extract_flat": True,
@@ -279,7 +279,7 @@ def fetch_preview_worker(
         on_error(str(e))
 
 
-def cleanup_partial_downloads(library_folder):
+def cleanup_partial_downloads(library_folder: str) -> None:
     """Remove stranded .part and .temp files from incomplete downloads."""
     try:
         if os.path.exists(library_folder):
@@ -403,21 +403,26 @@ def download_audio_worker(target_url, library_folder, cancel_event, on_progress,
 
 
 def download_playlist_worker(
-    entries,
-    library_folder,
-    cancel_event,
-    on_track_start=None,
-    on_track_progress=None,
-    on_track_finished=None,
-    on_batch_complete=None,
-    on_cancelled=None,
-    on_error=None,
-):
-    """Sequentially download each track in a playlist with per-track and overall progress reporting."""
+    entries: list[dict[str, Any]],
+    library_folder: str,
+    cancel_event: threading.Event,
+    on_track_start: Callable[[int, int, str], None] | None = None,
+    on_track_progress: Callable[[int, int, float, str, str], None] | None = None,
+    on_track_finished: Callable[[int, int, str], None] | None = None,
+    on_batch_complete: Callable[[list[str], int], None] | None = None,
+    on_cancelled: Callable[[], None] | None = None,
+    on_error: Callable[[str], None] | None = None,
+    on_track_failed: Callable[[int, int, str, str], None] | None = None,
+) -> None:
+    """Sequentially download each track in a playlist with per-track and overall progress reporting.
+
+    A track that cannot be downloaded is reported through ``on_track_failed(idx, total, title, error)``
+    and the batch continues with the next track.
+    """
     os.makedirs(library_folder, exist_ok=True)
     os.makedirs(YT_CACHE_DIR, exist_ok=True)
     total_tracks = len(entries)
-    downloaded_files = []
+    downloaded_files: list[str] = []
 
     try:
         for idx, entry in enumerate(entries, 1):
@@ -428,27 +433,31 @@ def download_playlist_worker(
 
             vid_id = entry.get("id")
             url = entry.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
+            track_title = entry.get("title") or f"Track {idx}"
             if not url:
+                if on_track_failed:
+                    on_track_failed(idx, total_tracks, track_title, "This playlist entry has no video link.")
                 continue
 
-            track_title = entry.get("title") or f"Track {idx}"
             if on_track_start:
                 on_track_start(idx, total_tracks, track_title)
 
-            track_file = [None]
+            track_file: list[str | None] = [None]
+            track_error: list[str | None] = [None]
 
-            def _prog(pct, spd, eta, _fin, current_idx=idx):
+            def _prog(pct: float, spd: str, eta: str, _fin: bool, current_idx: int = idx) -> None:
                 if on_track_progress:
                     on_track_progress(current_idx, total_tracks, pct, spd, eta)
 
-            def _succ(fname, tf=track_file):
+            def _succ(fname: str, tf: list[str | None] = track_file) -> None:
                 tf[0] = fname
 
-            def _canc():
+            def _canc() -> None:
                 pass
 
-            def _fail(err, current_idx=idx):
+            def _fail(err: str, current_idx: int = idx, te: list[str | None] = track_error) -> None:
                 log_error(f"download_playlist_worker track {current_idx} failed: {err}")
+                te[0] = err
 
             download_audio_worker(url, library_folder, cancel_event, _prog, _succ, _canc, _fail)
 
@@ -457,10 +466,13 @@ def download_playlist_worker(
                     on_cancelled()
                 return
 
-            if track_file[0]:
-                downloaded_files.append(track_file[0])
+            finished_file = track_file[0]
+            if finished_file:
+                downloaded_files.append(finished_file)
                 if on_track_finished:
-                    on_track_finished(idx, total_tracks, track_file[0])
+                    on_track_finished(idx, total_tracks, finished_file)
+            elif on_track_failed:
+                on_track_failed(idx, total_tracks, track_title, track_error[0] or "Unknown error")
 
         if on_batch_complete:
             on_batch_complete(downloaded_files, total_tracks)
