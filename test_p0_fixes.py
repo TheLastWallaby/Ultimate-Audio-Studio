@@ -176,7 +176,9 @@ class TestModelMappingProtocolAndCacheMetadata(unittest.TestCase):
             self.assertEqual(app.btn_cancel_dl.cget("state"), tk.DISABLED)
             self.assertFalse(app.prog_download.winfo_ismapped())
             self.assertFalse(app.lbl_dl_metrics.winfo_ismapped())
-            mock_info.assert_called_once()
+            # Success is confirmed in the status bar instead of a blocking pop-up.
+            mock_info.assert_not_called()
+            self.assertIn("Download complete", app.status.cget("text"))
         finally:
             app.on_close()
 
@@ -199,7 +201,8 @@ class TestModelMappingProtocolAndCacheMetadata(unittest.TestCase):
             self.assertEqual(app.btn_save_clip.cget("text"), "💾 Save Clip")
             self.assertEqual(app.btn_save_clip.cget("state"), tk.NORMAL)
             self.assertIn("test_clip_song.mp3", app.library_files)
-            mock_info.assert_called_once()
+            mock_info.assert_not_called()
+            self.assertIn("Clip saved", app.status.cget("text"))
         finally:
             if os.path.exists(test_file):
                 try:

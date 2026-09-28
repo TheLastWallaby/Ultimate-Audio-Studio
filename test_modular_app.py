@@ -1,11 +1,14 @@
 """Automated test suite verifying modular architecture and business logic."""
 
+import hashlib
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
-from app.config import atomic_save_json, format_time, sanitize_filename
+from app.config import PREVIEW_CACHE_DIR, atomic_save_json, format_time, sanitize_filename
 from app.core.audio_engine import AudioEngine
 from app.core.waveform import (
     _samples_to_peaks,
@@ -14,7 +17,7 @@ from app.core.waveform import (
     time_from_waveform_x,
     time_to_waveform_x,
 )
-from app.services.downloader import resolve_download_query
+from app.services.downloader import fetch_preview_audio, fetch_preview_worker, resolve_download_query, search_youtube
 
 
 class TestAppConfig(unittest.TestCase):
@@ -72,11 +75,6 @@ class TestWaveformMath(unittest.TestCase):
         # Inversion X to Time
         t_mid = time_from_waveform_x(300.0, width, b_s, b_e)
         self.assertAlmostEqual(t_mid, 50.0)
-
-
-from unittest.mock import patch
-
-from app.services.downloader import search_youtube
 
 
 class TestDownloaderRouting(unittest.TestCase):
@@ -138,13 +136,6 @@ class TestAudioEngine(unittest.TestCase):
         self.assertIsNotNone(engine.play_clock_origin)
         elapsed = engine.current_play_seconds()
         self.assertGreaterEqual(elapsed, 15.0)
-
-
-import hashlib
-import threading
-
-from app.config import PREVIEW_CACHE_DIR
-from app.services.downloader import fetch_preview_audio, fetch_preview_worker
 
 
 class TestPreviewService(unittest.TestCase):
@@ -618,8 +609,8 @@ class TestPhase2ApprovedEnhancements(unittest.TestCase):
             self.assertTrue(restarted)
             mock_engine.load_and_play.assert_called_with("song.mp3", 10.0)
 
-    def test_item8_always_320k_mp3_clip(self):
-        """Item 8: Clipping strictly forces 320 kbps MP3 output with album art preservation."""
+    def test_item8_clip_is_vbr_v2_mp3(self):
+        """Item 8: Clips are encoded as VBR V2 MP3 (like downloads) with album art preservation."""
         from unittest.mock import MagicMock
 
         from app.services.clipper import clip_audio_worker
@@ -633,11 +624,11 @@ class TestPhase2ApprovedEnhancements(unittest.TestCase):
             clip_audio_worker("source.wav", 15.0, 30.0, "output.mp3", soften=False, gain_db=0.0)
             self.assertTrue(mock_ffmpeg.called)
             cmd = mock_ffmpeg.call_args[0][0]
-            # Verify libmp3lame, 320k, and id3v2.3
+            # Verify libmp3lame at VBR V2 (same quality as downloads), and id3v2.3
             self.assertIn("-c:a", cmd)
             self.assertIn("libmp3lame", cmd)
-            self.assertIn("-b:a", cmd)
-            self.assertIn("320k", cmd)
+            self.assertEqual(cmd[cmd.index("-q:a") + 1], "2")
+            self.assertNotIn("320k", cmd)
             self.assertIn("-id3v2_version", cmd)
             self.assertIn("3", cmd)
 

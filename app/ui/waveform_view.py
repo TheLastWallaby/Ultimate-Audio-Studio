@@ -293,9 +293,8 @@ class WaveformView:
         if (self.app.is_playing_main or self.app.is_playing_playlist) and not self.app.is_paused:
             self.app._seek_playback(target_sec)
         else:
-            self.app.play_start_offset = target_sec
-            if self.app.is_paused:
-                self.app._scrubbed_while_paused = True
+            # The controller records the paused position, so Resume continues from the clicked spot.
+            self.app.playback_ctrl.seek(target_sec, self.app.track_duration)
 
     def on_drag(self, event):
         if not self.app.selected_file_path or self.app.track_duration <= 0:
@@ -350,6 +349,5 @@ class WaveformView:
         if (self.app.is_playing_main or self.app.is_playing_playlist) and not self.app.is_paused:
             self.app._seek_playback(target_sec)
         else:
-            self.app.play_start_offset = target_sec
-            if self.app.is_paused:
-                self.app._scrubbed_while_paused = True
+            # The controller records the paused position, so Resume continues from the clicked spot.
+            self.app.playback_ctrl.seek(target_sec, self.app.track_duration)

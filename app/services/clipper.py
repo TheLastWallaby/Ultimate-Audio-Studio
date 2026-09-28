@@ -8,6 +8,10 @@ from pydub import AudioSegment
 
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
 
+# LAME VBR V2 (~190 kbps), the same quality as downloads and USB export: a clip of a YouTube-sourced
+# song gains nothing from 320 kbps CBR except a ~1.7x larger file.
+MP3_VBR_QUALITY = "2"
+
 
 def create_audition_slice(filepath, s_time, e_time, gain_db=0.0, soften=False, fade_sec=1.5):
     """Generate a temporary rendered preview slice with volume boost and fade applied for 'Test Clip'."""
@@ -109,8 +113,8 @@ def clip_audio_worker(
                 "3",
                 "-c:a",
                 "libmp3lame",
-                "-b:a",
-                "320k",
+                "-q:a",
+                MP3_VBR_QUALITY,
             ]
         args.append(tmp_save)
         result = run_ffmpeg(args)
@@ -139,8 +143,8 @@ def clip_audio_worker(
                 "3",
                 "-c:a",
                 "libmp3lame",
-                "-b:a",
-                "320k",
+                "-q:a",
+                MP3_VBR_QUALITY,
                 tmp_save,
             ]
             result = run_ffmpeg(args_retry)
@@ -160,7 +164,7 @@ def clip_audio_worker(
             if wav:
                 clipped.export(tmp_save, format="wav")
             else:
-                clipped.export(tmp_save, format="mp3", bitrate="320k")
+                clipped.export(tmp_save, format="mp3", parameters=["-q:a", MP3_VBR_QUALITY])
 
         if not os.path.exists(tmp_save) or os.path.getsize(tmp_save) == 0:
             raise RuntimeError("Audio clipping produced an empty file.")

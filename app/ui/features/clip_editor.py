@@ -1,0 +1,352 @@
+"""Step 2 clipping: start/end markers, nudges, gain, fades, Test Clip and Save Clip."""
+
+from __future__ import annotations
+
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+
+from app.config import format_time, log_error
+from app.core.cache_manager import cache_mgr
+from app.core.task_manager import task_mgr
+from app.core.time_utils import parse_time
+from app.services.clipper import clip_audio_worker
+from app.ui.error_dialog import show_friendly_error
+from app.ui.features.base import AppBase
+from app.ui.theme import COLOR_DOWNLOAD, TEXT_DARK
+
+
+class ClipEditorMixin(AppBase):
+    """Step 2 clipping: start/end markers, nudges, gain, fades, Test Clip and Save Clip."""
+
+    def on_gain_change(self, val: str | float) -> None:
+        v = float(val)
+        sign = "+" if v > 0 else ""
+        self.lbl_gain.config(text=f"Volume Boost: {sign}{v:.1f} dB")
+        if abs(v) > 0.05:
+            self.lbl_gain.config(fg=COLOR_DOWNLOAD)
+        else:
+            self.lbl_gain.config(fg=TEXT_DARK)
+
+    def reset_gain(self) -> None:
+        self.scale_gain.set(0.0)
+        self.lbl_gain.config(text="Volume Boost: 0 dB", fg=TEXT_DARK)
+
+    def nudge_clip_start(self, delta: float) -> None:
+        if not self.selected_file_path:
+            return
+        new_val = self.playback_ctrl.nudge_start(delta, self.clip_start_sec, self.clip_end_sec)
+        self.clip_start_sec = new_val
+        self._updating_ui = True
+        is_frac = not float(new_val).is_integer()
+        self.lbl_start_time.config(text=f"Start: {format_time(new_val, include_fractional=is_frac)}")
+        self._updating_ui = False
+        self._update_clip_length_label()
+        self._render_waveform()
+        self.set_status(f"Clip start set to {format_time(new_val, include_fractional=is_frac)}.")
+
+    def nudge_clip_end(self, delta: float) -> None:
+        if not self.selected_file_path:
+            return
+        max_dur = self.track_duration if self.track_duration > 0 else 999999
+        new_val = self.playback_ctrl.nudge_end(delta, self.clip_start_sec, self.clip_end_sec, max_dur)
+        self.clip_end_sec = new_val
+        self._updating_ui = True
+        is_frac = not float(new_val).is_integer()
+        self.lbl_end_time.config(text=f"End: {format_time(new_val, include_fractional=is_frac)}")
+        self._updating_ui = False
+        self._update_clip_length_label()
+        self._render_waveform()
+        self.set_status(f"Clip end set to {format_time(new_val, include_fractional=is_frac)}.")
+
+    def _update_clip_length_label(self) -> None:
+        dur = max(0.0, self.clip_end_sec - self.clip_start_sec)
+        is_frac = (
+            not float(dur).is_integer()
+            or not float(self.clip_start_sec).is_integer()
+            or not float(self.clip_end_sec).is_integer()
+        )
+        self.lbl_clip_len.config(text=f"Clip: {format_time(dur, include_fractional=is_frac)}")
+
+    def set_start_here(self) -> None:
+        if not self.selected_file_path:
+            self.set_status("Select a song in the Library first to set clip start.")
+            return
+        curr = max(0.0, min(self.track_duration, float(self.scale_progress.get())))
+        self.clip_start_sec = curr
+        if self.clip_start_sec >= self.clip_end_sec:
+            self.clip_end_sec = self.track_duration
+            self.lbl_end_time.config(text=f"End: {format_time(self.clip_end_sec)}")
+        is_frac = not float(curr).is_integer()
+        self.lbl_start_time.config(text=f"Start: {format_time(curr, include_fractional=is_frac)}")
+        self._update_clip_length_label()
+        self._render_waveform()
+        self.set_status(f"Clip start set to {format_time(curr, include_fractional=is_frac)}.")
+
+    def set_end_here(self) -> None:
+        if not self.selected_file_path:
+            self.set_status("Select a song in the Library first to set clip end.")
+            return
+        curr = max(0.0, min(self.track_duration, float(self.scale_progress.get())))
+        self.clip_end_sec = curr
+        if self.clip_end_sec <= self.clip_start_sec:
+            self.clip_start_sec = 0.0
+            self.lbl_start_time.config(text="Start: 00:00")
+        is_frac = not float(curr).is_integer()
+        self.lbl_end_time.config(text=f"End: {format_time(curr, include_fractional=is_frac)}")
+        self._update_clip_length_label()
+        self._render_waveform()
+        self.set_status(f"Clip end set to {format_time(curr, include_fractional=is_frac)}.")
+
+    def _parse_time_input(self, text: str | None) -> float | None:
+        """Parse MM:SS, M:SS, MM:SS.s, HH:MM:SS or raw seconds; None when invalid or negative."""
+        return parse_time(text)
+
+    def edit_start_time(self) -> None:
+        if not self.selected_file_path:
+            self.set_status("Select a song in the Library first to edit clip start.")
+            return
+        curr_str = format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer())
+        inp = simpledialog.askstring(
+            "Set Clip Start",
+            f"Enter new Start time for clip (e.g. 01:23, 01:23.5, or 83.5):\nMax allowed: {format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())}",
+            initialvalue=curr_str,
+            parent=self.root,
+        )
+        if inp is None:
+            return
+        val = self._parse_time_input(inp)
+        if val is None:
+            messagebox.showwarning("Invalid Time", "Please enter a valid time (e.g. '01:30' or '90').")
+            return
+        if val >= self.clip_end_sec:
+            messagebox.showwarning(
+                "Invalid Range",
+                f"Clip Start must be before Clip End ({format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())}).",
+            )
+            return
+        self.clip_start_sec = max(0.0, val)
+        is_frac = not float(self.clip_start_sec).is_integer()
+        self.lbl_start_time.config(text=f"Start: {format_time(self.clip_start_sec, include_fractional=is_frac)}")
+        self._update_clip_length_label()
+        self._render_waveform()
+        self.set_status(f"Clip start set to {format_time(self.clip_start_sec, include_fractional=is_frac)}.")
+
+    def edit_end_time(self) -> None:
+        if not self.selected_file_path:
+            self.set_status("Select a song in the Library first to edit clip end.")
+            return
+        curr_str = format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())
+        inp = simpledialog.askstring(
+            "Set Clip End",
+            f"Enter new End time for clip (e.g. 02:45, 02:45.5, or 165.5):\nSong total length: {format_time(self.track_duration)}",
+            initialvalue=curr_str,
+            parent=self.root,
+        )
+        if inp is None:
+            return
+        val = self._parse_time_input(inp)
+        if val is None:
+            messagebox.showwarning("Invalid Time", "Please enter a valid time (e.g. '02:45' or '165').")
+            return
+        if val <= self.clip_start_sec:
+            messagebox.showwarning(
+                "Invalid Range",
+                f"Clip End must be after Clip Start ({format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer())}).",
+            )
+            return
+        max_limit = self.track_duration if self.track_duration > 0 else 999999
+        self.clip_end_sec = min(max_limit, val)
+        is_frac = not float(self.clip_end_sec).is_integer()
+        self.lbl_end_time.config(text=f"End: {format_time(self.clip_end_sec, include_fractional=is_frac)}")
+        self._update_clip_length_label()
+        self._render_waveform()
+        self.set_status(f"Clip end set to {format_time(self.clip_end_sec, include_fractional=is_frac)}.")
+
+    def _get_fade_sec(self) -> float:
+        choice = self.fade_choice_var.get() if hasattr(self, "fade_choice_var") else ""
+        if "0.5s" in choice:
+            return 0.5
+        elif "3.0s" in choice:
+            return 3.0
+        return 1.5
+
+    def test_clip(self) -> None:
+        if not self.selected_file_path:
+            messagebox.showwarning("No Song", "Click a song in the Library first.")
+            return
+        s_time = self.clip_start_sec
+        e_time = self.clip_end_sec
+        if s_time >= e_time:
+            messagebox.showwarning("Invalid Range", "Clip End must be after Clip Start.")
+            return
+        self.stop_audio()
+
+        soften = bool(self.soften_clip.get()) if hasattr(self, "soften_clip") else False
+        gain_db = float(self.scale_gain.get()) if hasattr(self, "scale_gain") else 0.0
+        fade_sec = self._get_fade_sec()
+        loop = bool(self.loop_clip.get()) if hasattr(self, "loop_clip") else False
+
+        path = self.selected_file_path
+        token = object()
+        self._pending_play_token = token
+        self.set_busy(True, "Preparing your clip preview...")
+
+        def _prepare() -> None:
+            # Both steps can run FFmpeg for seconds, so they stay off the Tkinter thread.
+            self.audio_engine.get_playable_audio_path(path)
+            slice_path = self.playback_ctrl.prepare_audition(path, s_time, e_time, gain_db, soften, fade_sec)
+            self._safe_after(0, _start, slice_path)
+
+        def _start(slice_path: str | None) -> None:
+            if self._pending_play_token is not token or self.selected_file_path != path:
+                self.playback_ctrl.discard_audition(slice_path)
+                return
+            self._pending_play_token = None
+            self.set_busy(False)
+            self._start_test_clip(path, s_time, e_time, slice_path, gain_db, soften, fade_sec, loop)
+
+        task_mgr.submit_task(_prepare)
+
+    def _start_test_clip(
+        self,
+        path: str,
+        s_time: float,
+        e_time: float,
+        slice_path: str | None,
+        gain_db: float,
+        soften: bool,
+        fade_sec: float,
+        loop: bool,
+    ) -> None:
+        try:
+            self.playback_ctrl.start_audition(path, s_time, e_time, slice_path, loop=loop)
+            self._is_audition_slice = self.playback_ctrl._is_audition_slice
+            self._audition_slice_file = self.playback_ctrl._audition_slice_file
+            self.is_playing_main = True
+            self.previewing_clip = True
+            self.clip_end_time = e_time
+            self._set_card_playing_state("playing")
+            self._updating_ui = True
+            self.scale_progress.set(s_time)
+            self._updating_ui = False
+            self._render_waveform()
+
+            notes = []
+            if abs(gain_db) > 0.05:
+                notes.append(f"{gain_db:+.1f}dB boost")
+            if soften:
+                notes.append(f"{fade_sec:.1f}s smooth fade")
+            if loop:
+                notes.append("loop on")
+            note_str = f" ({', '.join(notes)})" if notes else ""
+            self.set_status(f"Previewing clip from {format_time(s_time)} to {format_time(e_time)}{note_str}.", icon="▶")
+        except Exception as e:
+            log_error(f"test_clip: {e}")
+            show_friendly_error(self.root, e, "playback")
+
+    def _restart_clip_loop(self) -> bool:
+        s_time = self.clip_start_sec
+        if self.playback_ctrl.restart_clip_loop():
+            self._updating_ui = True
+            self.scale_progress.set(s_time)
+            self._updating_ui = False
+            self.set_status(
+                f"Looping clip preview ({format_time(s_time)} - {format_time(self.clip_end_sec)})...", icon="🔁"
+            )
+            return True
+        else:
+            self.stop_audio(user=False)
+            return False
+
+    def save_clip(self) -> None:
+        if not self.selected_file_path:
+            messagebox.showwarning("No Song", "Click a song in the Library first.")
+            return
+        s_time = self.clip_start_sec
+        e_time = self.clip_end_sec
+        if s_time >= e_time:
+            messagebox.showwarning("Invalid Range", "Clip End must be after Clip Start.")
+            return
+
+        dur = e_time - s_time
+        base, _ext = os.path.splitext(os.path.basename(self.selected_file_path))
+        def_name = f"{base}_clip_{int(dur)}s.mp3"
+
+        save_name = filedialog.asksaveasfilename(
+            initialdir=self.library_folder,
+            initialfile=def_name,
+            defaultextension=".mp3",
+            filetypes=[("MP3 Audio (*.mp3)", "*.mp3")],
+            title="Save Your Clip",
+            parent=self.root,
+        )
+        if not save_name:
+            return
+
+        if not save_name.lower().endswith(".mp3"):
+            save_name += ".mp3"
+
+        is_self_overwrite = os.path.abspath(save_name).lower() == os.path.abspath(self.selected_file_path).lower()
+        if is_self_overwrite:
+            confirm = messagebox.askyesno(
+                "Confirm Overwrite",
+                f"You are about to overwrite the original song file:\n\n'{os.path.basename(save_name)}'\n\n"
+                "A backup of the original will be saved automatically as:\n"
+                f"'{os.path.basename(save_name)}.original.bak'\n\nDo you want to proceed?",
+            )
+            if not confirm:
+                return
+
+        self.stop_audio()
+        self._release_audio_file()
+
+        soften = bool(self.soften_clip.get()) if hasattr(self, "soften_clip") else False
+        gain_db = float(self.scale_gain.get()) if hasattr(self, "scale_gain") else 0.0
+        fade_sec = self._get_fade_sec()
+
+        self._saving_clip = True
+        self.btn_save_clip.config(text="Saving...", state=tk.DISABLED)
+        self.set_busy(True, "Trimming and saving your clip...")
+
+        def _on_succ(name: str, full_path: str, was_self_ovw: bool) -> None:
+            self._safe_after(0, self._save_success, name, full_path, was_self_ovw)
+
+        def _on_err(err: str) -> None:
+            self._safe_after(0, self._save_error, err)
+
+        task_mgr.submit_task(
+            clip_audio_worker,
+            self.selected_file_path,
+            s_time,
+            e_time,
+            save_name,
+            soften,
+            gain_db,
+            is_self_overwrite,
+            _on_succ,
+            _on_err,
+            fade_sec=fade_sec,
+        )
+
+    def _save_success(self, name: str, full_path: str, was_self_overwrite: bool) -> None:
+        self._saving_clip = False
+        self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
+        self.set_busy(False)
+        cache_mgr.invalidate(full_path)
+        if hasattr(self, "library_ctrl"):
+            self.library_ctrl.invalidate_search_index(full_path)
+        self._art_cache.pop(full_path, None)
+        self.refresh_library(select_name=name)
+        if was_self_overwrite and self.selected_file_path == full_path:
+            self._load_track_ui(full_path, name)
+        if was_self_overwrite:
+            self.notify_success(f"Clip saved! The original was backed up as '{name}.original.bak'.", icon="💾")
+        else:
+            self.notify_success("Clip saved! It is highlighted in your Library on the left.", icon="💾")
+
+    def _save_error(self, err: str) -> None:
+        self._saving_clip = False
+        self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
+        self.set_busy(False, "Could not save clip.")
+        show_friendly_error(self.root, err, "save_clip")
