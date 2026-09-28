@@ -1,12 +1,16 @@
 """Platform utilities: Windows subprocess silencing, DPI, single-instance mutex, USB queries, and Drag-and-Drop."""
 
 import ctypes
+import logging
 import os
 import subprocess
+import time
 from typing import Any
 
 from app.core.config import get_settings
 from app.models import DriveInfo
+
+logger = logging.getLogger(__name__)
 
 _orig_popen: Any = subprocess.Popen
 
@@ -207,10 +211,179 @@ def list_removable_drives():
     return drives
 
 
-def safely_eject_usb_drive(drive_root):
-    """Safely flush buffers and dismount/eject a USB drive so it can be physically unplugged.
+_IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
+_GUID_DEVINTERFACE_DISK = "{53f56307-b6bf-11d0-94f2-00a0c91efb8b}"
+_DIGCF_PRESENT = 0x02
+_DIGCF_DEVICEINTERFACE = 0x10
+_CR_SUCCESS = 0
+_PNP_VETO_OUTSTANDING_OPEN = 6
+_EJECT_ATTEMPTS = 3
 
-    Returns (success: bool, message: str).
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("ClassGuid", _GUID),
+        ("DevInst", ctypes.c_ulong),
+        ("Reserved", ctypes.c_void_p),
+    ]
+
+
+class _SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("InterfaceClassGuid", _GUID),
+        ("Flags", ctypes.c_ulong),
+        ("Reserved", ctypes.c_void_p),
+    ]
+
+
+class _STORAGE_DEVICE_NUMBER(ctypes.Structure):
+    _fields_ = [
+        ("DeviceType", ctypes.c_ulong),
+        ("DeviceNumber", ctypes.c_ulong),
+        ("PartitionNumber", ctypes.c_ulong),
+    ]
+
+
+def _get_storage_device_number(device_path: str) -> tuple[int, int] | None:
+    """Return (DeviceType, DeviceNumber) for a volume (\\\\.\\E:) or disk interface path."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.DeviceIoControl.restype = wintypes.BOOL
+    kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    handle = kernel32.CreateFileW(device_path, 0, 1 | 2, None, 3, 0, None)
+    if not handle or handle == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        sdn = _STORAGE_DEVICE_NUMBER()
+        returned = wintypes.DWORD()
+        ok = kernel32.DeviceIoControl(
+            handle, _IOCTL_STORAGE_GET_DEVICE_NUMBER, None, 0,
+            ctypes.byref(sdn), ctypes.sizeof(sdn), ctypes.byref(returned), None,
+        )
+        return (int(sdn.DeviceType), int(sdn.DeviceNumber)) if ok else None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _find_disk_devinst(drive_letter: str) -> int | None:
+    """Find the PnP device instance of the physical disk that holds drive_letter (read-only lookup)."""
+    from ctypes import wintypes
+
+    target = _get_storage_device_number(f"\\\\.\\{drive_letter}:")
+    if target is None:
+        return None
+
+    setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32")
+    guid = _GUID()
+    if ole32.CLSIDFromString(ctypes.c_wchar_p(_GUID_DEVINTERFACE_DISK), ctypes.byref(guid)) != 0:
+        return None
+
+    setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+    setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(_GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
+    setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, ctypes.POINTER(_GUID), wintypes.DWORD,
+        ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA),
+    ]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA), wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(_SP_DEVINFO_DATA),
+    ]
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+
+    dev_info = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, _DIGCF_PRESENT | _DIGCF_DEVICEINTERFACE)
+    if not dev_info or dev_info == wintypes.HANDLE(-1).value:
+        return None
+    # SP_DEVICE_INTERFACE_DETAIL_DATA_W.cbSize is 8 on 64-bit and 6 on 32-bit Windows.
+    detail_cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+    try:
+        index = 0
+        while True:
+            iface = _SP_DEVICE_INTERFACE_DATA()
+            iface.cbSize = ctypes.sizeof(_SP_DEVICE_INTERFACE_DATA)
+            if not setupapi.SetupDiEnumDeviceInterfaces(dev_info, None, ctypes.byref(guid), index, ctypes.byref(iface)):
+                return None
+            index += 1
+            required = wintypes.DWORD()
+            setupapi.SetupDiGetDeviceInterfaceDetailW(dev_info, ctypes.byref(iface), None, 0, ctypes.byref(required), None)
+            if required.value < 8:
+                continue
+            buf = ctypes.create_string_buffer(required.value)
+            ctypes.c_ulong.from_buffer(buf).value = detail_cb_size
+            devinfo = _SP_DEVINFO_DATA()
+            devinfo.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
+            if not setupapi.SetupDiGetDeviceInterfaceDetailW(
+                dev_info, ctypes.byref(iface), buf, required, None, ctypes.byref(devinfo)
+            ):
+                continue
+            device_path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            if _get_storage_device_number(device_path) == target:
+                return int(devinfo.DevInst)
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(dev_info)
+
+
+def _request_device_eject(devinst: int) -> tuple[bool, int, str]:
+    """Ask Plug and Play to safely remove the device's parent (the USB device). Returns (ok, veto_type, veto_name)."""
+    cfgmgr32 = ctypes.WinDLL("cfgmgr32")
+    parent = ctypes.c_ulong()
+    if cfgmgr32.CM_Get_Parent(ctypes.byref(parent), ctypes.c_ulong(devinst), 0) != _CR_SUCCESS:
+        return False, 0, ""
+    veto_type = ctypes.c_int(0)
+    veto_name = ctypes.create_unicode_buffer(260)
+    cr = cfgmgr32.CM_Request_Device_EjectW(parent, ctypes.byref(veto_type), veto_name, 260, 0)
+    return (cr == _CR_SUCCESS and veto_type.value == 0), veto_type.value, veto_name.value
+
+
+def _flush_volume(clean_drive: str) -> None:
+    """Flush the volume's write cache so no buffered data is lost before removal."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateFileW(f"\\\\.\\{clean_drive}", 0x40000000 | 0x80000000, 1 | 2, None, 3, 0, None)
+    if handle and handle != wintypes.HANDLE(-1).value:
+        try:
+            kernel32.FlushFileBuffers(handle)
+        finally:
+            kernel32.CloseHandle(handle)
+
+
+def safely_eject_usb_drive(drive_root):
+    """Flush and safely remove a USB drive through Windows Plug and Play (like 'Safely Remove Hardware').
+
+    Only reports success once Windows has actually removed the drive, and explains when an open file
+    or window blocks the removal. Returns (success: bool, message: str).
     """
     if not drive_root:
         return False, "No drive specified."
@@ -222,59 +395,54 @@ def safely_eject_usb_drive(drive_root):
         return False, f"Invalid drive specification '{drive_root}'."
 
     drive_letter = drive[0].upper()
-    drive_idx = ord(drive_letter) - ord('A')
+    drive_idx = ord(drive_letter) - ord("A")
     clean_drive = f"{drive_letter}:"
 
     kernel32 = ctypes.windll.kernel32
-    bitmask = kernel32.GetLogicalDrives()
-    if not (bitmask & (1 << drive_idx)):
+    if not (kernel32.GetLogicalDrives() & (1 << drive_idx)):
         return False, f"Drive {clean_drive} does not exist or is not connected."
 
-    drive_handle = None
-    try:
-        drive_handle = kernel32.CreateFileW(
-            f"\\\\.\\{clean_drive}",
-            0x40000000 | 0x80000000,  # GENERIC_READ | GENERIC_WRITE
-            1 | 2,                     # FILE_SHARE_READ | FILE_SHARE_WRITE
-            None,
-            3,                         # OPEN_EXISTING
-            0,
-            None
-        )
-        if drive_handle and drive_handle != -1 and drive_handle != 0xFFFFFFFFFFFFFFFF:
-            try:
-                kernel32.FlushFileBuffers(drive_handle)
-                bytes_returned = ctypes.c_ulong()
-                # FSCTL_LOCK_VOLUME = 0x00090018
-                kernel32.DeviceIoControl(drive_handle, 0x00090018, None, 0, None, 0, ctypes.byref(bytes_returned), None)
-                # FSCTL_DISMOUNT_VOLUME = 0x00090020
-                kernel32.DeviceIoControl(drive_handle, 0x00090020, None, 0, None, 0, ctypes.byref(bytes_returned), None)
-                # IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808
-                kernel32.DeviceIoControl(drive_handle, 0x002D4808, None, 0, None, 0, ctypes.byref(bytes_returned), None)
-            finally:
-                kernel32.CloseHandle(drive_handle)
-    except Exception:
-        pass
+    # Never ask Windows to remove an internal disk, even if called with the wrong letter.
+    if not any(d.root.upper().startswith(clean_drive) for d in list_removable_drives()):
+        return False, f"Drive {clean_drive} is not a removable USB drive."
 
     try:
-        ps_script = f'(New-Object -com Shell.Application).Namespace(17).ParseName("{clean_drive}").InvokeVerb("Eject")'
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            creationflags=CREATE_NO_WINDOW,
-            timeout=8
+        _flush_volume(clean_drive)
+    except Exception as e:
+        logger.warning("Flushing %s before eject failed: %s", clean_drive, e)
+
+    veto_type, veto_name = 0, ""
+    try:
+        devinst = _find_disk_devinst(drive_letter)
+        if devinst is None:
+            return False, (
+                f"Windows could not identify drive {clean_drive} for safe removal.\n"
+                "Use the 'Safely Remove Hardware' icon in the taskbar instead."
+            )
+        for _attempt in range(_EJECT_ATTEMPTS):
+            ok, veto_type, veto_name = _request_device_eject(devinst)
+            if ok:
+                break
+            time.sleep(0.5)
+    except Exception as e:
+        logger.warning("Eject of %s failed: %s", clean_drive, e)
+
+    # Trust only the result that matters: is the drive actually gone?
+    for _ in range(20):
+        if not (kernel32.GetLogicalDrives() & (1 << drive_idx)):
+            return True, f"Drive {clean_drive} was safely ejected. You can now unplug it."
+        time.sleep(0.1)
+
+    if veto_type == _PNP_VETO_OUTSTANDING_OPEN or veto_type:
+        logger.info("Eject of %s vetoed (type %s): %s", clean_drive, veto_type, veto_name)
+        return False, (
+            f"Drive {clean_drive} is still being used, so Windows did not eject it.\n"
+            "Close any File Explorer windows or programs showing files on the drive, then try again."
         )
-    except Exception:
-        pass
-
-    bitmask = kernel32.GetLogicalDrives()
-    still_present = bool(bitmask & (1 << drive_idx))
-
-    if not still_present:
-        return True, f"Drive {clean_drive} was safely ejected. You can now unplug it."
-    else:
-        return True, f"Drive {clean_drive} was unmounted and flushed. It is safe to remove."
+    return False, (
+        f"Drive {clean_drive} could not be ejected.\n"
+        "Close any programs using it and try again, or use the 'Safely Remove Hardware' icon in the taskbar."
+    )
 
 
 def get_desktop_dir():
@@ -296,6 +464,19 @@ def get_desktop_dir():
     if os.path.exists(onedrive_desktop):
         return onedrive_desktop
     return desktop_std
+
+
+def find_windows_media_player():
+    """Return the path of Windows Media Player Legacy (used to burn audio CDs), or None if not installed."""
+    if os.name != "nt":
+        return None
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(env_var)
+        if base:
+            candidate = os.path.join(base, "Windows Media Player", "wmplayer.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
 
 class Win32DragDropHandler:

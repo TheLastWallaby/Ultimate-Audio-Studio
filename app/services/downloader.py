@@ -1,15 +1,18 @@
 """Background yt-dlp downloader worker with search routing, progress reporting, and cancellation."""
 
+import functools
 import hashlib
 import os
 import re
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import yt_dlp
 
-from app.config import PREVIEW_CACHE_DIR, YOUTUBE_RE, YT_CACHE_DIR, ffmpeg_path, format_time, log_error
+from app.config import BASE_PATH, PREVIEW_CACHE_DIR, YOUTUBE_RE, YT_CACHE_DIR, ffmpeg_path, format_time, log_error
 from app.models import SearchResult
 
 try:
@@ -18,6 +21,30 @@ except Exception:
 
     class DownloadCancelled(Exception):
         pass
+
+
+@functools.lru_cache(maxsize=1)
+def find_deno_runtime() -> str | None:
+    """Locate the Deno JavaScript runtime yt-dlp needs to solve YouTube's player challenges.
+
+    Packaged builds ship ``deno.exe`` next to ``ffmpeg.exe``; source runs use the ``deno``
+    PyPI package installed by the ``yt-dlp[deno]`` extra.
+    """
+    bundled = Path(BASE_PATH) / ("deno.exe" if os.name == "nt" else "deno")
+    if bundled.is_file():
+        return str(bundled)
+    try:
+        import deno  # type: ignore[import-untyped]
+
+        return str(deno.find_deno_bin())
+    except (ImportError, FileNotFoundError):
+        return None
+
+
+def _js_runtime_opts() -> dict[str, Any]:
+    """yt-dlp options enabling the Deno runtime when available (yt-dlp falls back to PATH lookup)."""
+    deno_bin = find_deno_runtime()
+    return {"js_runtimes": {"deno": {"path": deno_bin}}} if deno_bin else {}
 
 
 def resolve_download_query(query):
@@ -184,11 +211,7 @@ def fetch_preview_audio(url, max_seconds=30, cancel_event=None):
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 2,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web", "mweb", "ios"],
-            }
-        },
+        **_js_runtime_opts(),
         "progress_hooks": [_hook],
         "quiet": True,
         "no_warnings": True,
@@ -313,7 +336,8 @@ def download_audio_worker(target_url, library_folder, cancel_event, on_progress,
         "ffmpeg_location": os.path.dirname(os.path.abspath(ffmpeg_path)) or os.path.abspath(ffmpeg_path),
         "writethumbnail": True,
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"},
+            # VBR V2 (~190 kbps): transparent for YouTube's ~130-160 kbps sources without 320k bloat.
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "2"},
             {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
             {"key": "FFmpegMetadata", "add_metadata": True},
             {"key": "EmbedThumbnail", "already_have_thumbnail": False},
@@ -325,11 +349,7 @@ def download_audio_worker(target_url, library_folder, cancel_event, on_progress,
         "fragment_retries": 5,
         "extractor_retries": 3,
         "socket_timeout": 30,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web", "mweb", "ios"],
-            }
-        },
+        **_js_runtime_opts(),
         "progress_hooks": [_hook],
         "quiet": True,
         "no_warnings": True,
@@ -361,18 +381,16 @@ def download_audio_worker(target_url, library_folder, cancel_event, on_progress,
             if os.path.exists(os.path.join(library_folder, candidate)):
                 final_name = candidate
 
-        # If candidate wasn't directly matched, detect newly created or most recent MP3
+        # If candidate wasn't directly matched, accept only an MP3 created by this download.
         if not final_name and os.path.exists(library_folder):
             after_files = set(os.listdir(library_folder))
             new_mp3s = [f for f in (after_files - before_files) if f.lower().endswith(".mp3")]
             if new_mp3s:
                 new_mp3s.sort(key=lambda x: os.path.getmtime(os.path.join(library_folder, x)), reverse=True)
                 final_name = new_mp3s[0]
-            else:
-                all_mp3s = [f for f in os.listdir(library_folder) if f.lower().endswith(".mp3")]
-                if all_mp3s:
-                    all_mp3s.sort(key=lambda x: os.path.getmtime(os.path.join(library_folder, x)), reverse=True)
-                    final_name = all_mp3s[0]
+
+        if not final_name:
+            raise FileNotFoundError("Download finished but the converted MP3 file could not be found.")
 
         on_success(final_name)
     except DownloadCancelled:

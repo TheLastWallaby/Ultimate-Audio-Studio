@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import array
+import math
+import operator
 import os
 import subprocess
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from pydub import AudioSegment
 
@@ -33,20 +36,71 @@ def _samples_to_peaks(samples: Sequence[int], n_bars: int) -> list[float]:
     return [float(p) / float(max_p) for p in peaks]
 
 
-def extract_waveform_peaks(
+ANALYSIS_RATE_HZ = 4000
+_BLOCK_SECONDS = 0.4
+_ABSOLUTE_GATE_DB = -70.0
+_RELATIVE_GATE_DB = -10.0
+
+
+@dataclass(slots=True, frozen=True)
+class AudioAnalysis:
+    """Waveform peaks (normalized 0..1 for drawing) plus the track's un-normalized loudness."""
+
+    peaks: list[float]
+    loudness_db: float | None
+
+
+def _mean_square_db(mean_square: float) -> float:
+    return 10.0 * math.log10(mean_square) if mean_square > 0 else -200.0
+
+
+def measure_loudness_db(samples: Sequence[int], block_size: int) -> float | None:
+    """Estimate programme loudness in dBFS from raw 16-bit PCM using gated block RMS.
+
+    Mirrors EBU R128 gating (400 ms blocks, -70 dB absolute gate, -10 dB relative gate)
+    without K-weighting, so quiet intros and silences do not drag the estimate down.
+    Unlike the drawing peaks, this is NOT normalized, so loud and quiet tracks differ.
+    """
+    n = len(samples)
+    if n == 0 or block_size <= 0:
+        return None
+    full_scale_sq = 32768.0 * 32768.0
+    blocks: list[float] = []
+    for start in range(0, n, block_size):
+        chunk = samples[start : start + block_size]
+        if len(chunk) < block_size // 2:
+            break
+        blocks.append(sum(map(operator.mul, chunk, chunk)) / (len(chunk) * full_scale_sq))
+    gated = [ms for ms in blocks if _mean_square_db(ms) > _ABSOLUTE_GATE_DB]
+    if not gated:
+        return None
+    rel_threshold = _mean_square_db(sum(gated) / len(gated)) + _RELATIVE_GATE_DB
+    loud = [ms for ms in gated if _mean_square_db(ms) > rel_threshold] or gated
+    return round(_mean_square_db(sum(loud) / len(loud)), 2)
+
+
+def _analysis_from_samples(samples: Sequence[int], n_bars: int, rate: int, channels: int = 1) -> AudioAnalysis:
+    return AudioAnalysis(
+        peaks=_samples_to_peaks(samples, n_bars),
+        loudness_db=measure_loudness_db(samples, int(rate * channels * _BLOCK_SECONDS)),
+    )
+
+
+def analyze_audio(
     audio_path: str,
     n_bars: int = 220,
     cancel_event: threading.Event | None = None,
     on_process_spawned: Callable[[subprocess.Popen[bytes]], None] | None = None,
-) -> list[float]:
-    """Fast downsampled audio peak extraction for waveform visualization with accurate binning and timeout.
+) -> AudioAnalysis:
+    """Decode a track once to produce waveform peaks and a loudness estimate.
 
-    Returns a list of float peak values between 0.0 and 1.0, or [] if extraction fails.
+    Returns AudioAnalysis([], None) if the file cannot be decoded.
     """
+    empty = AudioAnalysis([], None)
     if not audio_path or not os.path.exists(audio_path):
-        return []
+        return empty
     if cancel_event and cancel_event.is_set():
-        return []
+        return empty
 
     # 1. Fast direct extraction via ffmpeg raw PCM pipe
     proc = None
@@ -64,7 +118,7 @@ def extract_waveform_peaks(
             "-ac",
             "1",
             "-ar",
-            "1000",
+            str(ANALYSIS_RATE_HZ),
             "-f",
             "s16le",
             "-",
@@ -87,26 +141,26 @@ def extract_waveform_peaks(
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_data, stderr_data = proc.communicate()
-            log_error(f"extract_waveform_peaks: ffmpeg pipe timed out on {audio_path}")
+            log_error(f"analyze_audio: ffmpeg pipe timed out on {audio_path}")
 
         if cancel_event and cancel_event.is_set():
-            return []
+            return empty
 
         if proc.returncode == 0 and stdout_data:
             raw_bytes = stdout_data
             even_len = len(raw_bytes) - (len(raw_bytes) % 2)
             if even_len > 0:
                 samples = array.array("h", raw_bytes[:even_len])
-                norm_peaks = _samples_to_peaks(samples, n_bars)
-                if norm_peaks:
-                    return norm_peaks
+                result = _analysis_from_samples(samples, n_bars, ANALYSIS_RATE_HZ)
+                if result.peaks:
+                    return result
         else:
             err_msg = stderr_data.decode("utf-8", errors="ignore")[:300] if stderr_data else ""
             if not (cancel_event and cancel_event.is_set()):
-                log_error(f"extract_waveform_peaks (ffmpeg pipe rc={proc.returncode}): {err_msg}")
+                log_error(f"analyze_audio (ffmpeg pipe rc={proc.returncode}): {err_msg}")
     except Exception as e:
         if not (cancel_event and cancel_event.is_set()):
-            log_error(f"extract_waveform_peaks (ffmpeg pipe): {e}")
+            log_error(f"analyze_audio (ffmpeg pipe): {e}")
 
     # 2. In-process Pygame Sound extraction (zero external dependencies, memory safe)
     try:
@@ -115,17 +169,18 @@ def extract_waveform_peaks(
 
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
+            mixer_rate, _fmt, mixer_channels = pygame.mixer.get_init()
             snd = pygame.mixer.Sound(audio_path)
             raw = snd.get_raw()
             del snd
             even_len = len(raw) - (len(raw) % 2)
             if even_len > 0:
                 samples = array.array("h", raw[:even_len])
-                norm_peaks = _samples_to_peaks(samples, n_bars)
-                if norm_peaks:
-                    return norm_peaks
+                result = _analysis_from_samples(samples, n_bars, mixer_rate, mixer_channels)
+                if result.peaks:
+                    return result
     except Exception as e:
-        log_error(f"extract_waveform_peaks (pygame fallback): {e}")
+        log_error(f"analyze_audio (pygame fallback): {e}")
 
     # 3. Resilient temp WAV extraction via ffmpeg + standard library wave
     import tempfile
@@ -147,7 +202,7 @@ def extract_waveform_peaks(
             "-ac",
             "1",
             "-ar",
-            "1000",
+            str(ANALYSIS_RATE_HZ),
             "-f",
             "wav",
             tmp_wav,
@@ -166,14 +221,14 @@ def extract_waveform_peaks(
             even_len = len(raw_bytes) - (len(raw_bytes) % 2)
             if even_len > 0:
                 samples = array.array("h", raw_bytes[:even_len])
-                norm_peaks = _samples_to_peaks(samples, n_bars)
-                if norm_peaks:
-                    return norm_peaks
+                result = _analysis_from_samples(samples, n_bars, ANALYSIS_RATE_HZ)
+                if result.peaks:
+                    return result
         elif res.returncode != 0:
             err_msg = res.stderr.decode("utf-8", errors="ignore")[:300] if res.stderr else ""
-            log_error(f"extract_waveform_peaks (temp wav rc={res.returncode}): {err_msg}")
+            log_error(f"analyze_audio (temp wav rc={res.returncode}): {err_msg}")
     except Exception as e:
-        log_error(f"extract_waveform_peaks (temp wav fallback): {e}")
+        log_error(f"analyze_audio (temp wav fallback): {e}")
     finally:
         if tmp_wav and os.path.exists(tmp_wav):
             try:
@@ -185,15 +240,28 @@ def extract_waveform_peaks(
     try:
         if os.path.exists(audio_path) and os.path.getsize(audio_path) < 50 * 1024 * 1024:
             audio = AudioSegment.from_file(audio_path)
-            low_res = audio.set_frame_rate(1000).set_channels(1)
+            low_res = audio.set_frame_rate(ANALYSIS_RATE_HZ).set_channels(1).set_sample_width(2)
             samples = low_res.get_array_of_samples()
-            norm_peaks = _samples_to_peaks(samples, n_bars)
-            if norm_peaks:
-                return norm_peaks
+            result = _analysis_from_samples(samples, n_bars, ANALYSIS_RATE_HZ)
+            if result.peaks:
+                return result
     except Exception as e:
-        log_error(f"extract_waveform_peaks (pydub fallback): {e}")
+        log_error(f"analyze_audio (pydub fallback): {e}")
 
-    return []
+    return empty
+
+
+def extract_waveform_peaks(
+    audio_path: str,
+    n_bars: int = 220,
+    cancel_event: threading.Event | None = None,
+    on_process_spawned: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> list[float]:
+    """Fast downsampled audio peak extraction for waveform visualization with accurate binning and timeout.
+
+    Returns a list of float peak values between 0.0 and 1.0, or [] if extraction fails.
+    """
+    return analyze_audio(audio_path, n_bars, cancel_event, on_process_spawned).peaks
 
 
 def get_waveform_bounds(track_duration, clip_start, clip_end, zoomed=False):

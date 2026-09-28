@@ -1,13 +1,15 @@
 """Application configuration, global constants, paths, and shared utilities."""
 
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shutil
 import sys
 import tempfile
 import threading
-import time
+from pathlib import Path
 from typing import Any
 
 from app.core.config import Settings, clear_settings_cache, get_settings
@@ -53,6 +55,7 @@ __all__ = [
     "sanitize_filename",
     "save_update_token",
     "settings_mgr",
+    "setup_logging",
 ]
 
 # Bootstrap audioop for Python 3.13+ before importing pydub
@@ -236,11 +239,39 @@ def cleanup_temp_caches() -> None:
             pass
 
 
+_LOG_MAX_BYTES = 1024 * 1024
+_LOG_BACKUP_COUNT = 3
+_log_setup_lock = threading.Lock()
+_log_handler_installed = False
+
+
+def setup_logging() -> logging.Logger:
+    """Attach a size-capped rotating file handler to the ``app`` logger namespace (idempotent)."""
+    global _log_handler_installed
+    app_logger = logging.getLogger("app")
+    with _log_setup_lock:
+        if _log_handler_installed:
+            return app_logger
+        _log_handler_installed = True
+        try:
+            Path(ERROR_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                ERROR_LOG_PATH,
+                maxBytes=_LOG_MAX_BYTES,
+                backupCount=_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+                delay=True,
+            )
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            handler.setLevel(logging.INFO)
+            app_logger.addHandler(handler)
+            app_logger.setLevel(logging.INFO)
+        except OSError:
+            # Logging must never take the app down (e.g. read-only Music folder).
+            pass
+    return app_logger
+
+
 def log_error(text: str) -> None:
-    """Append error message to user error log file."""
-    try:
-        os.makedirs(MUSIC_DIR, exist_ok=True)
-        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
-    except Exception:
-        pass
+    """Record an error in the rotating user error log (kept for existing call sites)."""
+    setup_logging().error(text)

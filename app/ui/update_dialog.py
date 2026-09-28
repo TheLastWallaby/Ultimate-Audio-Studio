@@ -16,11 +16,19 @@ from app.ui.components import create_button
 from app.services.updater import download_release_asset, apply_update_and_restart
 
 class UpdateDialog(tk.Toplevel):
-    def __init__(self, parent, release_info, auto_start=False):
+    def __init__(self, parent, release_info, auto_start=False, busy_reason_fn=None, prepare_restart_fn=None):
+        """Show release notes with 'Update Now' / 'Later'.
+
+        busy_reason_fn() returns a description of work in progress (download, export...) or None;
+        installing is refused while busy so the restart never interrupts it.
+        prepare_restart_fn() persists settings/playlists before the executable is swapped.
+        """
         super().__init__(parent)
         self.parent = parent
         self.release_info = release_info
         self.auto_start = auto_start
+        self.busy_reason_fn = busy_reason_fn
+        self.prepare_restart_fn = prepare_restart_fn
         self._cancel_event = threading.Event()
         self._is_downloading = False
         self._temp_exe = None
@@ -35,8 +43,12 @@ class UpdateDialog(tk.Toplevel):
 
         self._drain_ui_queue()
 
-        # Center on parent
-        w, h = 540, 480
+        self._build_ui()
+
+        # Size to content (fonts follow the user's text-size setting) and center on parent
+        self.update_idletasks()
+        w = max(540, self.winfo_reqwidth())
+        h = max(420, self.winfo_reqheight())
         pw = parent.winfo_width()
         ph = parent.winfo_height()
         px = parent.winfo_rootx()
@@ -44,8 +56,6 @@ class UpdateDialog(tk.Toplevel):
         x = max(50, px + (pw - w) // 2)
         y = max(50, py + (ph - h) // 2)
         self.geometry(f'{w}x{h}+{x}+{y}')
-
-        self._build_ui()
         self.protocol('WM_DELETE_WINDOW', self._on_cancel)
 
         try:
@@ -137,7 +147,7 @@ class UpdateDialog(tk.Toplevel):
             bg=COLOR_ACCENT if is_frozen else COLOR_BTN_NEUTRAL,
             hover_bg=COLOR_ACCENT_HV if is_frozen else COLOR_BTN_NEUTRAL_HV,
             fg='#ffffff' if is_frozen else TEXT_MUTED,
-            font=FONT_BTN_MAIN, height=36
+            font=FONT_BTN_MAIN, pady=6
         )
         if not is_frozen:
             self.btn_action.config(state=tk.DISABLED)
@@ -147,7 +157,7 @@ class UpdateDialog(tk.Toplevel):
             f_btns, text='Close' if not is_frozen else 'Remind Me Later',
             command=self._on_cancel,
             bg=COLOR_BTN_NEUTRAL, hover_bg=COLOR_BTN_NEUTRAL_HV, fg=TEXT_DARK,
-            font=FONT_BTN_SUB, height=36
+            font=FONT_BTN_SUB, pady=6
         )
         self.btn_cancel.pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -206,7 +216,8 @@ class UpdateDialog(tk.Toplevel):
         ok, result = download_release_asset(
             asset_id=asset_id,
             progress_callback=_progress,
-            cancel_event=self._cancel_event
+            cancel_event=self._cancel_event,
+            expected_digest=self.release_info.get('asset_digest'),
         )
 
         if ok:
@@ -238,6 +249,19 @@ class UpdateDialog(tk.Toplevel):
             messagebox.showerror('Update Error', 'Could not locate downloaded update file.')
             self.destroy()
             return
+
+        busy = self.busy_reason_fn() if self.busy_reason_fn else None
+        if busy:
+            # Never restart in the middle of a download/export; retry once the work is finished.
+            self.lbl_status.config(text=f'Update ready. It will install as soon as {busy} finishes...')
+            self.after(3000, self._apply_update)
+            return
+
+        if self.prepare_restart_fn:
+            try:
+                self.prepare_restart_fn()
+            except Exception as e:
+                log_error(f'Update prepare_restart failed: {e}')
 
         ok, msg = apply_update_and_restart(self._temp_exe)
         if not ok:

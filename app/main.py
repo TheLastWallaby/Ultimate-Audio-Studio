@@ -29,7 +29,7 @@ from app.config import (
 )
 from app.platform_utils import (
     enable_windows_dpi, already_running, list_removable_drives,
-    Win32DragDropHandler, get_desktop_dir
+    Win32DragDropHandler, get_desktop_dir, find_windows_media_player
 )
 from app.core.audio_engine import AudioEngine, SONG_END_EVENT
 from app.core.cache_manager import cache_mgr
@@ -39,7 +39,7 @@ from app.controllers import (
     ExportController, DownloadController, UpdateController
 )
 from app.core.metadata import probe_audio_duration, extract_album_art, read_track_metadata
-from app.core.waveform import extract_waveform_peaks
+from app.core.waveform import analyze_audio
 from app.ui.search_dialog import SearchChoiceDialog
 from app.services.clipper import clip_audio_worker
 from app.ui.theme import (
@@ -52,9 +52,11 @@ from app.ui.theme import (
     COLOR_STOP, COLOR_STOP_HV, COLOR_ACCENT, COLOR_ACCENT_HV,
     COLOR_EXPORT, COLOR_EXPORT_HV, COLOR_DOWNLOAD, COLOR_DOWNLOAD_HV,
     COLOR_BTN_NEUTRAL, COLOR_BTN_NEUTRAL_HV,
-    COLOR_DANGER_BG, COLOR_DANGER_TEXT, COLOR_DANGER_HV
+    COLOR_DANGER_BG, COLOR_DANGER_TEXT, COLOR_DANGER_HV,
+    DEFAULT_TEXT_SIZE, TEXT_SIZES, init_fonts, apply_text_size, next_text_size
 )
-from app.ui.components import ToolTip, create_button, scrolled_listbox, draw_placeholder_cover
+from app.ui.components import ToolTip, create_button, scrolled_listbox, draw_placeholder_cover, ScrollableFrame
+from app.ui.error_dialog import show_error, show_friendly_error
 from app.ui.waveform_view import WaveformView
 from app.ui.views.step1_library import build_step1_view
 from app.ui.views.step2_player import build_step2_view
@@ -68,13 +70,17 @@ class UltimateAudioStudio:
         self.root = root
         self.root.title(f"Ultimate Audio Studio v{APP_VERSION}")
 
-        # Responsive geometry
+        # Responsive geometry. Sizes are in physical pixels, so scale the design size by the
+        # Windows display scaling (125%/150%...) and start maximized when it does not fit.
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        target_w = min(1360, max(1040, screen_w - 60))
-        target_h = min(820, max(620, screen_h - 100))
+        ui_scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        want_w, want_h = int(1360 * ui_scale), int(820 * ui_scale)
+        target_w = min(want_w, max(800, screen_w - 60))
+        target_h = min(want_h, max(560, screen_h - 100))
         self.root.geometry(f"{target_w}x{target_h}")
-        self.root.minsize(1020, 600)
+        self.root.minsize(min(int(900 * ui_scale), target_w), min(int(560 * ui_scale), target_h))
+        self._start_maximized = want_w > screen_w - 60 or want_h > screen_h - 100
         self.root.configure(bg=BG_ROOT)
         self.root.option_add("*Font", FONT_BODY)
 
@@ -119,6 +125,13 @@ class UltimateAudioStudio:
         self.update_ctrl = UpdateController(self)
         self._undo_callback = None
         self._undo_timer = None
+        self._current_loudness = None
+        self._pending_play_token = None
+        self._library_meta_gen = 0
+        self._exporting = False
+        self._saving_clip = False
+        self._importing = False
+        self._timer_settings_save = None
 
         self.selected_file_path = None
         self.track_duration = 0.0
@@ -150,6 +163,7 @@ class UltimateAudioStudio:
         self._audition_slice_file = None
 
         self._load_settings()
+        init_fonts(self.root, self.text_size)
         self.repeat_playlist = tk.BooleanVar(value=getattr(self, "_saved_repeat", False))
         self.soften_clip = tk.BooleanVar(value=getattr(self, "_saved_soften", True))
         self.fade_choice_var = tk.StringVar(value=getattr(self, "_saved_fade_choice", "1.5s (Standard)"))
@@ -168,15 +182,23 @@ class UltimateAudioStudio:
                 self.root.geometry(self._saved_geometry)
             except Exception:
                 pass
+        elif self._start_maximized:
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
 
         self._build_layout()
         self.build_column_1()
         self.build_column_2()
         self.build_column_3()
+        self._balance_columns()
         self.refresh_usb_drives()
         self._setup_drag_and_drop()
         self._install_exception_hooks()
+        self._watch_settings_changes()
 
+        task_mgr.submit_task(self.library_ctrl.recover_stranded_deletes, self.library_folder)
         self.load_playlists()
         self.refresh_library()
         self.set_status("Ready. Select a song on the left to play or trim.")
@@ -259,6 +281,16 @@ class UltimateAudioStudio:
     def play_guard_until(self, val):
         if hasattr(self, "playback_ctrl"):
             self.playback_ctrl.play_guard_until = float(val)
+
+    @property
+    def _scrubbed_while_paused(self):
+        return self.playback_ctrl._scrubbed_while_paused if hasattr(self, "playback_ctrl") else False
+
+    @_scrubbed_while_paused.setter
+    def _scrubbed_while_paused(self, val):
+        # Single source of truth: the controller decides whether resume must reload the track.
+        if hasattr(self, "playback_ctrl"):
+            self.playback_ctrl._scrubbed_while_paused = bool(val)
 
     @property
     def playlists(self):
@@ -352,7 +384,13 @@ class UltimateAudioStudio:
             details = "".join(traceback.format_exception(exc_type, exc, tb))
             log_error(details)
             try:
-                messagebox.showerror("Something went wrong", "The app hit an unexpected problem.\n\nDetails were saved to error log.")
+                show_error(
+                    self.root,
+                    "Something went wrong",
+                    "The app hit an unexpected problem.\n\n"
+                    "You can keep using it. If something looks wrong, close and reopen the app.",
+                    details=f"{exc_type.__name__}: {exc}",
+                )
             except Exception:
                 pass
         self.root.report_callback_exception = hook
@@ -368,6 +406,8 @@ class UltimateAudioStudio:
             self._saved_fade_choice = s.fade_choice
             self._saved_even = s.even_volume
             self._saved_auto_level_playback = s.auto_level_playback
+            self.text_size = s.text_size if s.text_size in TEXT_SIZES else DEFAULT_TEXT_SIZE
+            self._saved_active_playlist = s.active_playlist
             geo = s.geometry
             if geo:
                 m = re.match(r"^(\d+)x(\d+)", str(geo))
@@ -385,6 +425,28 @@ class UltimateAudioStudio:
             self._saved_even = True
             self._saved_auto_level_playback = False
             self._saved_geometry = None
+            self.text_size = DEFAULT_TEXT_SIZE
+            self._saved_active_playlist = ""
+
+    def _schedule_settings_save(self, *_args):
+        """Persist settings shortly after any change (debounced), so a crash loses nothing."""
+        if getattr(self, "_is_shutting_down", False):
+            return
+        if self._timer_settings_save:
+            try:
+                self.root.after_cancel(self._timer_settings_save)
+            except Exception:
+                pass
+        self._timer_settings_save = self.root.after(1000, self._save_settings)
+
+    def _watch_settings_changes(self):
+        for var in (self.repeat_playlist, self.soften_clip, self.fade_choice_var, self.even_volume):
+            var.trace_add("write", self._schedule_settings_save)
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+
+    def _on_root_configure(self, event):
+        if event.widget is self.root:
+            self._schedule_settings_save()
 
     def _save_settings(self):
         try:
@@ -401,9 +463,12 @@ class UltimateAudioStudio:
                 even_volume=bool(self.even_volume.get()) if hasattr(self, "even_volume") else True,
                 auto_level_playback=bool(self.auto_level_playback.get()) if hasattr(self, "auto_level_playback") else False,
                 geometry=self.root.geometry(),
+                text_size=getattr(self, "text_size", DEFAULT_TEXT_SIZE),
+                active_playlist=self.active_playlist_name or "",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"_save_settings: {e}")
+        self._timer_settings_save = None
 
     def _setup_drag_and_drop(self):
         self._dnd_handler = Win32DragDropHandler(
@@ -442,21 +507,25 @@ class UltimateAudioStudio:
     def _handle_dropped_files(self, paths):
         if getattr(self, "_is_shutting_down", False):
             return
+        self._import_paths(paths, source="dropped")
+
+    def _import_paths(self, paths, source="selected"):
+        """Copy audio files/folders into the Library, asking before replacing existing songs."""
         planned, dest_exists = self.library_ctrl.build_import_plan(paths, self.library_folder)
         if not planned and not dest_exists:
             messagebox.showinfo(
                 "No Audio Files",
-                "No compatible audio songs (.mp3, .wav, .m4a, .ogg, .flac) were found in the dropped files."
+                f"No compatible audio songs (.mp3, .wav, .m4a, .ogg, .flac) were found in the {source} files."
             )
             return
         if not planned and dest_exists:
-            self.set_status("Dropped audio files are already in your Library.")
+            self.set_status(f"The {source} audio files are already in your Library.")
             return
 
         if dest_exists:
             replace = messagebox.askyesno(
                 "Replace Files?",
-                f"{len(dest_exists)} of the dropped song(s) already exist in your Library.\n\nDo you want to replace them?"
+                f"{len(dest_exists)} of the {source} song(s) already exist in your Library.\n\nDo you want to replace them?"
             )
             if not replace:
                 planned = [(s, d) for (s, d) in planned if not os.path.exists(d)]
@@ -464,7 +533,8 @@ class UltimateAudioStudio:
         if not planned:
             return
 
-        self.set_busy(True, f"Adding {len(planned)} dropped song(s) to Library...")
+        self._importing = True
+        self.set_busy(True, f"Adding {len(planned)} song(s) to your Library...")
         self.library_ctrl.import_external_files(
             planned,
             is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
@@ -493,6 +563,7 @@ class UltimateAudioStudio:
                 self.library_ctrl.flush_pending_trash()
             except Exception:
                 pass
+        cache_mgr.flush()
         self._release_audio_file()
         try:
             pygame.quit()
@@ -501,7 +572,8 @@ class UltimateAudioStudio:
         for timer_attr in (
             "_drain_timer", "_monitor_timer", "_selection_debounce_timer",
             "_resize_timer", "_timer_check_ffmpeg", "_timer_update_check",
-            "_timer_watch_library", "_timer_hotplug_debounce"
+            "_timer_watch_library", "_timer_hotplug_debounce", "_timer_settings_save",
+            "_search_debounce_timer", "_undo_timer"
         ):
             tid = getattr(self, timer_attr, None)
             if tid:
@@ -522,6 +594,46 @@ class UltimateAudioStudio:
 
         cleanup_temp_caches()
         self.root.destroy()
+
+    def busy_reason(self):
+        """Describe work that must not be interrupted (e.g. by an update restart), or None."""
+        if self.download_ctrl.is_downloading:
+            return "the current download"
+        if self._exporting:
+            return "the playlist export"
+        if self._saving_clip:
+            return "saving your clip"
+        if self._importing:
+            return "adding songs to your Library"
+        return None
+
+    def prepare_for_restart(self):
+        """Persist everything before the updater swaps the executable and exits the process."""
+        self.stop_audio()
+        self._save_settings()
+        self.save_playlists()
+        try:
+            self.library_ctrl.flush_pending_trash()
+        except Exception as e:
+            log_error(f"prepare_for_restart flush_pending_trash: {e}")
+        cache_mgr.flush()
+
+    def _balance_columns(self):
+        """Share the window width in proportion to what each column needs, so the widest column
+        (usually the player) does not need horizontal scrolling while the others have spare room."""
+        self.root.update_idletasks()
+        for idx, col in enumerate((self.col1, self.col2, self.col3)):
+            self._columns_body.columnconfigure(idx, weight=max(1, col.body.winfo_reqwidth()), uniform="col")
+
+    def cycle_text_size(self):
+        """Switch Normal -> Large -> Extra Large and resize the whole app immediately."""
+        self.text_size = next_text_size(self.text_size)
+        apply_text_size(self.root, self.text_size)
+        self._balance_columns()
+        if hasattr(self, "btn_text_size"):
+            self.btn_text_size.config(text=f"🔠 Text Size: {self.text_size}")
+        self.set_status(f"Text size set to {self.text_size}.", icon="🔠")
+        self._schedule_settings_save()
 
     def _build_layout(self):
         style = ttk.Style()
@@ -561,14 +673,18 @@ class UltimateAudioStudio:
 
         body = tk.Frame(self.root, bg=BG_ROOT)
         body.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
-        body.columnconfigure(0, weight=1, uniform="col")
-        body.columnconfigure(1, weight=1, uniform="col")
-        body.columnconfigure(2, weight=1, uniform="col")
+        # Column widths are balanced to their content in _balance_columns() once they are built.
+        self._columns_body = body
+        for idx in range(3):
+            body.columnconfigure(idx, weight=1, uniform="col")
         body.rowconfigure(0, weight=1)
 
-        self.col1 = tk.Frame(body, bg=BG_CARD, relief=tk.SOLID, borderwidth=1, highlightbackground=BORDER_MAIN, highlightthickness=1, padx=14, pady=14)
-        self.col2 = tk.Frame(body, bg=BG_CARD, relief=tk.SOLID, borderwidth=1, highlightbackground=BORDER_MAIN, highlightthickness=1, padx=14, pady=14)
-        self.col3 = tk.Frame(body, bg=BG_CARD, relief=tk.SOLID, borderwidth=1, highlightbackground=BORDER_MAIN, highlightthickness=1, padx=14, pady=14)
+        # Each column scrolls when the window is too small for it (small laptops, 125-150% scaling,
+        # or a larger text size), so no button can ever be cut off.
+        col_opts = dict(relief=tk.SOLID, borderwidth=1, highlightbackground=BORDER_MAIN, highlightthickness=1, padx=14, pady=14)
+        self.col1 = ScrollableFrame(body, bg=BG_CARD, **col_opts)
+        self.col2 = ScrollableFrame(body, bg=BG_CARD, **col_opts)
+        self.col3 = ScrollableFrame(body, bg=BG_CARD, **col_opts)
         self.col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.col2.grid(row=0, column=1, sticky="nsew", padx=4)
         self.col3.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
@@ -594,6 +710,16 @@ class UltimateAudioStudio:
             command=self.check_for_updates_manual
         )
         self.btn_version_check.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.btn_text_size = tk.Button(
+            f_status, text=f"🔠 Text Size: {self.text_size}",
+            font=FONT_STATUS_BAR, bg="#1e293b", fg="#f8fafc",
+            activebackground="#334155", activeforeground="#f8fafc",
+            relief=tk.FLAT, padx=8, pady=2, cursor="hand2",
+            command=self.cycle_text_size
+        )
+        self.btn_text_size.pack(side=tk.RIGHT, padx=(8, 0))
+        ToolTip(self.btn_text_size, "Make all text in the app bigger or smaller")
 
         self.btn_update_badge = tk.Button(
             f_status, text="⭐ Update Available",
@@ -667,9 +793,10 @@ class UltimateAudioStudio:
         if hasattr(self, "btn_update_badge") and self.btn_update_badge.winfo_exists():
             self.btn_update_badge.config(text=f"⭐ Update to {tag}")
             self.btn_update_badge.pack(side=tk.RIGHT, padx=(8, 0))
-        # If running as a frozen executable, open the update dialog
+        # If running as a frozen executable, offer the update; installing always needs a click
+        # and waits for downloads/exports to finish (see busy_reason / prepare_for_restart).
         if getattr(sys, "frozen", False):
-            self._open_update_dialog(auto_start=True)
+            self._open_update_dialog(auto_start=False)
 
     def check_for_updates_manual(self):
         """User-initiated update check with explicit UI feedback."""
@@ -733,14 +860,14 @@ class UltimateAudioStudio:
             )
 
     def build_column_1(self):
-        build_step1_view(self.col1, self)
+        build_step1_view(self.col1.body, self)
 
     def build_column_2(self):
-        build_step2_view(self.col2, self)
+        build_step2_view(self.col2.body, self)
         self.waveform_view = WaveformView(self.canvas_waveform, self)
 
     def build_column_3(self):
-        build_step3_view(self.col3, self)
+        build_step3_view(self.col3.body, self)
 
     def _draw_placeholder_cover(self):
         if hasattr(self, "canvas_cover"):
@@ -769,7 +896,8 @@ class UltimateAudioStudio:
                 def _on_spawn(p):
                     self._active_waveform_proc = p
 
-                peaks = extract_waveform_peaks(filepath, n_bars=220, cancel_event=cancel_evt, on_process_spawned=_on_spawn)
+                analysis = analyze_audio(filepath, n_bars=220, cancel_event=cancel_evt, on_process_spawned=_on_spawn)
+                peaks, loudness = analysis.peaks, analysis.loudness_db
                 self._active_waveform_proc = None
 
                 if cancel_evt and cancel_evt.is_set():
@@ -778,14 +906,17 @@ class UltimateAudioStudio:
 
                 if peaks and any(val > 0.001 for val in peaks):
                     cache_mgr.set_peaks(filepath, peaks)
+                if loudness is not None:
+                    cache_mgr.set_loudness(filepath, loudness)
                 if req_id == self._waveform_req_id and not getattr(self, "_is_shutting_down", False):
-                    def on_done(p=peaks, f=filepath, r=req_id):
+                    def on_done(p=peaks, f=filepath, r=req_id, ld=loudness):
                         if r == self._waveform_req_id and not getattr(self, "_is_shutting_down", False):
                             self._waveform_loading = False
                             if self.selected_file_path == f:
                                 self._current_peaks = p if (p and any(val > 0.001 for val in p)) else []
+                                self._current_loudness = ld
                                 if hasattr(self, "playback_ctrl"):
-                                    self.playback_ctrl.update_auto_level_for_peaks(self._current_peaks)
+                                    self.playback_ctrl.update_auto_level(ld)
                                 self._render_waveform(full_redraw=True)
                     self._safe_after(0, on_done)
                 self._waveform_queue.task_done()
@@ -873,19 +1004,22 @@ class UltimateAudioStudio:
             except Exception:
                 break
 
-        # Check persistent cache first
+        # Check persistent cache first (entries from older versions lack loudness: re-analyze those)
         disk_peaks = cache_mgr.get_peaks(filepath)
-        if disk_peaks and any(val > 0.001 for val in disk_peaks):
+        disk_loudness = cache_mgr.get_loudness(filepath)
+        if disk_peaks and any(val > 0.001 for val in disk_peaks) and disk_loudness is not None:
             self._current_peaks = disk_peaks
+            self._current_loudness = disk_loudness
             self._waveform_loading = False
             if hasattr(self, "playback_ctrl"):
-                self.playback_ctrl.update_auto_level_for_peaks(disk_peaks)
+                self.playback_ctrl.update_auto_level(disk_loudness)
             self._render_waveform(full_redraw=True)
             return
 
         self._current_peaks = []
+        self._current_loudness = None
         if hasattr(self, "playback_ctrl"):
-            self.playback_ctrl.update_auto_level_for_peaks([])
+            self.playback_ctrl.update_auto_level(None)
         self._waveform_loading = True
         self._render_waveform(full_redraw=True)
         self._waveform_queue.put((filepath, current_req, self._active_waveform_cancel))
@@ -940,8 +1074,20 @@ class UltimateAudioStudio:
 
     def load_playlists(self):
         self.playlist_ctrl.load(PLAYLISTS_PATH)
+        saved_active = getattr(self, "_saved_active_playlist", "")
+        if saved_active in self.playlists:
+            self.active_playlist_name = saved_active
+        self._relink_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
+
+    def _relink_playlists(self):
+        """Reconnect playlist songs that moved into the current Library folder (same file name)."""
+        relinked = self.playlist_ctrl.relink_missing(self.library_folder)
+        if relinked:
+            self.save_playlists()
+            self.set_status(f"Reconnected {relinked} playlist song(s) found in your Library folder.")
+        return relinked
 
     def save_playlists(self):
         self.playlist_ctrl.save(PLAYLISTS_PATH)
@@ -965,9 +1111,9 @@ class UltimateAudioStudio:
             if not os.path.exists(f):
                 self.listbox_pl.insert(tk.END, f"{prefix}⚠️ [Missing] {name}")
                 continue
-            dur = self._cached_duration(f)
+            dur = self._cached_duration(f, probe=False)
             dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
-            self.listbox_pl.insert(tk.END, f"{prefix}{name}{dur_str}")
+            self.listbox_pl.insert(tk.END, f"{prefix}{self._display_name(f)}{dur_str}")
 
     def on_playlist_selected(self, _event=None):
         name = self.playlist_var.get()
@@ -977,6 +1123,7 @@ class UltimateAudioStudio:
             if self.is_playing_playlist:
                 self.stop_audio()
             self.refresh_playlist_listbox()
+            self._schedule_settings_save()
             self.set_status(f"Switched to playlist: {name}")
 
     def create_playlist(self):
@@ -991,6 +1138,7 @@ class UltimateAudioStudio:
         self.save_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
+        self._schedule_settings_save()
         self.set_status(f"Created new playlist: {name}")
 
     def rename_playlist(self):
@@ -1006,6 +1154,7 @@ class UltimateAudioStudio:
         self.save_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
+        self._schedule_settings_save()
         self.set_status(f"Renamed playlist to: {name}")
 
     def delete_playlist(self):
@@ -1020,20 +1169,76 @@ class UltimateAudioStudio:
         self.save_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
+        self._schedule_settings_save()
         self.set_status(f"Deleted playlist '{current}'.")
 
     def refresh_library(self, select_name=None):
+        """Show the folder's songs immediately; tags and durations fill in from a background scan."""
         self.library_files = self.library_ctrl.scan_files(self.library_folder)
-        self.library_ctrl.update_search_index(
-            self.library_folder, self.library_files, get_metadata_fn=self._cached_metadata
-        )
         self.apply_library_filter(select_name)
+        self._warm_library_metadata()
 
-    def apply_library_filter(self, select_name=None):
+    def _warm_library_metadata(self):
+        """Read tags/durations for songs not yet cached on a worker thread, then refresh the lists once."""
+        paths = [os.path.join(self.library_folder, f) for f in self.library_files]
+        paths += [f for f in getattr(self, "playlist_files", []) if f not in paths]
+        missing = [p for p in paths if cache_mgr.get_metadata(p) is None]
+        if not missing:
+            return
+        self._library_meta_gen += 1
+        gen = self._library_meta_gen
+        if len(missing) > 20:
+            self.set_status(f"Reading song details for {len(missing)} songs...", icon="⏳")
+
+        def _worker():
+            for path in missing:
+                if getattr(self, "_is_shutting_down", False) or gen != self._library_meta_gen:
+                    return
+                try:
+                    cache_mgr.set_metadata(path, read_track_metadata(path))
+                except Exception as e:
+                    log_error(f"metadata warm-up {path}: {e}")
+            self._safe_after(0, self._on_library_metadata_ready, gen, len(missing))
+
+        task_mgr.submit_task(_worker)
+
+    def _on_library_metadata_ready(self, gen, count):
+        if gen != self._library_meta_gen or getattr(self, "_is_shutting_down", False):
+            return
+        self.library_ctrl.invalidate_search_index()
+        self.apply_library_filter(preserve_view=True)
+        pl_selection = self.listbox_pl.curselection()
+        pl_view = self.listbox_pl.yview()[0]
+        self.refresh_playlist_listbox()
+        for idx in pl_selection:
+            self.listbox_pl.selection_set(idx)
+        self.listbox_pl.yview_moveto(pl_view)
+        if count > 20:
+            self.set_status("Ready. Select a song on the left to play or trim.")
+
+    def _display_name(self, path, filename=None):
+        """Friendly row text: 'Title — Artist' from tags when present, else the file name without extension."""
+        meta = self._cached_metadata(path, probe=False)
+        stem = os.path.splitext(filename or os.path.basename(path))[0]
+        title = (meta.get("title") or "").strip() or stem
+        artist = (meta.get("artist") or "").strip()
+        if artist.endswith(" - Topic"):
+            artist = artist[: -len(" - Topic")]
+        if artist and artist.lower() not in title.lower():
+            return f"{title} — {artist}"
+        return title
+
+    def apply_library_filter(self, select_name=None, preserve_view=False):
         query = self.entry_search.get().strip().lower() if hasattr(self, "entry_search") else ""
+        prev_selected = set()
+        prev_view = None
+        if preserve_view:
+            prev_selected = {self.visible_files[i] for i in self.listbox_lib.curselection() if i < len(self.visible_files)}
+            prev_view = self.listbox_lib.yview()[0]
         if hasattr(self, "library_ctrl"):
             self.visible_files = self.library_ctrl.filter_files(
-                self.library_files, self.library_folder, query, get_metadata_fn=self._cached_metadata
+                self.library_files, self.library_folder, query,
+                get_metadata_fn=lambda path: self._cached_metadata(path, probe=False)
             )
         else:
             self.visible_files = list(self.library_files)
@@ -1042,12 +1247,16 @@ class UltimateAudioStudio:
         select_idx = None
         for idx, f in enumerate(self.visible_files):
             f_path = os.path.join(self.library_folder, f)
-            dur = self._cached_duration(f_path)
+            dur = self._cached_duration(f_path, probe=False)
             dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
-            self.listbox_lib.insert(tk.END, f"{f}{dur_str}")
+            self.listbox_lib.insert(tk.END, f"{self._display_name(f_path, f)}{dur_str}")
             if select_name and f == select_name:
                 select_idx = idx
+            elif f in prev_selected:
+                self.listbox_lib.selection_set(idx)
 
+        if prev_view is not None:
+            self.listbox_lib.yview_moveto(prev_view)
         if select_idx is not None:
             self.listbox_lib.selection_set(select_idx)
             self.listbox_lib.see(select_idx)
@@ -1071,23 +1280,29 @@ class UltimateAudioStudio:
             self.entry_search.delete(0, tk.END)
             self.apply_library_filter()
 
-    def _cached_duration(self, path):
+    def _cached_duration(self, path, probe=True):
+        """Track duration from cache; with probe=False never touches the file (safe for list redraws)."""
         if not path or not os.path.exists(path):
             return 0.0
         dur = cache_mgr.get_duration(path)
         if dur is not None:
             return dur
+        if not probe:
+            return 0.0
         meta = read_track_metadata(path)
         dur = meta.get("duration", 0.0)
         cache_mgr.set_duration(path, dur)
         return dur
 
-    def _cached_metadata(self, path):
+    def _cached_metadata(self, path, probe=True):
+        """Track tags from cache; with probe=False returns blanks instead of reading the file."""
         if not path or not os.path.exists(path):
             return {"title": "", "artist": "", "duration": 0.0}
         cached_meta = cache_mgr.get_metadata(path)
         if cached_meta is not None:
             return cached_meta
+        if not probe:
+            return {"title": "", "artist": "", "duration": 0.0}
         data = read_track_metadata(path)
         cache_mgr.set_metadata(path, data)
         return data.to_dict() if hasattr(data, "to_dict") else dict(data)
@@ -1097,8 +1312,11 @@ class UltimateAudioStudio:
         if f and os.path.isdir(f):
             self.library_folder = f
             self._save_settings()
+            task_mgr.submit_task(self.library_ctrl.recover_stranded_deletes, f)
             self.refresh_library()
             self.set_status(f"Music folder changed to: {f}")
+            if self._relink_playlists():
+                self.refresh_playlist_listbox()
 
     def open_library_folder(self):
         try:
@@ -1114,36 +1332,15 @@ class UltimateAudioStudio:
         )
         if not files:
             return
-        planned = []
-        for src in files:
-            dest = os.path.join(self.library_folder, os.path.basename(src))
-            if os.path.abspath(src).lower() != os.path.abspath(dest).lower():
-                planned.append((src, dest))
+        # Same plan/confirmation as drag-and-drop, so existing songs are never silently overwritten.
+        self._import_paths(list(files), source="selected")
 
-        if not planned:
-            return self.set_status("Selected files are already in your Library.")
-
-        self.set_busy(True, f"Copying {len(planned)} song(s) into Library...")
-        task_mgr.submit_task(self._copy_external_worker, planned)
-
-    def _copy_external_worker(self, planned):
-        copied = 0
-        for src, dest in planned:
-            if getattr(self, "_is_shutting_down", False):
-                break
-            try:
-                import shutil
-                shutil.copy2(src, dest)
-                copied += 1
-            except Exception as e:
-                log_error(f"copy_external: {e}")
-
-        def _done():
-            self.set_busy(False)
-            self.refresh_library()
-            self.set_status(f"Added {copied} song(s) to your Library.")
-            messagebox.showinfo("Import Complete", f"Successfully added {copied} song(s) to your Library!")
-        self._safe_after(0, _done)
+    def _on_copy_external_done(self, copied):
+        self._importing = False
+        self.set_busy(False)
+        self.refresh_library()
+        self.set_status(f"Added {copied} song(s) to your Library.")
+        messagebox.showinfo("Import Complete", f"Successfully added {copied} song(s) to your Library!")
 
     def paste_youtube_link(self):
         try:
@@ -1271,7 +1468,7 @@ class UltimateAudioStudio:
             self.set_status(f"Renamed song to: {new_name}")
         except Exception as e:
             log_error(f"rename_library_file: {e}")
-            messagebox.showerror("Rename Failed", f"Could not rename this file:\n{e}")
+            show_friendly_error(self.root, e, "generic")
 
     def delete_library_file(self):
         sel = self.listbox_lib.curselection()
@@ -1311,7 +1508,7 @@ class UltimateAudioStudio:
             )
         except Exception as e:
             log_error(f"delete_library_file: {e}")
-            messagebox.showerror("Delete Failed", f"Could not delete this file:\n{e}")
+            show_friendly_error(self.root, e, "generic")
 
     def _undo_delete_file(self):
         try:
@@ -1326,7 +1523,7 @@ class UltimateAudioStudio:
     def show_help(self):
         win = tk.Toplevel(self.root)
         win.title("Ultimate Audio Studio - Help Guide")
-        win.geometry("560x520")
+        win.geometry("640x600")
         win.minsize(480, 400)
         win.configure(bg=BG_CARD)
 
@@ -1349,8 +1546,13 @@ class UltimateAudioStudio:
             "STEP 3: PLAYLISTS & EXPORT\n"
             "• Playlists: Organize favorite songs with 'New Playlist' and reorder tracks using ▲ Up and ▼ Down.\n"
             "• USB Flash Drive: Plug in a USB flash drive, choose it from the list, and click 'Export Playlist Now'. "
-            "Songs are normalized and an M3U playlist file is created automatically for car stereos!\n"
-            "• CD Burn: Creates CD-ready WAV audio tracks on your Desktop in 'My_CD_Burn_Folder'."
+            "Songs are normalized and an M3U playlist file is created automatically for car stereos! "
+            "Click 'Eject' before unplugging the drive.\n"
+            "• CD Burn: Creates CD-ready audio tracks on your Desktop in 'My_CD_Burn_Folder'. Burn them with "
+            "Windows Media Player's 'Burn' tab set to 'Audio CD' (not File Explorer's 'Send to').\n\n"
+            "HANDY EXTRAS\n"
+            "• Text Size: Click '🔠 Text Size' at the bottom of the window to make all text bigger.\n"
+            "• Keyboard: Press Tab to move between buttons (a dotted outline shows where you are), then Enter to click."
         )
 
         txt = tk.Text(f_content, font=FONT_BODY, wrap="word", bg=BG_SUB_CARD, fg=TEXT_DARK, padx=10, pady=10, relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER_MAIN)
@@ -1509,21 +1711,17 @@ class UltimateAudioStudio:
         )
 
     def _on_search_preview_play(self):
-        """Pause active playback in main window when preview starts, marking reload needed."""
+        """Pause main playback when a search preview starts; the preview replaces the mixer's track,
+        so resuming must reload the song at the paused position."""
         if (self.is_playing_main or self.is_playing_playlist) and not self.is_paused:
             self.pause_audio()
-            self._scrubbed_while_paused = True
+        self.playback_ctrl.mark_mixer_taken()
 
     def _handle_search_error(self, err):
         self.btn_download.config(text="⬇ Download MP3", state=tk.NORMAL)
         self.btn_cancel_dl.config(state=tk.DISABLED)
         self.set_busy(False, "Search failed.")
-        messagebox.showerror(
-            "Search Failed",
-            "Could not search YouTube.\n\n"
-            "Please check that you are online and try again.\n\n"
-            f"Details: {err}"
-        )
+        show_friendly_error(self.root, err, "search")
 
     def _start_download_url(self, target_url, display_title=None):
         status_text = f'Downloading "{display_title}"...' if display_title else "Downloading from YouTube..."
@@ -1576,12 +1774,7 @@ class UltimateAudioStudio:
         self.prog_download.pack_forget()
         self.lbl_dl_metrics.pack_forget()
         self.set_busy(False, "Download failed.")
-        messagebox.showerror(
-            "Download Failed",
-            "The video could not be downloaded.\n\n"
-            "Please check that you are online and that the link is valid.\n\n"
-            f"Details: {error}"
-        )
+        show_friendly_error(self.root, error, "download")
 
     def on_volume_change(self, val):
         v = float(val)
@@ -1592,6 +1785,7 @@ class UltimateAudioStudio:
             self.btn_mute.config(text="🔇" if v <= 0.01 else "🔊")
         if v > 0.01:
             self._unmuted_volume = v
+        self._schedule_settings_save()
 
     @property
     def is_muted(self):
@@ -1621,12 +1815,12 @@ class UltimateAudioStudio:
         self.audio_engine.set_auto_level(enabled)
         if enabled:
             if hasattr(self, "playback_ctrl"):
-                self.playback_ctrl.update_auto_level_for_peaks(self._current_peaks)
-            self.set_status("Auto-level playback enabled: quiet tracks will be boosted smoothly.", icon="🔊")
+                self.playback_ctrl.update_auto_level(self._current_loudness)
+            self.set_status("Auto-level playback enabled: loud and quiet songs will play at a similar volume.", icon="🔊")
         else:
             self.audio_engine.set_track_gain(1.0)
             self.set_status("Auto-level playback disabled.", icon="ℹ️")
-        self._save_settings()
+        self._schedule_settings_save()
 
     def _current_play_seconds(self):
         return min(self.track_duration or 10**9, self.audio_engine.current_play_seconds())
@@ -1637,6 +1831,33 @@ class UltimateAudioStudio:
         self.play_clock_origin = self.audio_engine.play_clock_origin
         self.play_guard_until = time.monotonic() + 0.45
         self.is_paused = False
+
+    def _when_playable(self, path, start_fn, busy_text="Preparing this song for playback..."):
+        """Run start_fn once path can be played, converting (e.g. M4A -> WAV) on a worker if needed.
+
+        The conversion can take many seconds, so it never runs on the Tkinter thread. If the user
+        stops or picks another song meanwhile, the stale start is dropped.
+        """
+        if not self.audio_engine.needs_conversion(path):
+            self._pending_play_token = None
+            start_fn()
+            return
+        token = object()
+        self._pending_play_token = token
+        self.set_busy(True, busy_text)
+
+        def _worker():
+            self.audio_engine.get_playable_audio_path(path)
+            self._safe_after(0, _ready)
+
+        def _ready():
+            if self._pending_play_token is not token:
+                return
+            self._pending_play_token = None
+            self.set_busy(False)
+            start_fn()
+
+        task_mgr.submit_task(_worker)
 
     def _load_track_ui(self, path, title=None):
         self.selected_file_path = path
@@ -1671,6 +1892,9 @@ class UltimateAudioStudio:
 
         self._load_album_art(path)
         self._load_waveform(path)
+        if self.audio_engine.needs_conversion(path):
+            # Convert ahead of time so pressing Play is instant.
+            task_mgr.submit_task(self.audio_engine.get_playable_audio_path, path)
         return True
 
     def on_library_select(self, event):
@@ -1741,10 +1965,8 @@ class UltimateAudioStudio:
         if (self.is_playing_main or self.is_playing_playlist) and not self.is_paused:
             self._seek_playback(v)
         else:
-            self.play_start_offset = v
-            self.audio_engine.seek_clock(v, is_playing=False)
-            if self.is_paused:
-                self._scrubbed_while_paused = True
+            # Controller records the paused position so Resume continues from the new spot.
+            self.playback_ctrl.seek(v, self.track_duration)
 
     def _seek_playback(self, seconds):
         if not self.selected_file_path:
@@ -1924,18 +2146,21 @@ class UltimateAudioStudio:
             self.pause_audio()
             return
         self.stop_audio()
-        try:
-            start_pos = float(self.scale_progress.get())
-            if hasattr(self, "playback_ctrl"):
-                self.playback_ctrl.play_track(self.selected_file_path, start_pos, is_playlist=False)
-            else:
-                self.audio_engine.load_and_play(self.selected_file_path, start_pos)
-                self._start_clock(start_pos)
-                self.is_playing_main = True
-            self._set_card_playing_state("playing")
-            self.set_status(f"Playing: {os.path.basename(self.selected_file_path)}", icon="▶")
-        except Exception as e:
-            messagebox.showerror("Playback Error", f"Could not play this file:\n{e}")
+        path = self.selected_file_path
+        start_pos = float(self.scale_progress.get())
+
+        def _start():
+            if self.selected_file_path != path:
+                return
+            try:
+                self.playback_ctrl.play_track(path, start_pos, is_playlist=False)
+                self._set_card_playing_state("playing")
+                self.set_status(f"Playing: {os.path.basename(path)}", icon="▶")
+            except Exception as e:
+                log_error(f"play_main: {e}")
+                show_friendly_error(self.root, e, "playback")
+
+        self._when_playable(path, _start)
 
     def pause_audio(self):
         if not self.selected_file_path:
@@ -1950,7 +2175,8 @@ class UltimateAudioStudio:
                 self._set_card_playing_state("playing")
                 self.set_status(f"Playing: {os.path.basename(self.selected_file_path)}", icon="▶")
             except Exception as e:
-                messagebox.showerror("Playback Error", f"Could not resume playback:\n{e}")
+                log_error(f"resume: {e}")
+                show_friendly_error(self.root, e, "playback")
             return
         if not (self.is_playing_main or self.is_playing_playlist):
             return
@@ -1984,11 +2210,30 @@ class UltimateAudioStudio:
         fade_sec = self._get_fade_sec()
         loop = bool(self.loop_clip.get()) if hasattr(self, "loop_clip") else False
 
+        path = self.selected_file_path
+        token = object()
+        self._pending_play_token = token
+        self.set_busy(True, "Preparing your clip preview...")
+
+        def _prepare():
+            # Both steps can run FFmpeg for seconds, so they stay off the Tkinter thread.
+            self.audio_engine.get_playable_audio_path(path)
+            slice_path = self.playback_ctrl.prepare_audition(path, s_time, e_time, gain_db, soften, fade_sec)
+            self._safe_after(0, _start, slice_path)
+
+        def _start(slice_path):
+            if self._pending_play_token is not token or self.selected_file_path != path:
+                self.playback_ctrl.discard_audition(slice_path)
+                return
+            self._pending_play_token = None
+            self.set_busy(False)
+            self._start_test_clip(path, s_time, e_time, slice_path, gain_db, soften, fade_sec, loop)
+
+        task_mgr.submit_task(_prepare)
+
+    def _start_test_clip(self, path, s_time, e_time, slice_path, gain_db, soften, fade_sec, loop):
         try:
-            self.playback_ctrl.test_clip(
-                self.selected_file_path, s_time, e_time,
-                gain_db=gain_db, soften=soften, fade_sec=fade_sec, loop=loop
-            )
+            self.playback_ctrl.start_audition(path, s_time, e_time, slice_path, loop=loop)
             self._is_audition_slice = self.playback_ctrl._is_audition_slice
             self._audition_slice_file = self.playback_ctrl._audition_slice_file
             self.is_playing_main = True
@@ -2010,7 +2255,8 @@ class UltimateAudioStudio:
             note_str = f" ({', '.join(notes)})" if notes else ""
             self.set_status(f"Previewing clip from {format_time(s_time)} to {format_time(e_time)}{note_str}.", icon="▶")
         except Exception as e:
-            messagebox.showerror("Playback Error", f"Could not preview this clip:\n{e}")
+            log_error(f"test_clip: {e}")
+            show_friendly_error(self.root, e, "playback")
 
     def _restart_clip_loop(self):
         s_time = self.clip_start_sec
@@ -2025,6 +2271,9 @@ class UltimateAudioStudio:
             return False
 
     def stop_audio(self, user=False):
+        if self._pending_play_token is not None:
+            self._pending_play_token = None
+            self.set_busy(False)
         if hasattr(self, "playback_ctrl"):
             self.playback_ctrl.stop(user=user)
         self._release_audio_file()
@@ -2148,6 +2397,7 @@ class UltimateAudioStudio:
         gain_db = float(self.scale_gain.get()) if hasattr(self, "scale_gain") else 0.0
         fade_sec = self._get_fade_sec()
 
+        self._saving_clip = True
         self.btn_save_clip.config(text="Saving...", state=tk.DISABLED)
         self.set_busy(True, "Trimming audio and saving 320 kbps MP3 clip...")
 
@@ -2164,6 +2414,7 @@ class UltimateAudioStudio:
         )
 
     def _save_success(self, name, full_path, was_self_overwrite):
+        self._saving_clip = False
         self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
         self.set_busy(False)
         cache_mgr.invalidate(full_path)
@@ -2185,9 +2436,10 @@ class UltimateAudioStudio:
             messagebox.showinfo("Clip Saved", "Your trimmed song has been saved as 320 kbps MP3 to your Library!")
 
     def _save_error(self, err):
+        self._saving_clip = False
         self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
         self.set_busy(False, "Could not save clip.")
-        messagebox.showerror("Error", f"Failed to save clip:\n{err}")
+        show_friendly_error(self.root, err, "save_clip")
 
     def add_to_playlist(self):
         sel = self.listbox_lib.curselection() if hasattr(self, "listbox_lib") else ()
@@ -2293,7 +2545,13 @@ class UltimateAudioStudio:
     def play_prev_in_playlist(self):
         if not self.playlist_files:
             return
-        prev_idx = self.playlist_ctrl.get_prev_index(self.active_playlist_name, self.playlist_index)
+        # Like a CD player: past the first few seconds, Previous restarts the current song.
+        if (self.is_playing_playlist or self.is_paused) and self._current_play_seconds() > 3.0:
+            self._play_current_pl_track()
+            return
+        prev_idx = self.playlist_ctrl.get_prev_index(
+            self.active_playlist_name, self.playlist_index, repeat=bool(self.repeat_playlist.get())
+        )
         if prev_idx is not None:
             self.playlist_index = prev_idx
             self._play_current_pl_track()
@@ -2328,18 +2586,21 @@ class UltimateAudioStudio:
         self.stop_audio()
         if not self._load_track_ui(path):
             return
-        try:
-            if hasattr(self, "playback_ctrl"):
+        index = self.playlist_index
+
+        def _start():
+            if self.selected_file_path != path:
+                return
+            try:
                 self.playback_ctrl.play_track(path, 0.0, is_playlist=True)
-            else:
-                self.audio_engine.load_and_play(path, 0.0)
-                self._start_clock(0.0)
-                self.is_playing_playlist = True
-            self._set_card_playing_state("playing")
-            self.refresh_playlist_listbox()
-            self.set_status(f"Playlist ({self.playlist_index+1}/{len(self.playlist_files)}): {os.path.basename(path)}", icon="▶")
-        except Exception as e:
-            messagebox.showerror("Playback Error", f"Could not play playlist song:\n{e}")
+                self._set_card_playing_state("playing")
+                self.refresh_playlist_listbox()
+                self.set_status(f"Playlist ({index + 1}/{len(self.playlist_files)}): {os.path.basename(path)}", icon="▶")
+            except Exception as e:
+                log_error(f"_play_current_pl_track: {e}")
+                show_friendly_error(self.root, e, "playback")
+
+        self._when_playable(path, _start)
 
     def export_playlist(self):
         if not self.playlist_files:
@@ -2382,6 +2643,7 @@ class UltimateAudioStudio:
                 )
                 return
 
+            self._exporting = True
             self.btn_export.config(text="Exporting...", state=tk.DISABLED)
             self.prog_export.pack(fill=tk.X, pady=(4, 2))
             self.prog_export["value"] = 0
@@ -2429,6 +2691,7 @@ class UltimateAudioStudio:
                 if not ok:
                     return
 
+            self._exporting = True
             self.btn_export.config(text="Preparing CD...", state=tk.DISABLED)
             self.prog_export.pack(fill=tk.X, pady=(4, 2))
             self.prog_export["value"] = 0
@@ -2450,26 +2713,30 @@ class UltimateAudioStudio:
             self.prog_export["value"] = pct
 
     def _usb_export_success(self, success_count, total, skipped):
+        self._exporting = False
         self.btn_export.config(text="⚡ Export Playlist Now", state=tk.NORMAL)
         self.prog_export.pack_forget()
-        self.set_busy(False, "USB export finished! Files safely written and flushed to drive.")
+        self.set_busy(False, "USB export finished. Eject the drive before unplugging it.")
         pl_name = self.active_playlist_name or "Playlist"
         clean_pl = sanitize_filename(pl_name)
         if skipped:
-            msg = f"Exported {success_count} of {total} song(s) to USB flash drive (with '00_{clean_pl}.m3u' playlist).\n\n{len(skipped)} song(s) could not be processed:\n"
+            msg = f"Exported {success_count} of {total} song(s) to the USB flash drive (with '00_{clean_pl}.m3u' playlist).\n\n{len(skipped)} song(s) could not be processed:\n"
             msg += "\n".join(f"• {s}" for s in skipped[:6])
             if len(skipped) > 6:
                 msg += f"\n... and {len(skipped) - 6} more."
             messagebox.showwarning("Export Completed with Warnings", msg)
+            question = "Would you like to safely eject the USB flash drive now so you can unplug it?"
         else:
-            messagebox.showinfo(
-                "Export Successful",
-                f"Playlist copied to USB flash drive successfully!\n\nAn '00_{clean_pl}.m3u' playlist file was created for car stereos and media players.\n\nAll file buffers have been written and flushed to the disk. You can safely remove the flash drive."
+            question = (
+                f"Your playlist was copied to the USB flash drive, with a '00_{clean_pl}.m3u' playlist file "
+                "for car stereos and media players.\n\n"
+                "Before unplugging it, the drive should be ejected.\n\nEject the USB flash drive now?"
             )
-        if messagebox.askyesno("Safe USB Ejection", "Export complete! Would you like to safely eject the USB flash drive now so you can unplug it?"):
+        if messagebox.askyesno("Export Successful" if not skipped else "Eject USB Drive", question):
             self.eject_selected_usb()
 
     def _cd_export_success(self, cd_folder, success_count, total, skipped):
+        self._exporting = False
         self.btn_export.config(text="⚡ Export Playlist Now", state=tk.NORMAL)
         self.prog_export.pack_forget()
         self.set_busy(False, "CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
@@ -2477,27 +2744,44 @@ class UltimateAudioStudio:
         if skipped:
             warn_text = f"\n\nNote: {len(skipped)} song(s) were skipped:\n" + "\n".join(f"• {s}" for s in skipped[:5])
 
-        msg = (
-            f"Prepared {success_count} of {total} audio CD track(s) on your Desktop in 'My_CD_Burn_Folder'.{warn_text}\n\n"
-            "1. Insert a blank CD.\n"
-            "2. Select all files in that folder.\n"
-            "3. Right-click and choose 'Send to' -> Your CD Drive."
+        # File Explorer's 'Send to / Burn to disc' makes a DATA disc that most CD players and car
+        # stereos cannot play. An audio CD must be burned with Windows Media Player's Burn list.
+        wmp = find_windows_media_player()
+        steps = (
+            "To make a CD that plays in any CD player or car stereo:\n"
+            "1. Insert a blank CD-R.\n"
+            "2. In Windows Media Player, click the 'Burn' tab (top right).\n"
+            "3. Click the Burn options button and choose 'Audio CD'.\n"
+            "4. Drag all the songs from the CD folder into the Burn list.\n"
+            "5. Click 'Start burn'.\n\n"
+            "Please do not use File Explorer's 'Send to' for this: it makes a data disc that most CD players cannot play."
         )
-        if skipped:
-            messagebox.showwarning("Ready to Burn (with skipped files)", msg)
+        msg = f"Prepared {success_count} of {total} CD track(s) in 'My_CD_Burn_Folder' on your Desktop.{warn_text}\n\n{steps}"
+        if wmp:
+            if messagebox.askyesno("Ready to Burn", msg + "\n\nOpen Windows Media Player and the CD folder now?"):
+                try:
+                    os.startfile(cd_folder)
+                    os.startfile(wmp)
+                except OSError as e:
+                    log_error(f"open CD burn tools: {e}")
         else:
-            messagebox.showinfo("Ready to Burn", msg)
-        try:
-            os.startfile(cd_folder)
-        except Exception:
-            pass
+            messagebox.showinfo(
+                "Ready to Burn",
+                msg + "\n\nWindows Media Player is not installed on this PC. You can add it in "
+                "Settings > Apps > Optional features > 'Windows Media Player Legacy'.",
+            )
+            try:
+                os.startfile(cd_folder)
+            except OSError:
+                pass
 
     def _export_error(self, err):
+        self._exporting = False
         self.btn_export.config(text="⚡ Export Playlist Now", state=tk.NORMAL)
         if hasattr(self, "prog_export"):
             self.prog_export.pack_forget()
         self.set_busy(False, "Export failed.")
-        messagebox.showerror("Export Failed", err)
+        show_friendly_error(self.root, err, "export")
 
 
 def main():
