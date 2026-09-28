@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 import pygame
 
@@ -104,7 +105,9 @@ class SearchChoiceDialog:
             ph = self.parent.winfo_height()
             px = self.parent.winfo_rootx()
             py = self.parent.winfo_rooty()
-            w, h = 760, 560
+            # Grow with the user's text size; never smaller than the classic 760x560 layout.
+            w = min(max(760, self.win.winfo_reqwidth()), self.win.winfo_screenwidth() - 40)
+            h = min(max(560, self.win.winfo_reqheight()), self.win.winfo_screenheight() - 80)
             x = px + max(0, (pw - w) // 2)
             y = py + max(0, (ph - h) // 2)
             self.win.geometry(f"{w}x{h}+{x}+{y}")
@@ -218,7 +221,7 @@ class SearchChoiceDialog:
             foreground=TEXT_DARK,
             fieldbackground=BG_INPUT,
             font=FONT_BODY,
-            rowheight=30
+            rowheight=max(30, tkfont.Font(font=FONT_BODY).metrics("linespace") + 12)
         )
         style.configure(
             "Search.Treeview.Heading",
@@ -468,12 +471,15 @@ class SearchChoiceDialog:
             pass
 
     def _do_select(self):
+        # Validate the choice before shutting the dialog down; otherwise an empty click would leave
+        # the dialog open but with its preview and UI queue permanently stopped.
+        sel = self.tree.selection()
+        idx = int(sel[0]) if sel else -1
+        if not (0 <= idx < len(self.results)):
+            self.lbl_preview_status.config(text="Please click a song in the list first, then click Download.", fg=COLOR_STOP)
+            return
         self._closed = True
         self._stop_preview(reset_status=False)
-        sel = self.tree.selection()
-        if not sel:
-            return
-        idx = int(sel[0])
         if 0 <= idx < len(self.results):
             chosen = self.results[idx]
             self.chosen_item = chosen

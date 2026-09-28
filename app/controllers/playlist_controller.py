@@ -22,7 +22,12 @@ class PlaylistController:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict) and data:
-                    self.playlists = data
+                    # Drop malformed entries instead of crashing later on non-list values.
+                    self.playlists = {
+                        str(name): [t for t in tracks if isinstance(t, str) and t]
+                        for name, tracks in data.items()
+                        if isinstance(tracks, list)
+                    } or {DEFAULT_PLAYLIST_NAME: []}
                     if DEFAULT_PLAYLIST_NAME not in self.playlists:
                         self.playlists[DEFAULT_PLAYLIST_NAME] = []
                     self.active_playlist_name = list(self.playlists.keys())[0]
@@ -136,9 +141,33 @@ class PlaylistController:
         """Return list of all playlist names."""
         return list(self.playlists.keys())
 
-    def get_prev_index(self, playlist_name, current_index):
-        """Calculate previous track index in playlist."""
+    def get_prev_index(self, playlist_name, current_index, repeat=False):
+        """Calculate previous track index; at the first track, stay there unless repeat wraps to the end."""
         tracks = self.playlists.get(playlist_name, [])
         if not tracks:
             return None
-        return (current_index - 1) % len(tracks)
+        if current_index > 0:
+            return min(current_index - 1, len(tracks) - 1)
+        return len(tracks) - 1 if repeat else 0
+
+    def relink_missing(self, library_folder):
+        """Point playlist entries whose file is gone at a same-named file in library_folder.
+
+        Returns the number of entries relinked (e.g. after the library folder was moved or changed).
+        """
+        if not library_folder or not os.path.isdir(library_folder):
+            return 0
+        try:
+            by_name = {f.lower(): f for f in os.listdir(library_folder)}
+        except OSError:
+            return 0
+        relinked = 0
+        for tracks in self.playlists.values():
+            for idx, path in enumerate(tracks):
+                if not path or os.path.exists(path):
+                    continue
+                match = by_name.get(os.path.basename(path).lower())
+                if match:
+                    tracks[idx] = os.path.join(library_folder, match)
+                    relinked += 1
+        return relinked

@@ -1,7 +1,10 @@
 """Library controller handling scanning, search filtering, renaming, file import, and safe deletion with undo."""
 
+import contextlib
+import ctypes
 import os
 import shutil
+import uuid
 
 from app.config import AUDIO_EXTS, log_error
 from app.core.task_manager import task_mgr
@@ -10,6 +13,41 @@ try:
     from send2trash import send2trash as _send2trash
 except ImportError:
     _send2trash = None
+
+UNDO_DIR_NAME = ".undo_trash"
+
+
+def _hide_path(path):
+    """Mark a folder hidden on Windows so the undo area does not clutter File Explorer."""
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # FILE_ATTRIBUTE_HIDDEN
+
+
+def _trash_staged_file(staging_path, orig_path):
+    """Move a staged file back to its original location, then to the Recycle Bin.
+
+    Restoring it from the Recycle Bin later then returns it to the user's music folder under its
+    real name. If the original name has been reused meanwhile, the staged copy is trashed in place.
+    """
+    if not os.path.exists(staging_path):
+        return
+    target = staging_path
+    if orig_path and not os.path.exists(orig_path):
+        try:
+            shutil.move(staging_path, orig_path)
+            target = orig_path
+        except OSError as e:
+            log_error(f"restore-before-trash failed for {staging_path}: {e}")
+    try:
+        if _send2trash:
+            _send2trash(target)
+        else:
+            os.remove(target)
+    except Exception as e:
+        log_error(f"flush_pending_trash: {e}")
+    with contextlib.suppress(OSError):
+        os.rmdir(os.path.dirname(staging_path))
 
 
 class LibraryController:
@@ -126,13 +164,18 @@ class LibraryController:
         return new_path
 
     def stage_delete_with_undo(self, filepath, playlists):
-        """Stage file deletion by moving to a hidden undo directory so user can undo immediately."""
+        """Stage file deletion by moving to a hidden undo directory so user can undo immediately.
+
+        The file keeps its real name inside a unique sub-folder, and is moved back to its original
+        location before going to the Recycle Bin, so a later 'Restore' from the Bin works normally.
+        """
         self.flush_pending_trash()
         folder = os.path.dirname(filepath)
         filename = os.path.basename(filepath)
-        staging_dir = os.path.join(folder, ".undo_trash")
+        staging_dir = os.path.join(folder, UNDO_DIR_NAME, uuid.uuid4().hex)
         os.makedirs(staging_dir, exist_ok=True)
-        staging_path = os.path.join(staging_dir, f"{filename}.undo")
+        _hide_path(os.path.join(folder, UNDO_DIR_NAME))
+        staging_path = os.path.join(staging_dir, filename)
 
         # Remember playlists where this track was present
         affected_playlists = []
@@ -156,6 +199,8 @@ class LibraryController:
         try:
             if os.path.exists(staging_path):
                 shutil.move(staging_path, orig_path)
+                with contextlib.suppress(OSError):
+                    os.rmdir(os.path.dirname(staging_path))
             self.invalidate_search_index(orig_path)
             # Restore into playlists
             for pl_name, indices in affected_playlists:
@@ -174,16 +219,28 @@ class LibraryController:
         """Commit pending staged delete to Windows Recycle Bin."""
         if not self._pending_delete:
             return
-        _orig, staging_path, _fname, _aff = self._pending_delete
+        orig_path, staging_path, _fname, _aff = self._pending_delete
         self._pending_delete = None
-        if os.path.exists(staging_path):
-            try:
-                if _send2trash:
-                    _send2trash(staging_path)
-                else:
-                    os.remove(staging_path)
-            except Exception as e:
-                log_error(f"flush_pending_trash: {e}")
+        _trash_staged_file(staging_path, orig_path)
+
+    @staticmethod
+    def recover_stranded_deletes(folder):
+        """Send files left in the undo area by a crash or forced exit to the Recycle Bin.
+
+        Returns the number of files handled. Legacy '<name>.undo' files are supported too.
+        """
+        undo_root = os.path.join(folder or "", UNDO_DIR_NAME)
+        if not folder or not os.path.isdir(undo_root):
+            return 0
+        handled = 0
+        for root_dir, _dirs, files in os.walk(undo_root, topdown=False):
+            for name in files:
+                original_name = name[: -len(".undo")] if name.endswith(".undo") else name
+                _trash_staged_file(os.path.join(root_dir, name), os.path.join(folder, original_name))
+                handled += 1
+            with contextlib.suppress(OSError):
+                os.rmdir(root_dir)
+        return handled
 
     def import_external_files(self, planned_copies, is_shutting_down_fn, on_done):
         """Copy external files into library folder in background thread."""

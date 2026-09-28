@@ -25,7 +25,10 @@ class PlaybackController:
         self.clip_end_time = 0.0
         self.current_preview_filepath = None
         self.play_guard_until = 0.0
+        # True when the mixer no longer holds the paused track at the paused position (the user
+        # scrubbed, or another player such as the search preview used the shared pygame mixer).
         self._scrubbed_while_paused = False
+        self.paused_position = 0.0
         self._audition_slice_file = None
         self._is_audition_slice = False
         self._unmuted_volume = 80.0
@@ -57,6 +60,7 @@ class PlaybackController:
         if not (self.is_playing_main or self.is_playing_playlist):
             return
         self.audio_engine.pause()
+        self.paused_position = self.audio_engine.play_start_offset
         self.is_paused = True
         self._scrubbed_while_paused = False
 
@@ -72,8 +76,8 @@ class PlaybackController:
                 return
             except Exception:
                 pass
-        # If scrubbed while paused or unpause failed, reload from saved offset
-        target_pos = self.audio_engine.play_start_offset
+        # If scrubbed while paused, the mixer was borrowed, or unpause failed: reload from saved offset
+        target_pos = self.paused_position
         if current_track_path:
             self.audio_engine.load_and_play(current_track_path, target_pos)
             self.audio_engine.start_clock(target_pos)
@@ -111,7 +115,13 @@ class PlaybackController:
         else:
             self.audio_engine.seek_clock(seek_sec, is_playing=False)
             if self.is_paused:
+                self.paused_position = seek_sec
                 self._scrubbed_while_paused = True
+
+    def mark_mixer_taken(self):
+        """Record that another player used the shared mixer, so resuming must reload the track."""
+        if self.is_paused:
+            self._scrubbed_while_paused = True
 
     def skip_by(self, delta_seconds, track_duration=0.0):
         """Skip playback position by delta_seconds (+10s or -10s)."""
@@ -136,15 +146,35 @@ class PlaybackController:
 
     def test_clip(self, filepath, s_time, e_time, gain_db=0.0, soften=False, fade_sec=1.5, loop=False):
         """Audition a clipped section with gain boost, soft limiter, and smooth fade."""
+        preview_path = self.prepare_audition(filepath, s_time, e_time, gain_db, soften, fade_sec)
+        self.start_audition(filepath, s_time, e_time, preview_path, loop=loop)
+
+    @staticmethod
+    def prepare_audition(filepath, s_time, e_time, gain_db=0.0, soften=False, fade_sec=1.5):
+        """Render the boosted/faded preview slice with FFmpeg (safe to call from a worker thread).
+
+        Returns the temporary WAV path, or None when no processing is needed or rendering failed.
+        """
+        if (abs(gain_db) > 0.05 or soften) and os.path.exists(ffmpeg_path):
+            return create_audition_slice(filepath, s_time, e_time, gain_db=gain_db, soften=soften, fade_sec=fade_sec)
+        return None
+
+    @staticmethod
+    def discard_audition(preview_path):
+        """Delete a rendered preview slice that will not be played."""
+        if preview_path and os.path.exists(preview_path):
+            try:
+                os.remove(preview_path)
+            except OSError:
+                pass
+
+    def start_audition(self, filepath, s_time, e_time, preview_path=None, loop=False):
+        """Start clip playback on the UI thread, from a prepared slice or directly from the track."""
         self.stop(user=False)
         self.loop_preview = bool(loop)
         self.clip_start_time = s_time
         self.clip_end_time = e_time
         self.current_preview_filepath = filepath
-        needs_slice = (abs(gain_db) > 0.05 or soften)
-        preview_path = None
-        if needs_slice and os.path.exists(ffmpeg_path):
-            preview_path = create_audition_slice(filepath, s_time, e_time, gain_db=gain_db, soften=soften, fade_sec=fade_sec)
 
         if preview_path:
             pygame.mixer.music.load(preview_path)
@@ -194,29 +224,29 @@ class PlaybackController:
             except Exception:
                 pass
 
-    def compute_auto_level_gain(self, peaks):
-        """Compute auto-level gain factor from peaks."""
-        if not peaks:
+    # Gated-RMS level most tracks are pulled toward. Chosen low enough that loud modern masters are
+    # turned down while quiet older recordings can still be raised within the mixer's headroom.
+    AUTO_LEVEL_TARGET_DB = -16.0
+    AUTO_LEVEL_MAX_CUT_DB = -12.0
+    AUTO_LEVEL_MAX_BOOST_DB = 6.0
+
+    def compute_auto_level_gain(self, loudness_db):
+        """Return the linear gain factor that moves a track's measured loudness toward the target."""
+        if loudness_db is None:
             return 1.0
         try:
-            max_p = max(peaks) if peaks else 0.0
-            if max_p > 0.05:
-                return max(0.35, min(1.35, 0.70 / max_p))
-        except Exception:
-            pass
-        return 1.0
+            gain_db = self.AUTO_LEVEL_TARGET_DB - float(loudness_db)
+        except (TypeError, ValueError):
+            return 1.0
+        gain_db = max(self.AUTO_LEVEL_MAX_CUT_DB, min(self.AUTO_LEVEL_MAX_BOOST_DB, gain_db))
+        return 10 ** (gain_db / 20.0)
 
-    def update_auto_level_for_peaks(self, peaks):
-        """Update audio engine track gain from peaks."""
-        self.apply_track_auto_level(peaks)
-
-    def apply_track_auto_level(self, peaks):
-        """Adjust track gain factor based on peak amplitude to balance playback loudness."""
-        if not self.audio_engine.auto_level_enabled or not peaks:
+    def update_auto_level(self, loudness_db):
+        """Apply auto-level gain for the current track (unity gain when disabled or unmeasured)."""
+        if not self.audio_engine.auto_level_enabled or loudness_db is None:
             self.audio_engine.set_track_gain(1.0)
             return
-        factor = self.compute_auto_level_gain(peaks)
-        self.audio_engine.set_track_gain(factor)
+        self.audio_engine.set_track_gain(self.compute_auto_level_gain(loudness_db))
 
     @property
     def play_start_offset(self):

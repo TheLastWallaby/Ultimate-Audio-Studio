@@ -3,7 +3,7 @@
 import tkinter as tk
 from tkinter import ttk
 from app.ui.theme import (
-    FONT_STEP_BADGE, FONT_HERO_TITLE, FONT_HERO_ARTIST, FONT_FAMILY,
+    FONT_STEP_BADGE, FONT_HERO_TITLE, FONT_HERO_ARTIST, FONT_SMALL_BOLD,
     FONT_BTN_MAIN, FONT_BTN_SUB, FONT_BODY, FONT_BODY_BOLD, FONT_TIME_LARGE,
     BG_CARD, BG_SUB_CARD, BORDER_MAIN, TEXT_DARK, TEXT_MUTED,
     COLOR_PLAY, COLOR_PLAY_HV, COLOR_PAUSE, COLOR_PAUSE_HV,
@@ -40,7 +40,7 @@ def build_step2_view(parent, app):
     f_state_row = tk.Frame(f_track_info, bg=BG_SUB_CARD)
     f_state_row.pack(fill=tk.X, anchor="w", pady=(1, 0))
 
-    app.lbl_track_state = tk.Label(f_state_row, text="⏹ READY", font=(FONT_FAMILY, 9, "bold"), fg="#ffffff", bg="#64748b", padx=5, pady=1)
+    app.lbl_track_state = tk.Label(f_state_row, text="⏹ READY", font=FONT_SMALL_BOLD, fg="#ffffff", bg="#64748b", padx=5, pady=1)
     app.lbl_track_state.pack(side=tk.LEFT)
 
     app.canvas_vu = tk.Canvas(f_state_row, width=80, height=14, bg=BG_SUB_CARD, highlightthickness=0)
@@ -114,7 +114,7 @@ def build_step2_view(parent, app):
 
     f_wave_top = tk.Frame(f_wave_card, bg=BG_SUB_CARD)
     f_wave_top.pack(fill=tk.X)
-    tk.Label(f_wave_top, text="Interactive Waveform:", font=FONT_BODY_BOLD, fg=TEXT_DARK, bg=BG_SUB_CARD).pack(side=tk.LEFT)
+    tk.Label(f_wave_top, text="Waveform:", font=FONT_BODY_BOLD, fg=TEXT_DARK, bg=BG_SUB_CARD).pack(side=tk.LEFT)
     app.btn_zoom = create_button(f_wave_top, "🔍 Zoom Clip", app.toggle_waveform_zoom, bg=COLOR_BTN_NEUTRAL, fg=COLOR_ACCENT, font=FONT_BTN_SUB, pady=1, padx=4)
     app.btn_zoom.pack(side=tk.LEFT, padx=(6, 0))
     ToolTip(app.btn_zoom, "Zoom in on your trimmed clip section for fine-tuning")
@@ -122,7 +122,7 @@ def build_step2_view(parent, app):
     app.lbl_prog_time = tk.Label(f_wave_top, text="00:00 / 00:00", font=FONT_TIME_LARGE, fg=COLOR_ACCENT, bg=BG_SUB_CARD)
     app.lbl_prog_time.pack(side=tk.RIGHT)
 
-    app.canvas_waveform = tk.Canvas(f_wave_card, height=58, bg="#ffffff", highlightthickness=1, highlightbackground=BORDER_MAIN)
+    app.canvas_waveform = tk.Canvas(f_wave_card, height=90, width=200, bg="#ffffff", highlightthickness=1, highlightbackground=BORDER_MAIN)
     app.canvas_waveform.pack(fill=tk.X, pady=3)
 
     app.scale_progress = tk.Scale(
@@ -160,16 +160,16 @@ def build_step2_view(parent, app):
 
     f_s_nudge = tk.Frame(f_s_box, bg="#eff6ff")
     f_s_nudge.pack(fill=tk.X)
-    btn_ns_m1 = create_button(f_s_nudge, "-1s", lambda: app.nudge_clip_start(-1.0), bg="#dbeafe", fg="#1d4ed8", font=FONT_BTN_SUB, pady=1, padx=2)
+    btn_ns_m1 = create_button(f_s_nudge, "-1s", lambda: app.nudge_clip_start(-1.0), bg="#dbeafe", fg="#1d4ed8", font=FONT_SMALL_BOLD, pady=1, padx=2)
     btn_ns_m1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
     ToolTip(btn_ns_m1, "Nudge Start backward 1.0s")
-    btn_ns_mf = create_button(f_s_nudge, "-0.1s", lambda: app.nudge_clip_start(-0.1), bg="#dbeafe", fg="#1d4ed8", font=FONT_BTN_SUB, pady=1, padx=1)
+    btn_ns_mf = create_button(f_s_nudge, "-0.1s", lambda: app.nudge_clip_start(-0.1), bg="#dbeafe", fg="#1d4ed8", font=FONT_SMALL_BOLD, pady=1, padx=1)
     btn_ns_mf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
     ToolTip(btn_ns_mf, "Fine-tune Start backward 0.1s")
-    btn_ns_pf = create_button(f_s_nudge, "+0.1s", lambda: app.nudge_clip_start(0.1), bg="#dbeafe", fg="#1d4ed8", font=FONT_BTN_SUB, pady=1, padx=1)
+    btn_ns_pf = create_button(f_s_nudge, "+0.1s", lambda: app.nudge_clip_start(0.1), bg="#dbeafe", fg="#1d4ed8", font=FONT_SMALL_BOLD, pady=1, padx=1)
     btn_ns_pf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
     ToolTip(btn_ns_pf, "Fine-tune Start forward 0.1s")
-    btn_ns_p1 = create_button(f_s_nudge, "+1s", lambda: app.nudge_clip_start(1.0), bg="#dbeafe", fg="#1d4ed8", font=FONT_BTN_SUB, pady=1, padx=2)
+    btn_ns_p1 = create_button(f_s_nudge, "+1s", lambda: app.nudge_clip_start(1.0), bg="#dbeafe", fg="#1d4ed8", font=FONT_SMALL_BOLD, pady=1, padx=2)
     btn_ns_p1.pack(side=tk.LEFT, fill=tk.X, expand=True)
     ToolTip(btn_ns_p1, "Nudge Start forward 1.0s")
 
@@ -195,16 +195,16 @@ def build_step2_view(parent, app):
 
     f_e_nudge = tk.Frame(f_e_box, bg="#fef2f2")
     f_e_nudge.pack(fill=tk.X)
-    btn_ne_m1 = create_button(f_e_nudge, "-1s", lambda: app.nudge_clip_end(-1.0), bg="#fee2e2", fg="#b91c1c", font=FONT_BTN_SUB, pady=1, padx=2)
+    btn_ne_m1 = create_button(f_e_nudge, "-1s", lambda: app.nudge_clip_end(-1.0), bg="#fee2e2", fg="#b91c1c", font=FONT_SMALL_BOLD, pady=1, padx=2)
     btn_ne_m1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
     ToolTip(btn_ne_m1, "Nudge End backward 1.0s")
-    btn_ne_mf = create_button(f_e_nudge, "-0.1s", lambda: app.nudge_clip_end(-0.1), bg="#fee2e2", fg="#b91c1c", font=FONT_BTN_SUB, pady=1, padx=1)
+    btn_ne_mf = create_button(f_e_nudge, "-0.1s", lambda: app.nudge_clip_end(-0.1), bg="#fee2e2", fg="#b91c1c", font=FONT_SMALL_BOLD, pady=1, padx=1)
     btn_ne_mf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
     ToolTip(btn_ne_mf, "Fine-tune End backward 0.1s")
-    btn_ne_pf = create_button(f_e_nudge, "+0.1s", lambda: app.nudge_clip_end(0.1), bg="#fee2e2", fg="#b91c1c", font=FONT_BTN_SUB, pady=1, padx=1)
+    btn_ne_pf = create_button(f_e_nudge, "+0.1s", lambda: app.nudge_clip_end(0.1), bg="#fee2e2", fg="#b91c1c", font=FONT_SMALL_BOLD, pady=1, padx=1)
     btn_ne_pf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
     ToolTip(btn_ne_pf, "Fine-tune End forward 0.1s")
-    btn_ne_p1 = create_button(f_e_nudge, "+1s", lambda: app.nudge_clip_end(1.0), bg="#fee2e2", fg="#b91c1c", font=FONT_BTN_SUB, pady=1, padx=2)
+    btn_ne_p1 = create_button(f_e_nudge, "+1s", lambda: app.nudge_clip_end(1.0), bg="#fee2e2", fg="#b91c1c", font=FONT_SMALL_BOLD, pady=1, padx=2)
     btn_ne_p1.pack(side=tk.LEFT, fill=tk.X, expand=True)
     ToolTip(btn_ne_p1, "Nudge End forward 1.0s")
 

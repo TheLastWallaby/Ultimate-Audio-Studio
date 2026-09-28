@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import sys
 import tempfile
@@ -15,11 +16,14 @@ from pydantic import (
     BaseModel,
     Field,
     HttpUrl,
+    ValidationError,
     ValidationInfo,
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "AppConfig",
@@ -65,17 +69,17 @@ class AppConfig(BaseModel):
     app_name: str = Field(default="Ultimate Audio Studio", description="Display application name")
     app_version: str = Field(
         default="1.1.3",
-        validation_alias=AliasChoices("APP_VERSION", "APP__VERSION"),
+        validation_alias=AliasChoices("app_version"),
         description="Application semantic version string",
     )
     environment: Literal["development", "production", "test", "staging"] = Field(
         default="production",
-        validation_alias=AliasChoices("APP_ENV", "APP__ENVIRONMENT"),
+        validation_alias=AliasChoices("UAS_APP_ENV", "environment"),
         description="Operating runtime environment",
     )
     debug: bool = Field(
         default=False,
-        validation_alias=AliasChoices("DEBUG", "APP__DEBUG"),
+        validation_alias=AliasChoices("UAS_DEBUG", "debug"),
         description="Enable debug features and detailed diagnostic logging",
     )
 
@@ -87,17 +91,17 @@ class GitHubSettings(BaseModel):
 
     owner: str = Field(
         default="TheLastWallaby",
-        validation_alias=AliasChoices("GITHUB_OWNER", "GITHUB__OWNER"),
+        validation_alias=AliasChoices("UAS_GITHUB_OWNER", "owner"),
         description="GitHub organization or user owner of the repository",
     )
     repo: str = Field(
         default="Ultimate-Audio-Studio",
-        validation_alias=AliasChoices("GITHUB_REPO", "GITHUB__REPO"),
+        validation_alias=AliasChoices("UAS_GITHUB_REPO", "repo"),
         description="GitHub repository name",
     )
     releases_api_url: HttpUrl = Field(
         default=HttpUrl("https://api.github.com/repos/TheLastWallaby/Ultimate-Audio-Studio/releases/latest"),
-        validation_alias=AliasChoices("RELEASES_API_URL", "GITHUB__RELEASES_API_URL"),
+        validation_alias=AliasChoices("UAS_RELEASES_API_URL", "releases_api_url"),
         description="GitHub Releases API endpoint URL",
     )
 
@@ -116,42 +120,42 @@ class PathSettings(BaseModel):
 
     base_path: Path = Field(
         default_factory=_get_default_base_path,
-        validation_alias=AliasChoices("BASE_PATH", "PATHS__BASE_PATH"),
+        validation_alias=AliasChoices("UAS_BASE_PATH", "base_path"),
         description="Root application install or frozen bundle directory",
     )
     music_dir: Path = Field(
         default_factory=_default_music_dir,
-        validation_alias=AliasChoices("MUSIC_DIR", "PATHS__MUSIC_DIR"),
+        validation_alias=AliasChoices("UAS_MUSIC_DIR", "music_dir"),
         description="Root music directory for user audio files and application data",
     )
     playlists_path: Path = Field(
         default_factory=lambda: _default_music_dir() / "audio_studio_playlists.json",
-        validation_alias=AliasChoices("PLAYLISTS_PATH", "PATHS__PLAYLISTS_PATH"),
+        validation_alias=AliasChoices("UAS_PLAYLISTS_PATH", "playlists_path"),
         description="Path to user playlists JSON document",
     )
     settings_path: Path = Field(
         default_factory=lambda: _default_music_dir() / "audio_studio_settings.json",
-        validation_alias=AliasChoices("SETTINGS_PATH", "PATHS__SETTINGS_PATH"),
+        validation_alias=AliasChoices("UAS_SETTINGS_PATH", "settings_path"),
         description="Path to user GUI preferences JSON document",
     )
     error_log_path: Path = Field(
         default_factory=lambda: _default_music_dir() / "audio_studio_error.txt",
-        validation_alias=AliasChoices("ERROR_LOG_PATH", "PATHS__ERROR_LOG_PATH"),
+        validation_alias=AliasChoices("UAS_ERROR_LOG_PATH", "error_log_path"),
         description="Path to text error log file",
     )
     yt_cache_dir: Path = Field(
         default_factory=lambda: _default_music_dir() / ".audio_studio_cache",
-        validation_alias=AliasChoices("YT_CACHE_DIR", "PATHS__YT_CACHE_DIR"),
+        validation_alias=AliasChoices("UAS_YT_CACHE_DIR", "yt_cache_dir"),
         description="Directory for persistent YouTube metadata cache",
     )
     cover_cache_dir: Path = Field(
         default_factory=lambda: _default_temp_dir() / "audio_studio_art",
-        validation_alias=AliasChoices("COVER_CACHE_DIR", "PATHS__COVER_CACHE_DIR"),
+        validation_alias=AliasChoices("UAS_COVER_CACHE_DIR", "cover_cache_dir"),
         description="Temporary directory for cover art cache",
     )
     preview_cache_dir: Path = Field(
         default_factory=lambda: _default_temp_dir() / "audio_studio_preview",
-        validation_alias=AliasChoices("PREVIEW_CACHE_DIR", "PATHS__PREVIEW_CACHE_DIR"),
+        validation_alias=AliasChoices("UAS_PREVIEW_CACHE_DIR", "preview_cache_dir"),
         description="Temporary directory for audio preview clip cache",
     )
 
@@ -214,12 +218,12 @@ class SSLSettings(BaseModel):
 
     ssl_cert_file: Path = Field(
         default_factory=lambda: Path(certifi.where()),
-        validation_alias=AliasChoices("SSL_CERT_FILE", "SSL__CERT_FILE"),
+        validation_alias=AliasChoices("SSL_CERT_FILE", "ssl_cert_file"),
         description="Path to CA certificate bundle for Python SSL/urllib",
     )
     requests_ca_bundle: Path = Field(
         default_factory=lambda: Path(certifi.where()),
-        validation_alias=AliasChoices("REQUESTS_CA_BUNDLE", "SSL__REQUESTS_CA_BUNDLE"),
+        validation_alias=AliasChoices("REQUESTS_CA_BUNDLE", "requests_ca_bundle"),
         description="Path to CA certificate bundle for requests and yt-dlp",
     )
 
@@ -240,12 +244,12 @@ class BinarySettings(BaseModel):
 
     ffmpeg_path: Path | None = Field(
         default=None,
-        validation_alias=AliasChoices("FFMPEG_PATH", "BINARIES__FFMPEG_PATH"),
+        validation_alias=AliasChoices("UAS_FFMPEG_PATH", "ffmpeg_path"),
         description="Explicit override path to ffmpeg binary",
     )
     ffprobe_path: Path | None = Field(
         default=None,
-        validation_alias=AliasChoices("FFPROBE_PATH", "BINARIES__FFPROBE_PATH"),
+        validation_alias=AliasChoices("UAS_FFPROBE_PATH", "ffprobe_path"),
         description="Explicit override path to ffprobe binary",
     )
 
@@ -267,22 +271,22 @@ class SystemSettings(BaseModel):
 
     local_app_data: Path | None = Field(
         default=None,
-        validation_alias=AliasChoices("LOCALAPPDATA", "SYSTEM__LOCALAPPDATA"),
+        validation_alias=AliasChoices("LOCALAPPDATA", "local_app_data"),
         description="Windows LOCALAPPDATA directory for WinGet package discovery",
     )
     system_drive: str = Field(
         default_factory=_get_default_system_drive,
-        validation_alias=AliasChoices("SystemDrive", "SYSTEM__DRIVE"),
+        validation_alias=AliasChoices("SystemDrive", "system_drive"),
         description="Host primary system drive letter",
     )
     tcl_library: Path | None = Field(
         default=None,
-        validation_alias=AliasChoices("TCL_LIBRARY", "SYSTEM__TCL_LIBRARY"),
+        validation_alias=AliasChoices("TCL_LIBRARY", "tcl_library"),
         description="Path to Tcl runtime library directory",
     )
     tk_library: Path | None = Field(
         default=None,
-        validation_alias=AliasChoices("TK_LIBRARY", "SYSTEM__TK_LIBRARY"),
+        validation_alias=AliasChoices("TK_LIBRARY", "tk_library"),
         description="Path to Tk runtime library directory",
     )
 
@@ -301,12 +305,29 @@ class Settings(BaseSettings):
     """Centralized, immutable application settings for Ultimate Audio Studio."""
 
     model_config = SettingsConfigDict(
+        env_prefix="UAS_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
         env_nested_delimiter="__",
         frozen=True,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Ignore stray ``.env`` files in packaged builds and all env input in safe-fallback mode."""
+        if not _env_overrides_enabled():
+            return (init_settings,)
+        if getattr(sys, "frozen", False):
+            return (init_settings, env_settings)
+        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     app: AppConfig = Field(default_factory=AppConfig)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
@@ -323,34 +344,34 @@ class Settings(BaseSettings):
         res = dict(data)
 
         # Mapping of flat environment variable / data keys to nested models
-        mapping: dict[str, list[tuple[str, str, Any]]] = {
+        mapping: dict[str, list[tuple[str, str | None, Any]]] = {
             "app": [
-                ("app_version", "APP_VERSION", "1.1.3"),
-                ("environment", "APP_ENV", "production"),
-                ("debug", "DEBUG", False),
+                ("app_version", None, "1.1.3"),
+                ("environment", "UAS_APP_ENV", "production"),
+                ("debug", "UAS_DEBUG", False),
             ],
             "github": [
-                ("owner", "GITHUB_OWNER", "TheLastWallaby"),
-                ("repo", "GITHUB_REPO", "Ultimate-Audio-Studio"),
-                ("releases_api_url", "RELEASES_API_URL", None),
+                ("owner", "UAS_GITHUB_OWNER", "TheLastWallaby"),
+                ("repo", "UAS_GITHUB_REPO", "Ultimate-Audio-Studio"),
+                ("releases_api_url", "UAS_RELEASES_API_URL", None),
             ],
             "paths": [
-                ("base_path", "BASE_PATH", None),
-                ("music_dir", "MUSIC_DIR", None),
-                ("playlists_path", "PLAYLISTS_PATH", None),
-                ("settings_path", "SETTINGS_PATH", None),
-                ("error_log_path", "ERROR_LOG_PATH", None),
-                ("yt_cache_dir", "YT_CACHE_DIR", None),
-                ("cover_cache_dir", "COVER_CACHE_DIR", None),
-                ("preview_cache_dir", "PREVIEW_CACHE_DIR", None),
+                ("base_path", "UAS_BASE_PATH", None),
+                ("music_dir", "UAS_MUSIC_DIR", None),
+                ("playlists_path", "UAS_PLAYLISTS_PATH", None),
+                ("settings_path", "UAS_SETTINGS_PATH", None),
+                ("error_log_path", "UAS_ERROR_LOG_PATH", None),
+                ("yt_cache_dir", "UAS_YT_CACHE_DIR", None),
+                ("cover_cache_dir", "UAS_COVER_CACHE_DIR", None),
+                ("preview_cache_dir", "UAS_PREVIEW_CACHE_DIR", None),
             ],
             "ssl": [
                 ("ssl_cert_file", "SSL_CERT_FILE", None),
                 ("requests_ca_bundle", "REQUESTS_CA_BUNDLE", None),
             ],
             "binaries": [
-                ("ffmpeg_path", "FFMPEG_PATH", None),
-                ("ffprobe_path", "FFPROBE_PATH", None),
+                ("ffmpeg_path", "UAS_FFMPEG_PATH", None),
+                ("ffprobe_path", "UAS_FFPROBE_PATH", None),
             ],
             "system": [
                 ("local_app_data", "LOCALAPPDATA", None),
@@ -370,12 +391,15 @@ class Settings(BaseSettings):
                 section_data = {}
 
             for field_name, env_key, _ in fields:
-                for key_variant in (field_name, env_key.lower(), env_key):
+                variants = (field_name,) if env_key is None else (field_name, env_key.lower(), env_key)
+                for key_variant in variants:
                     if key_variant in res and (section_data.get(field_name) is None):
                         val = res.pop(key_variant)
                         if val is not None and (not isinstance(val, str) or val.strip()):
                             section_data[field_name] = val
                         break
+                if env_key is None or not _env_overrides_enabled():
+                    continue
                 if section_data.get(field_name) is None and env_key in os.environ:
                     env_val = os.environ[env_key].strip()
                     if env_val:
@@ -436,10 +460,30 @@ class Settings(BaseSettings):
         return self.paths.preview_cache_dir
 
 
+_env_disabled = False
+
+
+def _env_overrides_enabled() -> bool:
+    return not _env_disabled
+
+
 @functools.lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Retrieve cached, immutable global application settings instance."""
-    return Settings()
+    """Retrieve cached, immutable global application settings instance.
+
+    An invalid ``UAS_*`` environment value must never stop the app from opening, so on a
+    validation error the settings are rebuilt from built-in defaults and the problem is logged.
+    """
+    global _env_disabled
+    try:
+        return Settings()
+    except ValidationError as err:
+        logger.warning("Ignoring invalid environment configuration, using defaults: %s", err)
+        _env_disabled = True
+        try:
+            return Settings()
+        finally:
+            _env_disabled = False
 
 
 def clear_settings_cache() -> None:

@@ -1,8 +1,10 @@
 """Pygame mixer wrapper, high-precision timeline tracking, and playable audio caching."""
 
+import contextlib
 import hashlib
 import os
 import subprocess
+import threading
 import time
 from collections import OrderedDict
 
@@ -25,14 +27,16 @@ class AudioEngine:
         self._current_gain_factor = 1.0
         self.auto_level_enabled = False
         self.use_volume_curve = use_volume_curve
-        self.buffer_samples = 2048
+        # AGENTS.md invariant: 8192-sample buffer avoids crackling on slow machines.
+        self.buffer_samples = 8192
+        self._cache_lock = threading.Lock()
         self._init_mixer()
 
     def _init_mixer(self):
         """Single mixer pre_init to avoid audio driver deadlocks on Windows."""
         try:
             if not pygame.mixer.get_init():
-                pygame.mixer.pre_init(44100, -16, 2, 2048)
+                pygame.mixer.pre_init(44100, -16, 2, self.buffer_samples)
                 pygame.mixer.init()
                 pygame.mixer.music.set_volume(0.8)
                 self.set_endevent(SONG_END_EVENT)
@@ -48,15 +52,30 @@ class AudioEngine:
         except Exception:
             pass
 
+    NATIVE_EXTS = (".mp3", ".wav", ".ogg", ".flac")
+
+    def needs_conversion(self, filepath):
+        """True when playing filepath would first require a (slow) FFmpeg conversion to WAV."""
+        if not filepath or not os.path.exists(filepath):
+            return False
+        if os.path.splitext(filepath)[1].lower() in self.NATIVE_EXTS:
+            return False
+        with self._cache_lock:
+            cached = self._playable_cache.get(filepath)
+        return not (cached and os.path.exists(cached) and os.path.getsize(cached) > 0)
+
     def get_playable_audio_path(self, filepath):
-        """Returns a path directly playable by pygame.mixer.music, converting unsupported formats (e.g. M4A) to cached WAV if needed."""
+        """Returns a path directly playable by pygame.mixer.music, converting unsupported formats (e.g. M4A) to cached WAV if needed.
+
+        Thread-safe: may be called from a worker thread to prepare a file before playback.
+        """
         if not filepath or not os.path.exists(filepath):
             return filepath
         ext = os.path.splitext(filepath)[1].lower()
-        if ext in (".mp3", ".wav", ".ogg", ".flac"):
+        if ext in self.NATIVE_EXTS:
             return filepath
-        if filepath in self._playable_cache:
-            cached = self._playable_cache[filepath]
+        with self._cache_lock:
+            cached = self._playable_cache.get(filepath)
             if cached and os.path.exists(cached) and os.path.getsize(cached) > 0:
                 self._playable_cache.move_to_end(filepath)
                 return cached
@@ -68,14 +87,7 @@ class AudioEngine:
             mtime = int(os.path.getmtime(filepath))
             cached_wav = os.path.join(PREVIEW_CACHE_DIR, f"{file_hash}_{mtime}.wav")
             if os.path.exists(cached_wav) and os.path.getsize(cached_wav) > 0:
-                while len(self._playable_cache) >= self._max_playable_cache:
-                    _k, old_path = self._playable_cache.popitem(last=False)
-                    if old_path and os.path.exists(old_path):
-                        try:
-                            os.remove(old_path)
-                        except Exception:
-                            pass
-                self._playable_cache[filepath] = cached_wav
+                self._remember_playable(filepath, cached_wav)
                 return cached_wav
 
             cmd = [
@@ -96,18 +108,27 @@ class AudioEngine:
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW, timeout=30
             )
             if res.returncode == 0 and os.path.exists(cached_wav) and os.path.getsize(cached_wav) > 0:
-                while len(self._playable_cache) >= self._max_playable_cache:
-                    _k, old_path = self._playable_cache.popitem(last=False)
-                    if old_path and os.path.exists(old_path):
-                        try:
-                            os.remove(old_path)
-                        except Exception:
-                            pass
-                self._playable_cache[filepath] = cached_wav
+                self._remember_playable(filepath, cached_wav)
                 return cached_wav
         except Exception as e:
             log_error(f"AudioEngine.get_playable_audio_path: {e}")
         return filepath
+
+    def _remember_playable(self, filepath, cached_wav):
+        """Record a converted WAV in the bounded LRU cache, deleting evicted files."""
+        evicted = []
+        with self._cache_lock:
+            if filepath in self._playable_cache:
+                self._playable_cache.move_to_end(filepath)
+            else:
+                while len(self._playable_cache) >= self._max_playable_cache:
+                    _k, old_path = self._playable_cache.popitem(last=False)
+                    if old_path and old_path != cached_wav:
+                        evicted.append(old_path)
+            self._playable_cache[filepath] = cached_wav
+        for old_path in evicted:
+            with contextlib.suppress(OSError):
+                os.remove(old_path)
 
     def start_clock(self, start_pos):
         """Set the reference origin for playback timeline tracking."""

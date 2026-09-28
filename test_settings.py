@@ -115,11 +115,11 @@ class TestCentralizedSettings(unittest.TestCase):
     def test_environment_variable_flat_aliases(self) -> None:
         """Verify flat environment variables are routed into nested models."""
         env_vars = {
-            "APP_ENV": "development",
-            "DEBUG": "true",
-            "GITHUB_OWNER": "CustomOwner",
-            "GITHUB_REPO": "CustomRepo",
-            "RELEASES_API_URL": "https://api.github.com/repos/CustomOwner/CustomRepo/releases/latest",
+            "UAS_APP_ENV": "development",
+            "UAS_DEBUG": "true",
+            "UAS_GITHUB_OWNER": "CustomOwner",
+            "UAS_GITHUB_REPO": "CustomRepo",
+            "UAS_RELEASES_API_URL": "https://api.github.com/repos/CustomOwner/CustomRepo/releases/latest",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             settings = Settings()
@@ -129,12 +129,31 @@ class TestCentralizedSettings(unittest.TestCase):
             self.assertEqual(settings.github.repo, "CustomRepo")
             self.assertEqual(settings.github_update_token, "")
 
+    def test_generic_environment_names_are_ignored(self) -> None:
+        """Common un-prefixed variables set by other tools must not change app settings."""
+        env_vars = {"APP_ENV": "dev", "DEBUG": "maybe", "APP_VERSION": "9.9.9", "GITHUB_OWNER": "Someone"}
+        with patch.dict(os.environ, env_vars, clear=False):
+            settings = Settings()
+            self.assertEqual(settings.app.environment, "production")
+            self.assertEqual(settings.github.owner, "TheLastWallaby")
+            self.assertNotEqual(settings.app_version, "9.9.9")
+
+    def test_invalid_prefixed_environment_falls_back_to_defaults(self) -> None:
+        """An invalid UAS_* value must not crash startup; defaults are used instead."""
+        clear_settings_cache()
+        try:
+            with patch.dict(os.environ, {"UAS_APP_ENV": "bogus"}, clear=False):
+                settings = get_settings()
+                self.assertEqual(settings.app.environment, "production")
+        finally:
+            clear_settings_cache()
+
     def test_environment_variable_nested_delimiter(self) -> None:
         """Verify double-underscore nested environment variables."""
         env_vars = {
-            "APP__ENVIRONMENT": "staging",
-            "APP__DEBUG": "true",
-            "GITHUB__OWNER": "NestedOwner",
+            "UAS_APP__ENVIRONMENT": "staging",
+            "UAS_APP__DEBUG": "true",
+            "UAS_GITHUB__OWNER": "NestedOwner",
         }
         with patch.dict(os.environ, env_vars, clear=False):
             settings = Settings()

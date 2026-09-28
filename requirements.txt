@@ -1,6 +1,6 @@
 pygame>=2.6
 pydub>=0.25
-yt-dlp>=2026.8.19
+yt-dlp[default,deno]>=2026.8.19
 tinytag>=2.1
 certifi
 audioop-lts>=0.2.1; python_version>='3.13'

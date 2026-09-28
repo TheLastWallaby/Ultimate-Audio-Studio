@@ -524,7 +524,7 @@ class TestApprovedEnhancements(unittest.TestCase):
     def test_audio_engine_endevent_and_gain(self):
         """Item 2.1 & 2.4: Test native end event toggling and auto-level gain scaling."""
         engine = AudioEngine()
-        self.assertEqual(engine.buffer_samples, 2048)
+        self.assertEqual(engine.buffer_samples, 8192)
 
         engine.set_endevent()
         engine.clear_endevent()
@@ -821,7 +821,7 @@ class TestPhase2ApprovedEnhancements(unittest.TestCase):
         pb = PlaybackController(None, mock_engine)
         new_pos = pb.skip_by(10.0, track_duration=60.0)
         self.assertEqual(new_pos, 25.0)
-        gain = pb.compute_auto_level_gain([0.1, 0.2, 0.15])
+        gain = pb.compute_auto_level_gain(-20.0)
         self.assertGreater(gain, 0.0)
 
         # 4. ExportController
