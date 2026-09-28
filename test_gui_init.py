@@ -2,6 +2,7 @@
 
 import tkinter as tk
 import unittest
+
 from app.config import APP_VERSION
 from app.main import UltimateAudioStudio
 
@@ -65,6 +66,7 @@ class TestGUIInitialization(unittest.TestCase):
 
     def test_search_dialog(self):
         from app.ui.search_dialog import SearchChoiceDialog
+
         root = tk.Tk()
         root.withdraw()
         sample_results = [
@@ -78,7 +80,7 @@ class TestGUIInitialization(unittest.TestCase):
             query="Track",
             results=sample_results,
             on_select=lambda item: chosen.append(item),
-            on_preview_play=lambda: preview_played.append(True)
+            on_preview_play=lambda: preview_played.append(True),
         )
         root.update()
         self.assertIsNotNone(dialog.win)
@@ -132,13 +134,20 @@ class TestGUIInitialization(unittest.TestCase):
         # Verify root window has no global keyboard shortcuts bound
         root_binds = root.bind()
         for shortcut in (
-            "<space>", "<Key-space>",
-            "<Left>", "<Key-Left>",
-            "<Right>", "<Key-Right>",
-            "<bracketleft>", "<Key-bracketleft>",
-            "<bracketright>", "<Key-bracketright>",
-            "<Control-f>", "<Control-Key-f>",
-            "<Control-F>", "<Control-Key-F>"
+            "<space>",
+            "<Key-space>",
+            "<Left>",
+            "<Key-Left>",
+            "<Right>",
+            "<Key-Right>",
+            "<bracketleft>",
+            "<Key-bracketleft>",
+            "<bracketright>",
+            "<Key-bracketright>",
+            "<Control-f>",
+            "<Control-Key-f>",
+            "<Control-F>",
+            "<Control-Key-F>",
         ):
             self.assertNotIn(shortcut, root_binds)
 
@@ -146,7 +155,7 @@ class TestGUIInitialization(unittest.TestCase):
         entry_binds = app.entry_url.bind()
         self.assertTrue(
             "<Return>" in entry_binds or "<Key-Return>" in entry_binds,
-            f"Expected Return binding in entry_url, got {entry_binds}"
+            f"Expected Return binding in entry_url, got {entry_binds}",
         )
 
         app.on_close()

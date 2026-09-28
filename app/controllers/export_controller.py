@@ -89,9 +89,16 @@ class ExportController:
 
         task_mgr.submit_task(
             usb_export_worker,
-            pl_dest, playlist_name, playlist_files, normalize,
-            on_progress, on_status, on_success, on_error,
-            is_shutting_down_fn, duration_fn
+            pl_dest,
+            playlist_name,
+            playlist_files,
+            normalize,
+            on_progress,
+            on_status,
+            on_success,
+            on_error,
+            is_shutting_down_fn,
+            duration_fn,
         )
 
     def start_cd_export(
@@ -108,9 +115,14 @@ class ExportController:
         """Launch background CD WAV export worker."""
         task_mgr.submit_task(
             cd_export_worker,
-            cd_folder, playlist_files, normalize,
-            on_progress, on_status, on_success, on_error,
-            is_shutting_down_fn
+            cd_folder,
+            playlist_files,
+            normalize,
+            on_progress,
+            on_status,
+            on_success,
+            on_error,
+            is_shutting_down_fn,
         )
 
     def eject_usb_drive(self, drive_root):

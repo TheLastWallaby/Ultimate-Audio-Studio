@@ -5,10 +5,8 @@ from __future__ import annotations
 import tkinter as tk
 from collections.abc import Callable
 from typing import Any
-from app.ui.theme import (
-    FONT_TOOLTIP, FONT_BODY_BOLD, BG_INPUT,
-    COLOR_BTN_NEUTRAL, COLOR_BTN_NEUTRAL_HV, TEXT_DARK
-)
+
+from app.ui.theme import BG_INPUT, COLOR_BTN_NEUTRAL, COLOR_BTN_NEUTRAL_HV, FONT_BODY_BOLD, FONT_TOOLTIP, TEXT_DARK
 
 # Button fills that are too close to the panel colour to read as buttons on their own;
 # these get a permanent dark 1px outline.
@@ -67,9 +65,17 @@ class ToolTip:
             self.tip.wm_overrideredirect(True)
             self.tip.wm_geometry(f"+{x}+{y}")
             tk.Label(
-                self.tip, text=self.text, font=FONT_TOOLTIP,
-                bg="#0f172a", fg="#ffffff", padx=10, pady=5,
-                relief=tk.FLAT, borderwidth=0, wraplength=340, justify="left"
+                self.tip,
+                text=self.text,
+                font=FONT_TOOLTIP,
+                bg="#0f172a",
+                fg="#ffffff",
+                padx=10,
+                pady=5,
+                relief=tk.FLAT,
+                borderwidth=0,
+                wraplength=340,
+                justify="left",
             ).pack()
         except Exception:
             if self.tip:
@@ -90,9 +96,16 @@ class ToolTip:
 
 
 def create_button(
-    parent: tk.Misc, text: str, command: Callable[[], Any],
-    bg: str = COLOR_BTN_NEUTRAL, fg: str = TEXT_DARK, hover_bg: str | None = COLOR_BTN_NEUTRAL_HV,
-    font: Any = FONT_BODY_BOLD, pady: int = 4, padx: int = 6, **kwargs: Any
+    parent: tk.Misc,
+    text: str,
+    command: Callable[[], Any],
+    bg: str = COLOR_BTN_NEUTRAL,
+    fg: str = TEXT_DARK,
+    hover_bg: str | None = COLOR_BTN_NEUTRAL_HV,
+    font: Any = FONT_BODY_BOLD,
+    pady: int = 4,
+    padx: int = 6,
+    **kwargs: Any,
 ) -> tk.Button:
     """Helper to create polished, tactile buttons with hover feedback.
 
@@ -103,10 +116,22 @@ def create_button(
     """
     outlined = str(bg).lower() in _LOW_CONTRAST_FILLS
     btn = tk.Button(
-        parent, text=text, command=command, bg=bg, fg=fg,
-        activebackground=hover_bg or bg, activeforeground=fg,
-        font=font, relief=tk.SOLID if outlined else tk.FLAT, borderwidth=1 if outlined else 0,
-        cursor="hand2", padx=padx, pady=pady, highlightthickness=0, takefocus=1, **kwargs
+        parent,
+        text=text,
+        command=command,
+        bg=bg,
+        fg=fg,
+        activebackground=hover_bg or bg,
+        activeforeground=fg,
+        font=font,
+        relief=tk.SOLID if outlined else tk.FLAT,
+        borderwidth=1 if outlined else 0,
+        cursor="hand2",
+        padx=padx,
+        pady=pady,
+        highlightthickness=0,
+        takefocus=1,
+        **kwargs,
     )
     if hover_bg:
         btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg))

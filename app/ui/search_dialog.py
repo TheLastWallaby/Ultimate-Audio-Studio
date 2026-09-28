@@ -1,23 +1,40 @@
 """Search results selection dialog allowing users to preview and pick which YouTube result to download."""
 
-import os
 import queue
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
+
 import pygame
 
 from app.config import format_time, log_error
 from app.services.downloader import fetch_preview_worker
-from app.ui.theme import (
-    FONT_APP_TITLE, FONT_SECTION_HDR, FONT_BODY, FONT_BODY_BOLD,
-    FONT_BTN_MAIN, FONT_BTN_SUB, FONT_FAMILY,
-    BG_CARD, BG_SUB_CARD, BG_INPUT, BORDER_MAIN, TEXT_DARK, TEXT_MUTED,
-    COLOR_DOWNLOAD, COLOR_DOWNLOAD_HV, COLOR_BTN_NEUTRAL, COLOR_BTN_NEUTRAL_HV,
-    COLOR_PLAY, COLOR_PLAY_HV, COLOR_PAUSE, COLOR_PAUSE_HV, COLOR_STOP, COLOR_STOP_HV, COLOR_ACCENT
-)
 from app.ui.components import create_button
+from app.ui.theme import (
+    BG_CARD,
+    BG_INPUT,
+    BG_SUB_CARD,
+    BORDER_MAIN,
+    COLOR_ACCENT,
+    COLOR_BTN_NEUTRAL,
+    COLOR_BTN_NEUTRAL_HV,
+    COLOR_DOWNLOAD,
+    COLOR_DOWNLOAD_HV,
+    COLOR_PAUSE,
+    COLOR_PAUSE_HV,
+    COLOR_PLAY,
+    COLOR_PLAY_HV,
+    COLOR_STOP,
+    COLOR_STOP_HV,
+    FONT_APP_TITLE,
+    FONT_BODY,
+    FONT_BODY_BOLD,
+    FONT_BTN_MAIN,
+    FONT_BTN_SUB,
+    TEXT_DARK,
+    TEXT_MUTED,
+)
 
 
 class SearchChoiceDialog:
@@ -122,15 +139,16 @@ class SearchChoiceDialog:
         f_top = tk.Frame(container, bg=BG_CARD)
         f_top.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
-        tk.Label(
-            f_top, text="🎵 Multiple Matches Found",
-            font=FONT_APP_TITLE, fg=TEXT_DARK, bg=BG_CARD
-        ).pack(anchor="w")
+        tk.Label(f_top, text="🎵 Multiple Matches Found", font=FONT_APP_TITLE, fg=TEXT_DARK, bg=BG_CARD).pack(
+            anchor="w"
+        )
 
         tk.Label(
             f_top,
             text=f'Select the version of "{self.query}" you would like to download:',
-            font=FONT_BODY, fg=TEXT_MUTED, bg=BG_CARD
+            font=FONT_BODY,
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
         ).pack(anchor="w", pady=(2, 0))
 
         # Bottom Controls - Pack to BOTTOM first so action buttons are always visible
@@ -138,68 +156,109 @@ class SearchChoiceDialog:
         self.f_btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
 
         tk.Label(
-            self.f_btns, text="💡 Tip: Double-click a song to download.",
-            font=FONT_BODY, fg=TEXT_MUTED, bg=BG_CARD
+            self.f_btns, text="💡 Tip: Double-click a song to download.", font=FONT_BODY, fg=TEXT_MUTED, bg=BG_CARD
         ).pack(side=tk.LEFT, anchor="c")
 
         self.btn_more = create_button(
-            self.f_btns, "➕ Show More Results", self._load_more_results,
-            bg=COLOR_BTN_NEUTRAL, fg=COLOR_ACCENT, hover_bg=COLOR_BTN_NEUTRAL_HV,
-            font=FONT_BTN_SUB, padx=10, pady=5
+            self.f_btns,
+            "➕ Show More Results",
+            self._load_more_results,
+            bg=COLOR_BTN_NEUTRAL,
+            fg=COLOR_ACCENT,
+            hover_bg=COLOR_BTN_NEUTRAL_HV,
+            font=FONT_BTN_SUB,
+            padx=10,
+            pady=5,
         )
         self.btn_more.pack(side=tk.LEFT, padx=(10, 0))
 
         self.btn_cancel = create_button(
-            self.f_btns, "Cancel", self._do_cancel,
-            bg=COLOR_BTN_NEUTRAL, fg=TEXT_DARK, hover_bg=COLOR_BTN_NEUTRAL_HV,
-            font=FONT_BTN_SUB, padx=14, pady=5
+            self.f_btns,
+            "Cancel",
+            self._do_cancel,
+            bg=COLOR_BTN_NEUTRAL,
+            fg=TEXT_DARK,
+            hover_bg=COLOR_BTN_NEUTRAL_HV,
+            font=FONT_BTN_SUB,
+            padx=14,
+            pady=5,
         )
         self.btn_cancel.pack(side=tk.RIGHT, padx=(6, 0))
 
         self.btn_download = create_button(
-            self.f_btns, "⬇ Download Selected", self._do_select,
-            bg=COLOR_DOWNLOAD, fg="#ffffff", hover_bg=COLOR_DOWNLOAD_HV,
-            font=FONT_BTN_MAIN, padx=16, pady=5
+            self.f_btns,
+            "⬇ Download Selected",
+            self._do_select,
+            bg=COLOR_DOWNLOAD,
+            fg="#ffffff",
+            hover_bg=COLOR_DOWNLOAD_HV,
+            font=FONT_BTN_MAIN,
+            padx=16,
+            pady=5,
         )
         self.btn_download.pack(side=tk.RIGHT)
 
         # Preview Control Panel - Pack to BOTTOM above f_btns
-        self.f_prev = tk.Frame(container, bg=BG_SUB_CARD, highlightthickness=1, highlightbackground=BORDER_MAIN, padx=12, pady=8)
+        self.f_prev = tk.Frame(
+            container, bg=BG_SUB_CARD, highlightthickness=1, highlightbackground=BORDER_MAIN, padx=12, pady=8
+        )
         self.f_prev.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8))
 
         f_prev_top = tk.Frame(self.f_prev, bg=BG_SUB_CARD)
         f_prev_top.pack(fill=tk.X)
 
         self.btn_preview_play = create_button(
-            f_prev_top, "▶ Play Preview", self._toggle_preview,
-            bg=COLOR_PLAY, fg="#ffffff", hover_bg=COLOR_PLAY_HV,
-            font=FONT_BTN_MAIN, padx=12, pady=4
+            f_prev_top,
+            "▶ Play Preview",
+            self._toggle_preview,
+            bg=COLOR_PLAY,
+            fg="#ffffff",
+            hover_bg=COLOR_PLAY_HV,
+            font=FONT_BTN_MAIN,
+            padx=12,
+            pady=4,
         )
         self.btn_preview_play.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_preview_stop = create_button(
-            f_prev_top, "⏹ Stop", self._stop_preview,
-            bg=COLOR_BTN_NEUTRAL, fg=TEXT_DARK, hover_bg=COLOR_BTN_NEUTRAL_HV,
-            font=FONT_BTN_SUB, padx=10, pady=4, state=tk.DISABLED
+            f_prev_top,
+            "⏹ Stop",
+            self._stop_preview,
+            bg=COLOR_BTN_NEUTRAL,
+            fg=TEXT_DARK,
+            hover_bg=COLOR_BTN_NEUTRAL_HV,
+            font=FONT_BTN_SUB,
+            padx=10,
+            pady=4,
+            state=tk.DISABLED,
         )
         self.btn_preview_stop.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_preview_download = create_button(
-            f_prev_top, "⬇ Download", self._do_select,
-            bg=COLOR_DOWNLOAD, fg="#ffffff", hover_bg=COLOR_DOWNLOAD_HV,
-            font=FONT_BTN_SUB, padx=10, pady=4
+            f_prev_top,
+            "⬇ Download",
+            self._do_select,
+            bg=COLOR_DOWNLOAD,
+            fg="#ffffff",
+            hover_bg=COLOR_DOWNLOAD_HV,
+            font=FONT_BTN_SUB,
+            padx=10,
+            pady=4,
         )
         self.btn_preview_download.pack(side=tk.LEFT, padx=(0, 10))
 
         self.lbl_preview_time = tk.Label(
-            f_prev_top, text="0:00 / 0:30",
-            font=FONT_BODY_BOLD, fg=TEXT_MUTED, bg=BG_SUB_CARD
+            f_prev_top, text="0:00 / 0:30", font=FONT_BODY_BOLD, fg=TEXT_MUTED, bg=BG_SUB_CARD
         )
         self.lbl_preview_time.pack(side=tk.RIGHT, padx=(6, 0))
 
         self.lbl_preview_status = tk.Label(
-            f_prev_top, text="Select a song and click 'Play Preview' to listen (30-sec sample)",
-            font=FONT_BODY, fg=TEXT_MUTED, bg=BG_SUB_CARD, anchor="w"
+            f_prev_top,
+            text="Select a song and click 'Play Preview' to listen (30-sec sample)",
+            font=FONT_BODY,
+            fg=TEXT_MUTED,
+            bg=BG_SUB_CARD,
+            anchor="w",
         )
         self.lbl_preview_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -221,7 +280,7 @@ class SearchChoiceDialog:
             foreground=TEXT_DARK,
             fieldbackground=BG_INPUT,
             font=FONT_BODY,
-            rowheight=max(30, tkfont.Font(font=FONT_BODY).metrics("linespace") + 12)
+            rowheight=max(30, tkfont.Font(font=FONT_BODY).metrics("linespace") + 12),
         )
         style.configure(
             "Search.Treeview.Heading",
@@ -229,19 +288,13 @@ class SearchChoiceDialog:
             foreground=TEXT_DARK,
             font=FONT_BODY_BOLD,
             relief="flat",
-            padding=4
+            padding=4,
         )
-        style.map(
-            "Search.Treeview",
-            background=[("selected", "#0284c7")],
-            foreground=[("selected", "#ffffff")]
-        )
+        style.map("Search.Treeview", background=[("selected", "#0284c7")], foreground=[("selected", "#ffffff")])
 
         columns = ("title", "artist", "duration")
         self.tree = ttk.Treeview(
-            f_table, columns=columns, show="headings",
-            selectmode="browse", style="Search.Treeview",
-            height=6
+            f_table, columns=columns, show="headings", selectmode="browse", style="Search.Treeview", height=6
         )
         self.tree.heading("title", text="Song Title / Description")
         self.tree.heading("artist", text="Artist / Channel")
@@ -263,8 +316,10 @@ class SearchChoiceDialog:
         # Populate rows
         for idx, item in enumerate(self.results):
             self.tree.insert(
-                "", tk.END, iid=str(idx),
-                values=(item.get("title", ""), item.get("uploader", ""), item.get("duration_str", "--:--"))
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(item.get("title", ""), item.get("uploader", ""), item.get("duration_str", "--:--")),
             )
 
     def _on_tree_select(self, _event=None):
@@ -279,13 +334,11 @@ class SearchChoiceDialog:
                     if item.get("url") != self._preview_active_url:
                         self._stop_preview(reset_status=False)
                         self.lbl_preview_status.config(
-                            text=f"Selected: {item.get('title', 'Song')} — Click 'Play Preview' to listen",
-                            fg=TEXT_DARK
+                            text=f"Selected: {item.get('title', 'Song')} — Click 'Play Preview' to listen", fg=TEXT_DARK
                         )
                 else:
                     self.lbl_preview_status.config(
-                        text=f"Selected: {item.get('title', 'Song')} — Click 'Play Preview' to listen",
-                        fg=TEXT_DARK
+                        text=f"Selected: {item.get('title', 'Song')} — Click 'Play Preview' to listen", fg=TEXT_DARK
                     )
         except Exception:
             pass
@@ -326,7 +379,7 @@ class SearchChoiceDialog:
         req_id = self._preview_request_id
 
         title = item.get("title", "Song")
-        self.lbl_preview_status.config(text=f"⏳ Loading 30s preview for \"{title}\"...", fg=COLOR_ACCENT)
+        self.lbl_preview_status.config(text=f'⏳ Loading 30s preview for "{title}"...', fg=COLOR_ACCENT)
         self.lbl_preview_time.config(text="0:00 / 0:30", fg=COLOR_ACCENT)
         self.prog_preview["value"] = 0
         self._style_play_button("⏳ Loading...", COLOR_PAUSE, COLOR_PAUSE_HV, state=tk.NORMAL)
@@ -341,17 +394,12 @@ class SearchChoiceDialog:
         threading.Thread(
             target=fetch_preview_worker,
             args=(url, int(self._preview_duration), self._preview_cancel_event, _on_succ, _on_err),
-            daemon=True
+            daemon=True,
         ).start()
 
     def _style_play_button(self, text, bg, hover_bg, state=tk.NORMAL):
         try:
-            self.btn_preview_play.config(
-                text=text,
-                bg=bg,
-                activebackground=hover_bg or bg,
-                state=state
-            )
+            self.btn_preview_play.config(text=text, bg=bg, activebackground=hover_bg or bg, state=state)
             self.btn_preview_play.bind("<Enter>", lambda e: self.btn_preview_play.config(bg=hover_bg))
             self.btn_preview_play.bind("<Leave>", lambda e: self.btn_preview_play.config(bg=bg))
         except Exception:
@@ -390,7 +438,9 @@ class SearchChoiceDialog:
         self._is_previewing = False
         self._style_play_button("▶ Play Preview", COLOR_PLAY, COLOR_PLAY_HV, state=tk.NORMAL)
         self.btn_preview_stop.config(state=tk.DISABLED)
-        self.lbl_preview_status.config(text="⚠️ Preview unavailable for this track (you can still download)", fg=COLOR_STOP)
+        self.lbl_preview_status.config(
+            text="⚠️ Preview unavailable for this track (you can still download)", fg=COLOR_STOP
+        )
         self.lbl_preview_time.config(text="--:--", fg=TEXT_MUTED)
         self.prog_preview["value"] = 0
 
@@ -430,8 +480,7 @@ class SearchChoiceDialog:
 
         self.prog_preview["value"] = min(self._preview_duration, elapsed)
         self.lbl_preview_time.config(
-            text=f"{format_time(elapsed)} / {format_time(self._preview_duration)}",
-            fg=TEXT_DARK
+            text=f"{format_time(elapsed)} / {format_time(self._preview_duration)}", fg=TEXT_DARK
         )
 
         if not self._closed and self.win.winfo_exists():
@@ -464,8 +513,7 @@ class SearchChoiceDialog:
                 self.lbl_preview_time.config(text=f"0:00 / {format_time(self._preview_duration)}", fg=TEXT_MUTED)
                 if reset_status:
                     self.lbl_preview_status.config(
-                        text="Select a song and click 'Play Preview' to listen (30-sec sample)",
-                        fg=TEXT_MUTED
+                        text="Select a song and click 'Play Preview' to listen (30-sec sample)", fg=TEXT_MUTED
                     )
         except Exception:
             pass
@@ -476,7 +524,9 @@ class SearchChoiceDialog:
         sel = self.tree.selection()
         idx = int(sel[0]) if sel else -1
         if not (0 <= idx < len(self.results)):
-            self.lbl_preview_status.config(text="Please click a song in the list first, then click Download.", fg=COLOR_STOP)
+            self.lbl_preview_status.config(
+                text="Please click a song in the list first, then click Download.", fg=COLOR_STOP
+            )
             return
         self._closed = True
         self._stop_preview(reset_status=False)
@@ -513,6 +563,7 @@ class SearchChoiceDialog:
         def _worker():
             try:
                 from app.services.downloader import search_youtube
+
                 fetched = search_youtube(self.query, max_results=next_count)
                 if self._closed:
                     return
@@ -528,13 +579,19 @@ class SearchChoiceDialog:
                         start_pos = len(self.results)
                         for i, item in enumerate(new_entries):
                             self.tree.insert(
-                                "", tk.END, iid=str(start_pos + i),
-                                values=(item.get("title", ""), item.get("uploader", ""), item.get("duration_str", "--:--"))
+                                "",
+                                tk.END,
+                                iid=str(start_pos + i),
+                                values=(
+                                    item.get("title", ""),
+                                    item.get("uploader", ""),
+                                    item.get("duration_str", "--:--"),
+                                ),
                             )
                             self.results.append(item)
                         self.lbl_preview_status.config(
                             text=f"Added {len(new_entries)} more match(es). Double-click or click Download to choose.",
-                            fg=TEXT_DARK
+                            fg=TEXT_DARK,
                         )
                     else:
                         self.btn_more.config(text="No More Results", state=tk.DISABLED)
@@ -543,12 +600,15 @@ class SearchChoiceDialog:
                 self._safe_dispatch(_apply)
             except Exception as e:
                 log_error(f"_load_more_results: {e}")
+
                 def _err():
                     self._loading_more = False
                     if not self._closed:
                         self.btn_more.config(text="➕ Show More Results", state=tk.NORMAL)
-                        self.lbl_preview_status.config(text="Could not load more results. Try again later.", fg=TEXT_MUTED)
+                        self.lbl_preview_status.config(
+                            text="Could not load more results. Try again later.", fg=TEXT_MUTED
+                        )
+
                 self._safe_dispatch(_err)
 
         threading.Thread(target=_worker, daemon=True).start()
-
