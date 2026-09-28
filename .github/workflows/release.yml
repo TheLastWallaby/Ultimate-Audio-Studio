@@ -45,7 +45,7 @@ jobs:
           .\build_exe.ps1
 
       - name: Create GitHub Release and Upload Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/Ultimate Audio Studio.exe
           draft: false
