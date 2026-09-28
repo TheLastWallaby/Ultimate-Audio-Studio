@@ -1,6 +1,7 @@
 # yt-dlp must stay current: YouTube changes regularly break older versions, and the packaged
-# .exe freezes whichever yt-dlp was installed at build time. A Dependabot PR bumping yt-dlp is
-# the signal to cut a new release (bump app_version, tag, push) so users get the fix via auto-update.
+# .exe freezes whichever yt-dlp was installed at build time. Merging a Dependabot PR that bumps
+# yt-dlp triggers .github/workflows/yt-dlp-autorelease.yml, which bumps the app version, tags, and
+# publishes a release, so users get the fix via auto-update.
 version: 2
 updates:
   - package-ecosystem: "pip"

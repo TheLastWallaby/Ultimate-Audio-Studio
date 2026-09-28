@@ -10,7 +10,53 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    name: Lint & type check
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies and tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt ruff mypy bandit pip-audit
+
+      - name: Ruff lint
+        run: python -m ruff check .
+
+      - name: Ruff format
+        run: python -m ruff format --check .
+
+      # Type checking is ratcheted: these modules must stay clean under --strict. Add a module to the
+      # first list once it passes, and move it out of the second when its dependencies are typed.
+      - name: Mypy (strict modules)
+        run: >-
+          python -m mypy --strict --follow-imports=silent
+          app/config.py app/models.py
+          app/core/cache_manager.py app/core/config.py app/core/errors.py app/core/file_utils.py
+          app/core/process_utils.py app/core/task_manager.py app/core/time_utils.py
+          app/controllers/download_controller.py app/controllers/playlist_controller.py
+          app/ui/error_dialog.py app/ui/theme.py app/ui/features/base.py
+          .github/scripts/bump_version.py
+
+      - name: Mypy (main window; calls into not-yet-typed modules allowed)
+        run: python -m mypy --strict --allow-untyped-calls --follow-imports=silent app/main.py app/ui/features
+
+      - name: Bandit
+        run: python -m bandit -r app/ -ll -ii -q
+
+      - name: pip-audit
+        run: python -m pip_audit -r requirements.txt
+
   test:
+    name: Tests (Python ${{ matrix.python-version }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -30,37 +76,47 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: Build Windows executable
+    needs: [quality, test]
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run Modular App Tests
+      - name: Install FFmpeg
         run: |
-          python test_modular_app.py
+          choco install ffmpeg --no-progress
+          $realFfmpeg = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\ffmpeg" -Filter "ffmpeg.exe" -Recurse | Where-Object { $_.Length -gt 10MB } | Select-Object -First 1).FullName
+          $realFfprobe = (Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\ffmpeg" -Filter "ffprobe.exe" -Recurse | Where-Object { $_.Length -gt 10MB } | Select-Object -First 1).FullName
+          if (-not $realFfmpeg -or -not $realFfprobe) {
+            throw "Failed to locate genuine FFmpeg/FFprobe binaries in Chocolatey lib."
+          }
+          Copy-Item $realFfmpeg .\ffmpeg.exe -Force
+          Copy-Item $realFfprobe .\ffprobe.exe -Force
 
-      - name: Run Updater Tests
-        run: |
-          python test_updater.py
+      - name: Build Standalone Executable
+        run: .\build_exe.ps1
 
-      - name: Run GUI Smoke Tests
-        run: |
-          python test_gui_init.py
-
-      - name: Run P0 Regression Tests
-        run: |
-          python test_p0_fixes.py
-
-      - name: Run Architecture Enhancement Tests
-        run: |
-          python test_architecture_enhancements.py
-
-      - name: Run Edge Case Regression Tests
-        run: |
-          python test_edge_cases.py
-
-      - name: Run Settings Tests
-        run: |
-          python test_settings.py
-
-      - name: Run Stability & UX Regression Tests
-        run: |
-          python test_stability_ux.py
-
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ultimate-Audio-Studio-exe
+          path: dist/Ultimate Audio Studio.exe
+          retention-days: 7
