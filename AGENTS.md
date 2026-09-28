@@ -141,15 +141,16 @@ flowchart LR
 
 ### D. Release & Publishing Workflow
 - **Automated CI/CD Pipeline**: Releases are built and published automatically via GitHub Actions (`.github/workflows/release.yml`) on pushing a version tag.
-- **Step-by-Step Publishing**:
-  1. Update `app_version` in `app/core/config.py` (e.g. `app_version: str = Field(default="1.1.4")`).
+- **Automatic yt-dlp Releases**: When a change to the `yt-dlp` requirement lands on `main` (e.g. a merged Dependabot PR), `.github/workflows/yt-dlp-autorelease.yml` bumps the patch version with `.github/scripts/bump_version.py`, pushes the commit and tag, and calls `release.yml`. No manual steps are needed.
+- **Step-by-Step Publishing** (manual releases):
+  1. Update the version everywhere it is declared (`app/core/config.py` twice, `pyproject.toml`, `test_settings.py`), or run `python .github/scripts/bump_version.py` for a patch bump.
   2. Commit and push the version bump to `main`.
   3. Create and push a matching Git tag:
      ```bash
      git tag v1.1.4
      git push origin v1.1.4
      ```
-  4. The release workflow installs dependencies, bundles real `ffmpeg.exe`/`ffprobe.exe`, packages `Ultimate Audio Studio.exe`, and drafts/publishes the GitHub Release with the executable attached.
+  4. The release workflow checks that the tag matches `app_version`, runs the tests, bundles real `ffmpeg.exe`/`ffprobe.exe`, packages `Ultimate Audio Studio.exe`, and publishes the GitHub Release with the executable attached.
 
 ### E. Auto-Updater & Security Governance
 - **Non-blocking Startup**: Auto-update check (`check_latest_release()`) must run on a background thread on launch; never delay GUI presentation or audio playback.

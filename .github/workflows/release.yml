@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  # Called by yt-dlp-autorelease.yml: a tag pushed with GITHUB_TOKEN does not trigger the push event above.
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build and publish (e.g. v1.1.5)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,10 +18,14 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v7
@@ -25,7 +36,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt pytest
+
+      - name: Check tag matches app_version
+        # The auto-updater compares app_version with the release tag; a mismatch would offer the update forever.
+        run: |
+          $appVersion = python -c "from app.core.config import get_settings; print(get_settings().app.app_version)"
+          if ("v$appVersion" -ne $env:RELEASE_TAG) {
+            throw "Tag $env:RELEASE_TAG does not match app_version $appVersion in app/core/config.py."
+          }
+
+      - name: Run tests
+        run: python -m pytest -q
 
       - name: Install FFmpeg
         run: |
@@ -47,6 +69,7 @@ jobs:
       - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: dist/Ultimate Audio Studio.exe
           draft: false
           prerelease: false

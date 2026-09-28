@@ -1,0 +1,79 @@
+name: Auto-release on yt-dlp update
+
+# YouTube changes regularly break older yt-dlp versions, and the packaged .exe keeps the yt-dlp it was
+# built with. When a yt-dlp bump (usually a merged Dependabot PR) lands on main, bump the app's patch
+# version, tag it, and build/publish the release so users get the fix through the auto-updater.
+#
+# Requirements: GitHub Actions must be allowed to push to main (if main is protected, allow the
+# github-actions bot to bypass the rule or push via a GitHub App token instead).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - requirements.txt
+      - pyproject.toml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yt-dlp-autorelease
+  cancel-in-progress: false
+
+jobs:
+  bump-and-tag:
+    runs-on: ubuntu-latest
+    # Skip the version-bump commit this workflow pushes itself.
+    if: github.actor != 'github-actions[bot]'
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Did the yt-dlp requirement change?
+        id: changed
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "yt_dlp=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff "$before" "${{ github.sha }}" -- requirements.txt pyproject.toml | grep -E '^[+-][^+-].*yt-dlp' ; then
+            echo "yt_dlp=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "yt_dlp=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.changed.outputs.yt_dlp == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Bump patch version
+        id: bump
+        if: steps.changed.outputs.yt_dlp == 'true'
+        run: python .github/scripts/bump_version.py >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag, and push
+        if: steps.changed.outputs.yt_dlp == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): bump version to ${{ steps.bump.outputs.tag }} for updated yt-dlp"
+          git tag "${{ steps.bump.outputs.tag }}"
+          git push origin main "${{ steps.bump.outputs.tag }}"
+
+  release:
+    needs: bump-and-tag
+    if: needs.bump-and-tag.outputs.tag != ''
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump-and-tag.outputs.tag }}
+    permissions:
+      contents: write
