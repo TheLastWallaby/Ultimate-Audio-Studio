@@ -68,7 +68,7 @@ class AppConfig(BaseModel):
 
     app_name: str = Field(default="Ultimate Audio Studio", description="Display application name")
     app_version: str = Field(
-        default="1.1.3",
+        default="1.1.4",
         validation_alias=AliasChoices("app_version"),
         description="Application semantic version string",
     )
@@ -346,7 +346,7 @@ class Settings(BaseSettings):
         # Mapping of flat environment variable / data keys to nested models
         mapping: dict[str, list[tuple[str, str | None, Any]]] = {
             "app": [
-                ("app_version", None, "1.1.3"),
+                ("app_version", None, "1.1.4"),
                 ("environment", "UAS_APP_ENV", "production"),
                 ("debug", "UAS_DEBUG", False),
             ],
