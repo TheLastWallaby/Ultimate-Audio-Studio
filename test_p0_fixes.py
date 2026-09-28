@@ -130,7 +130,7 @@ class TestModelMappingProtocolAndCacheMetadata(unittest.TestCase):
             html_url="http://html",
         )
         self.assertEqual(dict(rel)["tag_name"], "v1.0")
-        self.assertEqual(len(rel), 10)
+        self.assertEqual(len(rel), 11)
 
         drv = DriveInfo(root="D:\\", display_label="USB", fs_type="FAT32")
         self.assertEqual(dict(drv)["root"], "D:\\")

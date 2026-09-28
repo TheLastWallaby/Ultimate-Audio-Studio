@@ -1,4 +1,6 @@
 # Auto-update service for Ultimate Audio Studio
+import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -80,6 +82,7 @@ def check_latest_release(current_ver=APP_VERSION, token=None, timeout=6, return_
             asset_api_url=chosen_asset.get("url", ""),
             browser_download_url=chosen_asset.get("browser_download_url", ""),
             html_url=data.get("html_url", ""),
+            asset_digest=str(chosen_asset.get("digest") or ""),
         )
         return (True, info, None) if return_error else (True, info)
 
@@ -98,7 +101,21 @@ def check_latest_release(current_ver=APP_VERSION, token=None, timeout=6, return_
         return (False, None, err) if return_error else (False, None)
 
 
-def download_release_asset(asset_id, token=None, dest_path=None, progress_callback=None, cancel_event=None):
+def _parse_sha256_digest(digest):
+    """Return the lowercase hex from a GitHub ``sha256:<hex>`` digest string, or None."""
+    if not digest or not isinstance(digest, str):
+        return None
+    algo, _, value = digest.strip().partition(":")
+    value = value.strip().lower()
+    if algo.lower() != "sha256" or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        return None
+    return value
+
+
+def download_release_asset(
+    asset_id, token=None, dest_path=None, progress_callback=None, cancel_event=None, expected_digest=None
+):
+    """Stream a release asset to disk, verifying its SHA-256 against GitHub's published digest when given."""
     if token is None:
         token = get_update_token()
 
@@ -111,6 +128,8 @@ def download_release_asset(asset_id, token=None, dest_path=None, progress_callba
         headers["Authorization"] = f"Bearer {token}"
 
     opener = urllib.request.build_opener(_GitHubAssetRedirectHandler())
+    expected_sha256 = _parse_sha256_digest(expected_digest)
+    hasher = hashlib.sha256()
 
     try:
         req = urllib.request.Request(asset_url, headers=headers)
@@ -134,6 +153,7 @@ def download_release_asset(asset_id, token=None, dest_path=None, progress_callba
                     if not chunk:
                         break
                     f_out.write(chunk)
+                    hasher.update(chunk)
                     downloaded += len(chunk)
 
                     if progress_callback:
@@ -159,6 +179,16 @@ def download_release_asset(asset_id, token=None, dest_path=None, progress_callba
                 except Exception:
                     pass
                 return False, "Downloaded file is not a valid Windows executable"
+
+        if expected_sha256:
+            actual = hasher.hexdigest()
+            if actual != expected_sha256:
+                log_error(f"Update checksum mismatch: expected {expected_sha256}, got {actual}")
+                with contextlib.suppress(OSError):
+                    os.remove(dest_path)
+                return False, "The downloaded update was damaged (checksum mismatch). Please try again later."
+        else:
+            log_error("Update asset has no published SHA-256 digest; relying on HTTPS integrity only.")
 
         return True, dest_path
 
