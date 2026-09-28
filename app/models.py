@@ -89,6 +89,7 @@ class ReleaseInfo:
     asset_api_url: str
     browser_download_url: str
     html_url: str
+    asset_digest: str = ""  # GitHub-computed "sha256:<hex>" for the asset; "" if unavailable
 
     def __getitem__(self, item: str) -> Any:
         if not isinstance(item, str) or not hasattr(self, item):
@@ -110,13 +111,14 @@ class ReleaseInfo:
             "asset_api_url",
             "browser_download_url",
             "html_url",
+            "asset_digest",
         )
 
     def __iter__(self) -> Iterator[str]:
         yield from self.keys()
 
     def __len__(self) -> int:
-        return 10
+        return 11
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +132,7 @@ class ReleaseInfo:
             "asset_api_url": self.asset_api_url,
             "browser_download_url": self.browser_download_url,
             "html_url": self.html_url,
+            "asset_digest": self.asset_digest,
         }
 
 
@@ -179,6 +182,8 @@ class AppSettings:
     auto_level_playback: bool = False
     geometry: str | None = None
     github_update_token: str = ""
+    text_size: str = "Normal"
+    active_playlist: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -192,6 +197,8 @@ class AppSettings:
             "auto_level_playback": self.auto_level_playback,
             "geometry": self.geometry,
             "github_update_token": self.github_update_token,
+            "text_size": self.text_size,
+            "active_playlist": self.active_playlist,
         }
         if self.extra:
             data.update(self.extra)
@@ -209,6 +216,8 @@ class AppSettings:
             "auto_level_playback",
             "geometry",
             "github_update_token",
+            "text_size",
+            "active_playlist",
         }
         extra = {k: v for k, v in data.items() if k not in known_keys}
         return cls(
@@ -221,5 +230,7 @@ class AppSettings:
             auto_level_playback=bool(data.get("auto_level_playback", False)),
             geometry=data.get("geometry"),
             github_update_token=str(data.get("github_update_token") or ""),
+            text_size=str(data.get("text_size") or "Normal"),
+            active_playlist=str(data.get("active_playlist") or ""),
             extra=extra,
         )

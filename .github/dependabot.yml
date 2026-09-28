@@ -1,0 +1,20 @@
+# yt-dlp must stay current: YouTube changes regularly break older versions, and the packaged
+# .exe freezes whichever yt-dlp was installed at build time. A Dependabot PR bumping yt-dlp is
+# the signal to cut a new release (bump app_version, tag, push) so users get the fix via auto-update.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    versioning-strategy: "increase"
+    allow:
+      - dependency-name: "yt-dlp"
+    labels:
+      - "dependencies"
+      - "release-needed"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

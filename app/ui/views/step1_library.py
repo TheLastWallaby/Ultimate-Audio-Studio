@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 from app.ui.theme import (
     FONT_STEP_BADGE, FONT_SECTION_HDR, FONT_BODY, FONT_BODY_BOLD,
-    FONT_BTN_MAIN, FONT_BTN_SUB, FONT_FAMILY,
+    FONT_BTN_MAIN, FONT_BTN_SUB, FONT_HINT,
     BG_CARD, BG_SUB_CARD, BG_INPUT, BORDER_MAIN, TEXT_DARK, TEXT_MUTED,
     COLOR_BTN_NEUTRAL, COLOR_BTN_NEUTRAL_HV, COLOR_DOWNLOAD, COLOR_DOWNLOAD_HV,
     COLOR_STOP, COLOR_DANGER_BG, COLOR_DANGER_TEXT, COLOR_DANGER_HV
@@ -23,7 +23,7 @@ def build_step1_view(parent, app):
     f_yt_box = tk.Frame(parent, bg=BG_SUB_CARD, padx=8, pady=6, relief=tk.FLAT, highlightbackground=BORDER_MAIN, highlightthickness=1)
     f_yt_box.pack(fill=tk.X, pady=(0, 6))
 
-    tk.Label(f_yt_box, text="Enter Song & Artist, or Paste YouTube Link:", font=FONT_SECTION_HDR, fg=TEXT_DARK, bg=BG_SUB_CARD).pack(anchor="w")
+    tk.Label(f_yt_box, text="Enter Song & Artist, or Paste YouTube Link:", font=FONT_SECTION_HDR, fg=TEXT_DARK, bg=BG_SUB_CARD, wraplength=300, justify="left").pack(anchor="w")
     app.entry_url = tk.Entry(f_yt_box, font=FONT_BODY, bg=BG_INPUT, fg=TEXT_DARK, insertbackground=TEXT_DARK, relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER_MAIN)
     app.entry_url.pack(fill=tk.X, pady=(3, 4), ipady=3)
     app.entry_url.bind("<FocusIn>", app._on_url_focus)
@@ -99,5 +99,5 @@ def build_step1_view(parent, app):
     app.btn_load_ext.pack(fill=tk.X, pady=(2, 0))
     ToolTip(app.btn_load_ext, "Import songs from any folder on your PC into this library")
 
-    lbl_dnd_hint = tk.Label(parent, text="💡 Tip: You can also drag & drop music files here", font=(FONT_FAMILY, 9, "italic"), fg=TEXT_MUTED, bg=BG_CARD)
+    lbl_dnd_hint = tk.Label(parent, text="💡 Tip: You can also drag & drop music files here", font=FONT_HINT, fg=TEXT_MUTED, bg=BG_CARD)
     lbl_dnd_hint.pack(pady=(2, 0))

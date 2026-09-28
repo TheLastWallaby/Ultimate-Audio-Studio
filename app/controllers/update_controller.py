@@ -52,7 +52,13 @@ class UpdateController:
         if not info:
             return
         try:
-            UpdateDialog(parent_win, info, auto_start=auto_start)
+            UpdateDialog(
+                parent_win,
+                info,
+                auto_start=auto_start,
+                busy_reason_fn=getattr(self.app, "busy_reason", None),
+                prepare_restart_fn=getattr(self.app, "prepare_for_restart", None),
+            )
         except Exception as e:
             log_error(f"Failed to open UpdateDialog: {e}")
 

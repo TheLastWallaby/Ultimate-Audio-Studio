@@ -89,7 +89,7 @@ class WaveformView:
             w = 400
         h = c.winfo_height()
         if h <= 1:
-            h = 58
+            h = 90
 
         mid_y = h / 2.0
         dur = max(0.1, self.app.track_duration)
@@ -199,7 +199,7 @@ class WaveformView:
             # Zoom indicator badge on canvas
             if getattr(self.app, "waveform_zoomed", False):
                 c.create_text(
-                    w - 60, 10, text="🔍 Zoomed View", fill="#0284c7", font=(FONT_FAMILY, 8, "bold"), tags="zoom_tag"
+                    w - 60, 10, text="🔍 Zoomed View", fill="#0369a1", font=(FONT_FAMILY, 10, "bold"), tags="zoom_tag"
                 )
 
             # Start Marker Line & Top Handle (Blue)
@@ -236,8 +236,8 @@ class WaveformView:
                         w - 60,
                         10,
                         text="🔍 Zoomed View",
-                        fill="#0284c7",
-                        font=(FONT_FAMILY, 8, "bold"),
+                        fill="#0369a1",
+                        font=(FONT_FAMILY, 10, "bold"),
                         tags="zoom_tag",
                     )
                 else:

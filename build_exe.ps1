@@ -54,6 +54,14 @@ if ($fSize -lt 10MB -or $pSize -lt 10MB) {
 Write-Host "Verified genuine FFmpeg ($fSize bytes) and FFprobe ($pSize bytes)."
 
 python -m pip install -r requirements.txt
+
+# yt-dlp needs the Deno JavaScript runtime for YouTube; it is bundled from the yt-dlp[deno] extra.
+$denoBin = python -c "import deno; print(deno.find_deno_bin())"
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $denoBin)) {
+    throw "Deno runtime not found. Run: python -m pip install -r requirements.txt"
+}
+Write-Host "Bundling Deno runtime: $denoBin"
+
 python -m PyInstaller --noconfirm --clean simple_audio_clipper.spec
 
 $exe = Join-Path $PSScriptRoot "dist\Ultimate Audio Studio.exe"

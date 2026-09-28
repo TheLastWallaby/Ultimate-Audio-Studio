@@ -1,8 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
+import deno
+
 datas = []
-binaries = [('ffmpeg.exe', '.'), ('ffprobe.exe', '.')]
+# deno.exe is the JavaScript runtime yt-dlp needs for YouTube (installed by the yt-dlp[deno] extra).
+binaries = [('ffmpeg.exe', '.'), ('ffprobe.exe', '.'), (deno.find_deno_bin(), '.')]
 hiddenimports = [
     'audioop', 'audioop_lts', 'certifi', 'pydub', 'tinytag', 'pygame', 'send2trash',
     'app.services.updater', 'app.ui.update_dialog', 'app.core.cache_manager',
@@ -11,7 +14,7 @@ hiddenimports = [
     'app.controllers.download_controller', 'app.controllers.update_controller'
 ]
 
-for pkg in ('yt_dlp', 'certifi', 'tinytag'):
+for pkg in ('yt_dlp', 'yt_dlp_ejs', 'certifi', 'tinytag'):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries
