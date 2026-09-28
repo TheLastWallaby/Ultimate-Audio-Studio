@@ -48,10 +48,12 @@ def enable_windows_dpi():
         return
     try:
         from ctypes import windll
+
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         try:
             from ctypes import windll
+
             windll.user32.SetProcessDPIAware()
         except Exception:
             pass
@@ -93,7 +95,8 @@ def clean_pyi_env():
         if key.startswith("_PYI_") or key.startswith("_MEI") or key.startswith("PYI_"):
             os.environ.pop(key, None)
     return {
-        k: v for k, v in os.environ.items()
+        k: v
+        for k, v in os.environ.items()
         if not (k.startswith("_PYI_") or k.startswith("_MEI") or k.startswith("PYI_"))
     }
 
@@ -117,7 +120,9 @@ def launch_detached_gui(executable_path):
     # Fallback to unpatched Popen with detached process flags
     creationflags = 0
     if os.name == "nt":
-        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        )
 
     _orig_popen([executable_path], env=clean_env, creationflags=creationflags, close_fds=True)
     return True
@@ -137,12 +142,13 @@ def _is_usb_bus_drive(drive_root):
             None,
             3,  # OPEN_EXISTING
             0,
-            None
+            None,
         )
         if h == -1 or h == 0 or h == 0xFFFFFFFFFFFFFFFF:
             return False
         try:
             import struct
+
             query = (ctypes.c_int * 3)(0, 0, 0)
             out_buf = ctypes.create_string_buffer(1024)
             bytes_returned = ctypes.c_ulong()
@@ -154,7 +160,7 @@ def _is_usb_bus_drive(drive_root):
                 out_buf,
                 ctypes.sizeof(out_buf),
                 ctypes.byref(bytes_returned),
-                None
+                None,
             )
             if success and bytes_returned.value >= 32:
                 bus_type = struct.unpack_from("<I", out_buf.raw, 28)[0]
@@ -179,9 +185,14 @@ def list_removable_drives():
         kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
         kernel32.GetVolumeInformationW.restype = ctypes.c_int
         kernel32.GetVolumeInformationW.argtypes = [
-            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
-            ctypes.POINTER(ctypes.c_uint32), ctypes.c_wchar_p, ctypes.c_uint32
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
         ]
         bitmask = kernel32.GetLogicalDrives()
         label_buf = ctypes.create_unicode_buffer(261)
@@ -205,7 +216,9 @@ def list_removable_drives():
                         fs_type = fs_buf.value or fs_type
                 except Exception:
                     pass
-                drives.append(DriveInfo(root=root, display_label=f"USB Drive: {label} ({root}) [{fs_type}]", fs_type=fs_type))
+                drives.append(
+                    DriveInfo(root=root, display_label=f"USB Drive: {label} ({root}) [{fs_type}]", fs_type=fs_type)
+                )
     except Exception:
         pass
     return drives
@@ -262,13 +275,24 @@ def _get_storage_device_number(device_path: str) -> tuple[int, int] | None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
     ]
     kernel32.DeviceIoControl.restype = wintypes.BOOL
     kernel32.DeviceIoControl.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
-        wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
     ]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
@@ -279,8 +303,14 @@ def _get_storage_device_number(device_path: str) -> tuple[int, int] | None:
         sdn = _STORAGE_DEVICE_NUMBER()
         returned = wintypes.DWORD()
         ok = kernel32.DeviceIoControl(
-            handle, _IOCTL_STORAGE_GET_DEVICE_NUMBER, None, 0,
-            ctypes.byref(sdn), ctypes.sizeof(sdn), ctypes.byref(returned), None,
+            handle,
+            _IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            None,
+            0,
+            ctypes.byref(sdn),
+            ctypes.sizeof(sdn),
+            ctypes.byref(returned),
+            None,
         )
         return (int(sdn.DeviceType), int(sdn.DeviceNumber)) if ok else None
     finally:
@@ -305,13 +335,20 @@ def _find_disk_devinst(drive_letter: str) -> int | None:
     setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(_GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
     setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
     setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
-        wintypes.HANDLE, wintypes.LPVOID, ctypes.POINTER(_GUID), wintypes.DWORD,
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        ctypes.POINTER(_GUID),
+        wintypes.DWORD,
         ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA),
     ]
     setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
     setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA), wintypes.LPVOID, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(_SP_DEVINFO_DATA),
+        wintypes.HANDLE,
+        ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA),
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(_SP_DEVINFO_DATA),
     ]
     setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
 
@@ -329,7 +366,9 @@ def _find_disk_devinst(drive_letter: str) -> int | None:
                 return None
             index += 1
             required = wintypes.DWORD()
-            setupapi.SetupDiGetDeviceInterfaceDetailW(dev_info, ctypes.byref(iface), None, 0, ctypes.byref(required), None)
+            setupapi.SetupDiGetDeviceInterfaceDetailW(
+                dev_info, ctypes.byref(iface), None, 0, ctypes.byref(required), None
+            )
             if required.value < 8:
                 continue
             buf = ctypes.create_string_buffer(required.value)
@@ -366,8 +405,13 @@ def _flush_volume(clean_drive: str) -> None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
     ]
     kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -450,6 +494,7 @@ def get_desktop_dir():
     if os.name == "nt":
         try:
             import ctypes.wintypes
+
             buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
             # CSIDL_DESKTOPDIRECTORY = 0x0010
             if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:
@@ -496,6 +541,7 @@ class Win32DragDropHandler:
             return
         try:
             from ctypes import wintypes
+
             WM_DROPFILES = 0x0233
             WM_DEVICECHANGE = 0x0219
             GWLP_WNDPROC = -4
@@ -508,7 +554,9 @@ class Win32DragDropHandler:
             parent_hwnd = user32.GetParent(hwnd)
             target_hwnd = parent_hwnd if parent_hwnd else hwnd
 
-            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            WNDPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            )
 
             def py_wndproc(h_wnd, msg, wparam, lparam):
                 if msg == WM_DEVICECHANGE:
@@ -545,7 +593,13 @@ class Win32DragDropHandler:
             user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
             user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
             user32.CallWindowProcW.restype = ctypes.c_ssize_t
-            user32.CallWindowProcW.argtypes = [ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallWindowProcW.argtypes = [
+                ctypes.c_ssize_t,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
 
             self._drop_target_hwnd = target_hwnd
             self._old_wndproc = user32.SetWindowLongPtrW(

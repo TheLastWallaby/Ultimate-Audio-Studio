@@ -2,8 +2,10 @@
 
 import os
 import time
+
 import pygame
-from app.config import format_time, ffmpeg_path, log_error
+
+from app.config import ffmpeg_path, log_error
 from app.core.audio_engine import SONG_END_EVENT
 from app.services.clipper import create_audition_slice
 

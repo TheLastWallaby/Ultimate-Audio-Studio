@@ -16,6 +16,7 @@ class UpdateController:
 
     def check_on_launch(self, on_update_found):
         """Silently check for updates in a background thread after launch."""
+
         def _worker():
             try:
                 has_update, release_info, err = check_latest_release(current_ver=APP_VERSION, return_error=True)
@@ -61,4 +62,3 @@ class UpdateController:
             )
         except Exception as e:
             log_error(f"Failed to open UpdateDialog: {e}")
-

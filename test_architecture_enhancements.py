@@ -59,7 +59,7 @@ class TestPlatformSecurity(unittest.TestCase):
         self.assertIn("no drive", msg.lower())
 
         # Malicious PowerShell command injection attempt
-        malicious_input = 'D:; Remove-Item -Path C:\\ -Recurse -Force'
+        malicious_input = "D:; Remove-Item -Path C:\\ -Recurse -Force"
         ok, msg = safely_eject_usb_drive(malicious_input)
         self.assertFalse(ok)
         self.assertIn("invalid drive", msg.lower())
@@ -83,8 +83,12 @@ class TestModels(unittest.TestCase):
 
     def test_search_result_dataclass(self):
         sr = SearchResult(
-            id="vid123", title="Song Title", uploader="Artist",
-            duration_sec=180.0, duration_str="03:00", url="https://youtube.com/watch?v=vid123"
+            id="vid123",
+            title="Song Title",
+            uploader="Artist",
+            duration_sec=180.0,
+            duration_str="03:00",
+            url="https://youtube.com/watch?v=vid123",
         )
         self.assertEqual(sr.id, "vid123")
         self.assertEqual(sr.duration_str, "03:00")
