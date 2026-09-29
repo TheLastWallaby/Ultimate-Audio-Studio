@@ -1,16 +1,22 @@
 """Export services for USB flash drives (with loudness normalization and M3U playlists) and CD burning."""
 
+from __future__ import annotations
+
+import contextlib
 import json
 import math
 import os
 import re
 import shutil
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from pydub import AudioSegment
 
-from app.config import log_error, run_ffmpeg, sanitize_filename
+from app.config import AUDIO_EXTS, log_error, run_ffmpeg, sanitize_filename
 from app.core.cache_manager import cache_mgr
+from app.core.process_utils import CancelToken
+from app.services.ffmpeg_args import mp3_output_args
 
 # EBU R128-style targets used for "Make all songs equally loud".
 LOUDNORM_I = -16.0
@@ -23,8 +29,59 @@ _ALREADY_LEVEL_TOLERANCE_LU = 1.0
 # Encoding a long track with loudnorm can take minutes on slow PCs.
 _ENCODE_TIMEOUT_SEC = 900
 
+# Files this app writes into an export folder: "07 - Song.mp3" / "107 - Song.mp3" and "00_Playlist.m3u(8)".
+_EXPORTED_TRACK_RE = re.compile(r"^\d{2,3} - .+$")
+_EXPORTED_PLAYLIST_RE = re.compile(r"^00_.+\.m3u8?$", re.IGNORECASE)
 
-def measure_loudnorm(filepath: str) -> dict[str, str] | None:
+ProgressFn = Callable[[float], None]
+StatusFn = Callable[[str], None]
+StopFn = Callable[[], bool]
+
+
+def track_number_width(total: int) -> int:
+    """Digits used to number exported files, so players that sort by name keep playlist order.
+
+    With 100+ songs, two digits would sort "100 - ..." before "11 - ...".
+    """
+    return 3 if total >= 100 else 2
+
+
+def find_previous_export(folder: str) -> list[str]:
+    """Files an earlier export of this app left in ``folder`` (numbered songs and its M3U lists).
+
+    Anything else the user put there is never touched.
+    """
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        full = os.path.join(folder, name)
+        if not os.path.isfile(full):
+            continue
+        is_track = _EXPORTED_TRACK_RE.match(name) and name.lower().endswith(AUDIO_EXTS)
+        if is_track or _EXPORTED_PLAYLIST_RE.match(name):
+            found.append(full)
+    return sorted(found)
+
+
+def remove_previous_export(folder: str) -> list[str]:
+    """Delete an earlier export's files from ``folder``; returns the names that could not be removed.
+
+    USB drives have no Recycle Bin, and these are copies of songs that stay in the Library.
+    """
+    failed = []
+    for path in find_previous_export(folder):
+        try:
+            os.remove(path)
+        except OSError as e:
+            log_error(f"remove_previous_export {path}: {e}")
+            failed.append(os.path.basename(path))
+    return failed
+
+
+def measure_loudnorm(filepath: str, cancel_event: CancelToken | None = None) -> dict[str, str] | None:
     """Run (or reuse the cached result of) FFmpeg's loudnorm analysis pass for two-pass normalization."""
     cached = cache_mgr.get_loudnorm_stats(filepath)
     if cached and all(k in cached for k in _LOUDNORM_KEYS):
@@ -32,6 +89,7 @@ def measure_loudnorm(filepath: str) -> dict[str, str] | None:
     res = run_ffmpeg(
         ["-hide_banner", "-i", filepath, "-vn", "-af", f"{_LOUDNORM_BASE}:print_format=json", "-f", "null", "-"],
         timeout=_ENCODE_TIMEOUT_SEC,
+        cancel_event=cancel_event,
     )
     if res.returncode != 0:
         return None
@@ -74,33 +132,100 @@ def is_already_level(stats: dict[str, str] | None) -> bool:
         return False
 
 
+def _fsync_file(path: str) -> None:
+    """Write a file's cached data through to the drive (works without administrator rights).
+
+    Flushing the whole volume needs admin rights, so it silently did nothing for normal accounts.
+    """
+    try:
+        with open(path, "rb+") as f:
+            os.fsync(f.fileno())
+    except OSError as e:
+        log_error(f"fsync {path}: {e}")
+
+
+def _encode_mp3(
+    filepath: str, dest_file: str, stats: dict[str, str] | None, normalize: bool, cancel_event: CancelToken | None
+) -> bool:
+    """Encode to MP3 with FFmpeg, retrying with a re-encoded cover picture; True when a file was made."""
+    for cover in ("copy", "mjpeg"):
+        args = ["-y", "-i", filepath]
+        if normalize:
+            args += ["-af", loudnorm_filter(stats)]
+        args += mp3_output_args("copy" if cover == "copy" else "mjpeg", resample_44k=True) + [dest_file]
+        result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
+        if result.returncode == 0 and os.path.exists(dest_file) and os.path.getsize(dest_file) > 0:
+            return True
+        with contextlib.suppress(OSError):
+            os.remove(dest_file)
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+    return False
+
+
+def _write_m3u(dest_folder: str, playlist_name: str, tracks: list[tuple[str, str, float]]) -> None:
+    """M3U (UTF-8 with BOM, for car stereos) and M3U8 playlists listing the exported files in order."""
+    try:
+        pl_clean = sanitize_filename(playlist_name or "Playlist")
+        for ext_name, enc in ((".m3u", "utf-8-sig"), (".m3u8", "utf-8")):
+            m3u_path = os.path.join(dest_folder, f"00_{pl_clean}{ext_name}")
+            with open(m3u_path, "w", encoding=enc) as f:
+                f.write("#EXTM3U\n")
+                for fname, title, dur in tracks:
+                    d_int = int(dur) if dur > 0 else -1
+                    f.write(f"#EXTINF:{d_int},{title}\n")
+                    f.write(f"{fname}\n")
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception as m3u_err:
+        log_error(f"failed writing m3u: {m3u_err}")
+
+
 def usb_export_worker(
     dest_folder: str,
     playlist_name: str,
     files_to_export: Sequence[str],
     normalize: bool = False,
-    on_progress: Callable[[float], None] | None = None,
-    on_status: Callable[[str], None] | None = None,
+    on_progress: ProgressFn | None = None,
+    on_status: StatusFn | None = None,
     on_success: Callable[[int, int, list[str]], None] | None = None,
     on_error: Callable[[str], None] | None = None,
-    is_shutting_down_fn: Callable[[], bool] | None = None,
+    is_shutting_down_fn: StopFn | None = None,
     duration_fn: Callable[[str], float] | None = None,
+    cancel_event: CancelToken | None = None,
+    on_cancelled: Callable[[int, int], None] | None = None,
+    clear_existing: bool = False,
 ) -> None:
-    """Export playlist tracks to USB with numbering, FAT32-safe filenames, optional loudnorm, and M3U playlist file."""
-    total = len(files_to_export)
-    success_count = 0
-    skipped = []
-    exported_tracks = []
+    """Export playlist tracks to USB with numbering, FAT32-safe filenames, optional loudnorm, and M3U playlist file.
 
-    normalize_requested = normalize
+    ``clear_existing`` first removes the files of an earlier export, so songs that were removed or
+    reordered since do not linger on the drive. When ``cancel_event`` is set, the current FFmpeg
+    run is stopped, its half-written file removed, and ``on_cancelled(done, total)`` is called.
+    """
+    total = len(files_to_export)
+    width = track_number_width(total)
+    success_count = 0
+    skipped: list[str] = []
+    exported_tracks: list[tuple[str, str, float]] = []
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _stopping() -> bool:
+        return bool(is_shutting_down_fn and is_shutting_down_fn()) or _cancelled()
+
     try:
+        if clear_existing:
+            if on_status:
+                on_status("Removing the songs from the previous export...")
+            for name in remove_previous_export(dest_folder):
+                skipped.append(f"{name} (old file could not be removed)")
+
         for idx, filepath in enumerate(files_to_export, 1):
-            if is_shutting_down_fn and is_shutting_down_fn():
+            if _stopping():
                 break
-            normalize = normalize_requested
-            pct = (idx / total) * 100
             if on_progress:
-                on_progress(pct)
+                on_progress(((idx - 1) / total) * 100)
 
             if not filepath or not os.path.exists(filepath):
                 skipped.append(os.path.basename(filepath or f"Track {idx}") + " (file not found)")
@@ -111,129 +236,68 @@ def usb_export_worker(
             clean_base = sanitize_filename(base_name)
             clean_stem = sanitize_filename(stem)
             is_mp3 = ext.lower() == ".mp3"
+            track_normalize = normalize
+            dest_file = ""
 
             try:
                 stats = None
-                if normalize:
+                if track_normalize:
                     if on_status:
                         on_status(f"Measuring loudness of USB track {idx} of {total}...")
-                    stats = measure_loudnorm(filepath)
+                    stats = measure_loudnorm(filepath, cancel_event=cancel_event)
+                    if _stopping():
+                        break
                     if is_mp3 and is_already_level(stats):
-                        normalize = False  # already at target: a straight copy is faster and lossless
+                        track_normalize = False  # already at target: a straight copy is faster and lossless
 
                 # Car stereos require standard MP3. If not already MP3 or if normalize is enabled, transcode.
-                if normalize or not is_mp3:
-                    norm_name = f"{idx:02d} - {clean_stem}.mp3"
-                    dest_file = os.path.join(dest_folder, norm_name)
-                    action_desc = "Normalizing & converting" if normalize else "Converting to MP3 for"
+                if track_normalize or not is_mp3:
+                    dest_file = os.path.join(dest_folder, f"{idx:0{width}d} - {clean_stem}.mp3")
+                    action_desc = "Normalizing & converting" if track_normalize else "Converting to MP3 for"
                     if on_status:
                         on_status(f"{action_desc} USB track {idx} of {total}...")
-                    args = ["-y", "-i", filepath]
-                    if normalize:
-                        args += ["-af", loudnorm_filter(stats)]
-                    args += [
-                        "-map",
-                        "0:a",
-                        "-map",
-                        "0:v?",
-                        "-c:v",
-                        "copy",
-                        "-disposition:v:0",
-                        "attached_pic",
-                        "-map_metadata",
-                        "0",
-                        "-id3v2_version",
-                        "3",
-                        "-c:a",
-                        "libmp3lame",
-                        "-q:a",
-                        "2",
-                        "-ar",
-                        "44100",
-                        dest_file,
-                    ]
-                    result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC)
-                    if result.returncode != 0 or not os.path.exists(dest_file) or os.path.getsize(dest_file) == 0:
-                        # Retry with mjpeg video conversion to handle PNG/M4A cover art
-                        if os.path.exists(dest_file):
-                            try:
-                                os.remove(dest_file)
-                            except Exception:
-                                pass
-                        args_mjpeg = ["-y", "-i", filepath]
-                        if normalize:
-                            args_mjpeg += ["-af", loudnorm_filter(stats)]
-                        args_mjpeg += [
-                            "-map",
-                            "0:a",
-                            "-map",
-                            "0:v?",
-                            "-c:v:0",
-                            "mjpeg",
-                            "-disposition:v:0",
-                            "attached_pic",
-                            "-map_metadata",
-                            "0",
-                            "-id3v2_version",
-                            "3",
-                            "-c:a",
-                            "libmp3lame",
-                            "-q:a",
-                            "2",
-                            "-ar",
-                            "44100",
-                            dest_file,
-                        ]
-                        result = run_ffmpeg(args_mjpeg, timeout=_ENCODE_TIMEOUT_SEC)
-
-                    if result.returncode != 0 or not os.path.exists(dest_file) or os.path.getsize(dest_file) == 0:
+                    encoded = _encode_mp3(filepath, dest_file, stats, track_normalize, cancel_event)
+                    if _stopping():
+                        with contextlib.suppress(OSError):
+                            os.remove(dest_file)
+                        break
+                    if not encoded:
                         if is_mp3:
                             shutil.copy2(filepath, dest_file)
                         else:
                             audio = AudioSegment.from_file(filepath)
-                            if normalize:
-                                try:
+                            if track_normalize:
+                                with contextlib.suppress(Exception):
                                     from pydub.effects import normalize as pydub_norm
 
                                     audio = pydub_norm(audio)
-                                except Exception:
-                                    pass
                             audio.export(dest_file, format="mp3")
                 else:
-                    new_name = f"{idx:02d} - {clean_base}"
-                    dest_file = os.path.join(dest_folder, new_name)
+                    dest_file = os.path.join(dest_folder, f"{idx:0{width}d} - {clean_base}")
                     if on_status:
                         on_status(f"Copying USB track {idx} of {total}...")
                     shutil.copy2(filepath, dest_file)
 
+                _fsync_file(dest_file)
                 success_count += 1
                 dur = duration_fn(filepath) if duration_fn else 0.0
-                track_title = clean_stem if (normalize or not is_mp3) else clean_base
+                track_title = clean_stem if (track_normalize or not is_mp3) else clean_base
                 exported_tracks.append((os.path.basename(dest_file), track_title, dur))
             except Exception as track_err:
                 log_error(f"usb export track {filepath}: {track_err}")
                 skipped.append(f"{base_name} ({track_err})")
 
-        # Generate M3U playlist files for car stereos and media players (UTF-8 BOM for car stereo compatibility)
-        if exported_tracks and not (is_shutting_down_fn and is_shutting_down_fn()):
-            try:
-                pl_clean = sanitize_filename(playlist_name or "Playlist")
-                for ext_name, enc in ((".m3u", "utf-8-sig"), (".m3u8", "utf-8")):
-                    m3u_file = f"00_{pl_clean}{ext_name}"
-                    m3u_path = os.path.join(dest_folder, m3u_file)
-                    with open(m3u_path, "w", encoding=enc) as f:
-                        f.write("#EXTM3U\n")
-                        for fname, title, dur in exported_tracks:
-                            d_int = int(dur) if dur > 0 else -1
-                            f.write(f"#EXTINF:{d_int},{title}\n")
-                            f.write(f"{fname}\n")
-            except Exception as m3u_err:
-                log_error(f"failed writing m3u: {m3u_err}")
+        shutting_down = bool(is_shutting_down_fn and is_shutting_down_fn())
+        # Even after Stop, list the songs that were copied so the drive plays them in order.
+        if exported_tracks and not shutting_down:
+            _write_m3u(dest_folder, playlist_name, exported_tracks)
 
-        # Flush file and disk write buffers to physical media before reporting success
-        if not (is_shutting_down_fn and is_shutting_down_fn()):
-            flush_usb_drive(dest_folder)
-
+        if _cancelled():
+            if on_cancelled:
+                on_cancelled(success_count, total)
+            return
+        if on_progress:
+            on_progress(100.0)
         if on_success:
             on_success(success_count, total, skipped)
     except Exception as e:
@@ -242,49 +306,43 @@ def usb_export_worker(
             on_error(f"Could not complete USB export:\n{e}")
 
 
-def flush_usb_drive(dest_folder):
-    """Flush file and disk write buffers to physical media to ensure safe drive removal."""
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            drive_letter = os.path.splitdrive(dest_folder)[0]
-            if drive_letter:
-                h = kernel32.CreateFileW(f"\\\\.\\{drive_letter}", 0x40000000 | 0x80000000, 1 | 2, None, 3, 0, None)
-                if h and h != -1 and h != 0xFFFFFFFFFFFFFFFF:
-                    try:
-                        kernel32.FlushFileBuffers(h)
-                    finally:
-                        kernel32.CloseHandle(h)
-        elif hasattr(os, "sync"):
-            os.sync()
-    except Exception as flush_err:
-        log_error(f"flush_usb_drive: {flush_err}")
+def flush_usb_drive(dest_folder: str) -> None:
+    """Write every file in ``dest_folder`` through to the drive before it is unplugged."""
+    for entry in Path(dest_folder).iterdir() if os.path.isdir(dest_folder) else ():
+        if entry.is_file():
+            _fsync_file(str(entry))
 
 
 def cd_export_worker(
-    cd_folder,
-    files_to_export,
-    normalize=False,
-    on_progress=None,
-    on_status=None,
-    on_success=None,
-    on_error=None,
-    is_shutting_down_fn=None,
-):
+    cd_folder: str,
+    files_to_export: Sequence[str],
+    normalize: bool = False,
+    on_progress: ProgressFn | None = None,
+    on_status: StatusFn | None = None,
+    on_success: Callable[[str, int, int, list[str]], None] | None = None,
+    on_error: Callable[[str], None] | None = None,
+    is_shutting_down_fn: StopFn | None = None,
+    cancel_event: CancelToken | None = None,
+    on_cancelled: Callable[[int, int], None] | None = None,
+) -> None:
     """Export tracks to Desktop burn folder as standard Red Book 44.1kHz 16-bit stereo PCM WAV files."""
     total = len(files_to_export)
+    width = track_number_width(total)
     success_count = 0
-    skipped = []
+    skipped: list[str] = []
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _stopping() -> bool:
+        return bool(is_shutting_down_fn and is_shutting_down_fn()) or _cancelled()
 
     try:
         for idx, filepath in enumerate(files_to_export, 1):
-            if is_shutting_down_fn and is_shutting_down_fn():
+            if _stopping():
                 break
-            pct = (idx / total) * 100
             if on_progress:
-                on_progress(pct)
+                on_progress(((idx - 1) / total) * 100)
 
             if not filepath or not os.path.exists(filepath):
                 skipped.append(os.path.basename(filepath or f"Track {idx}") + " (file not found)")
@@ -296,23 +354,25 @@ def cd_export_worker(
 
             base = os.path.splitext(os.path.basename(filepath))[0]
             clean_base = sanitize_filename(base)
-            wav_path = os.path.join(cd_folder, f"{idx:02d} - {clean_base}.wav")
+            wav_path = os.path.join(cd_folder, f"{idx:0{width}d} - {clean_base}.wav")
 
             try:
                 args = ["-y", "-i", filepath]
                 if normalize:
-                    args += ["-af", loudnorm_filter(measure_loudnorm(filepath))]
+                    args += ["-af", loudnorm_filter(measure_loudnorm(filepath, cancel_event=cancel_event))]
                 args += ["-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", wav_path]
-                result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC)
+                result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
+                if _stopping():
+                    with contextlib.suppress(OSError):
+                        os.remove(wav_path)
+                    break
                 if result.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
                     audio = AudioSegment.from_file(filepath)
                     if normalize:
-                        try:
+                        with contextlib.suppress(Exception):
                             from pydub.effects import normalize as pydub_norm
 
                             audio = pydub_norm(audio)
-                        except Exception:
-                            pass
                     audio = audio.set_frame_rate(44100).set_channels(2).set_sample_width(2)
                     audio.export(wav_path, format="wav")
                 success_count += 1
@@ -320,6 +380,12 @@ def cd_export_worker(
                 log_error(f"cd export track {filepath}: {track_err}")
                 skipped.append(f"{base} ({track_err})")
 
+        if _cancelled():
+            if on_cancelled:
+                on_cancelled(success_count, total)
+            return
+        if on_progress:
+            on_progress(100.0)
         if on_success:
             on_success(cd_folder, success_count, total, skipped)
     except Exception as e:

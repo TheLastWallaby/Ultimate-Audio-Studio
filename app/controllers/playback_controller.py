@@ -1,19 +1,22 @@
 """Playback controller managing audio transport, clock tracking, native end events, and auto-leveling."""
 
+from __future__ import annotations
+
 import os
 import time
+from collections.abc import Sequence
 
 import pygame
 
 from app.config import ffmpeg_path, log_error
-from app.core.audio_engine import SONG_END_EVENT
+from app.core.audio_engine import AudioEngine
 from app.services.clipper import create_audition_slice
 
 
 class PlaybackController:
     """Manages audio playback transport, timeline synchronization, volume, and audition clips."""
 
-    def __init__(self, app, audio_engine):
+    def __init__(self, app: object, audio_engine: AudioEngine) -> None:
         self.app = app
         self.audio_engine = audio_engine
         if self.audio_engine:
@@ -25,22 +28,22 @@ class PlaybackController:
         self.loop_preview = False
         self.clip_start_time = 0.0
         self.clip_end_time = 0.0
-        self.current_preview_filepath = None
+        self.current_preview_filepath: str | None = None
         self.play_guard_until = 0.0
         # True when the mixer no longer holds the paused track at the paused position (the user
         # scrubbed, or another player such as the search preview used the shared pygame mixer).
         self._scrubbed_while_paused = False
         self.paused_position = 0.0
-        self._audition_slice_file = None
+        self._audition_slice_file: str | None = None
         self._is_audition_slice = False
         self._unmuted_volume = 80.0
 
-    def set_volume(self, vol, use_curve=True):
+    def set_volume(self, vol: float, use_curve: bool = True) -> None:
         """Set volume on audio engine with perceptual curve."""
         if self.audio_engine:
             self.audio_engine.set_volume(vol, use_curve=use_curve)
 
-    def play_track(self, filepath, start_sec=0.0, is_playlist=False):
+    def play_track(self, filepath: str, start_sec: float = 0.0, is_playlist: bool = False) -> None:
         """Start playback of a track from start_sec."""
         self.stop(user=False)
         self.audio_engine.load_and_play(filepath, start_sec)
@@ -55,10 +58,11 @@ class PlaybackController:
             self.is_playing_main = True
             self.is_playing_playlist = False
 
-    def pause(self):
+    def pause(self) -> None:
         """Pause playback or resume if already paused."""
         if self.is_paused:
-            return self.unpause()
+            self.unpause()
+            return
         if not (self.is_playing_main or self.is_playing_playlist):
             return
         self.audio_engine.pause()
@@ -66,7 +70,7 @@ class PlaybackController:
         self.is_paused = True
         self._scrubbed_while_paused = False
 
-    def unpause(self, current_track_path=None):
+    def unpause(self, current_track_path: str | None = None) -> None:
         """Resume playback from paused position."""
         if not self.is_paused:
             return
@@ -87,7 +91,7 @@ class PlaybackController:
         self._scrubbed_while_paused = False
         self.play_guard_until = time.monotonic() + 0.45
 
-    def stop(self, user=False):
+    def stop(self, user: bool = False) -> None:
         """Stop playback and cleanup any temporary audition slice."""
         self.cleanup_audition_slice()
         self.audio_engine.stop()
@@ -99,7 +103,7 @@ class PlaybackController:
         if user:
             self.audio_engine.play_start_offset = 0.0
 
-    def seek(self, seconds, track_duration=0.0):
+    def seek(self, seconds: float, track_duration: float = 0.0) -> None:
         """Seek playback to specified seconds position."""
         seek_sec = max(0.0, min(track_duration or seconds, seconds))
         if (self.is_playing_main or self.is_playing_playlist) and not self.is_paused:
@@ -120,39 +124,40 @@ class PlaybackController:
                 self.paused_position = seek_sec
                 self._scrubbed_while_paused = True
 
-    def mark_mixer_taken(self):
+    def mark_mixer_taken(self) -> None:
         """Record that another player used the shared mixer, so resuming must reload the track."""
         if self.is_paused:
             self._scrubbed_while_paused = True
 
-    def skip_by(self, delta_seconds, track_duration=0.0):
+    def skip_by(self, delta_seconds: float, track_duration: float = 0.0) -> float:
         """Skip playback position by delta_seconds (+10s or -10s)."""
         curr = self.current_play_seconds()
         new_pos = max(0.0, min(track_duration, curr + delta_seconds))
         self.seek(new_pos, track_duration)
         return new_pos
 
-    def current_play_seconds(self):
+    def current_play_seconds(self) -> float:
         """Get elapsed playback position from high-precision monotonic clock."""
         return self.audio_engine.current_play_seconds()
 
-    def check_native_end_event(self):
-        """Check Pygame event queue for SONG_END_EVENT fired by mixer."""
-        try:
-            for event in pygame.event.get():
-                if event.type == SONG_END_EVENT:
-                    return True
-        except Exception:
-            pass
-        return False
-
-    def test_clip(self, filepath, s_time, e_time, gain_db=0.0, soften=False, fade_sec=1.5, loop=False):
+    def test_clip(
+        self,
+        filepath: str,
+        s_time: float,
+        e_time: float,
+        gain_db: float = 0.0,
+        soften: bool = False,
+        fade_sec: float = 1.5,
+        loop: bool = False,
+    ) -> None:
         """Audition a clipped section with gain boost, soft limiter, and smooth fade."""
         preview_path = self.prepare_audition(filepath, s_time, e_time, gain_db, soften, fade_sec)
         self.start_audition(filepath, s_time, e_time, preview_path, loop=loop)
 
     @staticmethod
-    def prepare_audition(filepath, s_time, e_time, gain_db=0.0, soften=False, fade_sec=1.5):
+    def prepare_audition(
+        filepath: str, s_time: float, e_time: float, gain_db: float = 0.0, soften: bool = False, fade_sec: float = 1.5
+    ) -> str | None:
         """Render the boosted/faded preview slice with FFmpeg (safe to call from a worker thread).
 
         Returns the temporary WAV path, or None when no processing is needed or rendering failed.
@@ -162,7 +167,7 @@ class PlaybackController:
         return None
 
     @staticmethod
-    def discard_audition(preview_path):
+    def discard_audition(preview_path: str | None) -> None:
         """Delete a rendered preview slice that will not be played."""
         if preview_path and os.path.exists(preview_path):
             try:
@@ -170,7 +175,9 @@ class PlaybackController:
             except OSError:
                 pass
 
-    def start_audition(self, filepath, s_time, e_time, preview_path=None, loop=False):
+    def start_audition(
+        self, filepath: str, s_time: float, e_time: float, preview_path: str | None = None, loop: bool = False
+    ) -> None:
         """Start clip playback on the UI thread, from a prepared slice or directly from the track."""
         self.stop(user=False)
         self.loop_preview = bool(loop)
@@ -195,7 +202,7 @@ class PlaybackController:
         self.clip_end_time = e_time
         self.play_guard_until = time.monotonic() + 0.45
 
-    def restart_clip_loop(self):
+    def restart_clip_loop(self) -> bool:
         """Seamlessly loop back to clip start if loop preview mode is active."""
         if not self.previewing_clip or not self.loop_preview:
             return False
@@ -214,7 +221,7 @@ class PlaybackController:
             log_error(f"restart_clip_loop: {e}")
         return False
 
-    def cleanup_audition_slice(self):
+    def cleanup_audition_slice(self) -> None:
         """Remove any temporary audition WAV slice."""
         if self._audition_slice_file:
             f = self._audition_slice_file
@@ -232,7 +239,7 @@ class PlaybackController:
     AUTO_LEVEL_MAX_CUT_DB = -12.0
     AUTO_LEVEL_MAX_BOOST_DB = 6.0
 
-    def compute_auto_level_gain(self, loudness_db):
+    def compute_auto_level_gain(self, loudness_db: float | None) -> float:
         """Return the linear gain factor that moves a track's measured loudness toward the target."""
         if loudness_db is None:
             return 1.0
@@ -243,7 +250,7 @@ class PlaybackController:
         gain_db = max(self.AUTO_LEVEL_MAX_CUT_DB, min(self.AUTO_LEVEL_MAX_BOOST_DB, gain_db))
         return 10 ** (gain_db / 20.0)
 
-    def update_auto_level(self, loudness_db):
+    def update_auto_level(self, loudness_db: float | None) -> None:
         """Apply auto-level gain for the current track (unity gain when disabled or unmeasured)."""
         if not self.audio_engine.auto_level_enabled or loudness_db is None:
             self.audio_engine.set_track_gain(1.0)
@@ -251,33 +258,33 @@ class PlaybackController:
         self.audio_engine.set_track_gain(self.compute_auto_level_gain(loudness_db))
 
     @property
-    def play_start_offset(self):
+    def play_start_offset(self) -> float:
         return self.audio_engine.play_start_offset
 
     @play_start_offset.setter
-    def play_start_offset(self, val):
+    def play_start_offset(self, val: float) -> None:
         self.audio_engine.play_start_offset = float(val)
 
     @property
-    def play_clock_origin(self):
+    def play_clock_origin(self) -> float | None:
         return self.audio_engine.play_clock_origin
 
     @play_clock_origin.setter
-    def play_clock_origin(self, val):
+    def play_clock_origin(self, val: float | None) -> None:
         self.audio_engine.play_clock_origin = val
 
     @staticmethod
-    def nudge_start(delta, clip_start, clip_end):
+    def nudge_start(delta: float, clip_start: float, clip_end: float) -> float:
         """Calculate and return new clip start clamped between 0 and clip_end - 0.05."""
         return max(0.0, min(float(clip_end) - 0.05, float(clip_start) + float(delta)))
 
     @staticmethod
-    def nudge_end(delta, clip_start, clip_end, track_duration=999999.0):
+    def nudge_end(delta: float, clip_start: float, clip_end: float, track_duration: float = 999999.0) -> float:
         """Calculate and return new clip end clamped between clip_start + 0.05 and track_duration."""
         max_limit = float(track_duration) if track_duration > 0 else 999999.0
         return max(float(clip_start) + 0.05, min(max_limit, float(clip_end) + float(delta)))
 
-    def calculate_vu_level(self, current_seconds, duration, peaks):
+    def calculate_vu_level(self, current_seconds: float, duration: float, peaks: Sequence[float]) -> int:
         """Calculate 0 to 5 LED VU activity level based on current peak amplitude and playback state."""
         if not (self.is_playing_main or self.is_playing_playlist) or self.is_paused:
             return 0

@@ -66,6 +66,17 @@ jobs:
         run: |
           .\build_exe.ps1
 
+      - name: Self-test the built executable
+        # Runs the frozen .exe with --self-test (bundled FFmpeg/Deno, hidden imports, Tk, audio
+        # pipeline) so a broken build is never published to users' auto-updaters.
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "self-test.txt"
+          $p = Start-Process -FilePath "dist\Ultimate Audio Studio.exe" -ArgumentList "--self-test", "--self-test-report", $report -PassThru
+          $null = $p.Handle  # cache the handle so ExitCode is available after the wait
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "Self-test did not finish within 5 minutes." }
+          if (Test-Path $report) { Get-Content $report } else { Write-Host "No self-test report was written." }
+          if ($p.ExitCode -ne 0) { throw "Self-test failed (exit code $($p.ExitCode))." }
+
       - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v3
         with:

@@ -1,7 +1,10 @@
 """Step 3 View: Playlist manager, track reordering, USB flash drive export, and CD burn options."""
 
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk
+from typing import TYPE_CHECKING
 
 from app.config import DEFAULT_PLAYLIST_NAME
 from app.ui.components import ToolTip, create_button, scrolled_listbox
@@ -29,8 +32,11 @@ from app.ui.theme import (
     TEXT_MUTED,
 )
 
+if TYPE_CHECKING:
+    from app.main import UltimateAudioStudio
 
-def build_step3_view(parent, app):
+
+def build_step3_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     """Construct Step 3 UI widgets on parent container and attach references to app."""
     # Header Badge
     f_hdr = tk.Frame(parent, bg="#f3e8ff", padx=8, pady=4, highlightbackground="#d8b4fe", highlightthickness=1)
@@ -224,6 +230,19 @@ def build_step3_view(parent, app):
     )
     app.btn_export.pack(fill=tk.X, pady=(2, 1))
     ToolTip(app.btn_export, "Copy this entire playlist to your USB flash drive or CD burn folder")
+
+    # Shown (under the Export button) only while an export is running.
+    app.btn_cancel_export = create_button(
+        parent,
+        "⏹ Stop Export",
+        app.cancel_export,
+        bg=COLOR_BTN_NEUTRAL,
+        fg=COLOR_DANGER_TEXT,
+        hover_bg=COLOR_DANGER_BG,
+        font=FONT_BTN_SUB,
+        pady=3,
+    )
+    ToolTip(app.btn_cancel_export, "Stop copying; the songs already copied stay on the drive")
 
     btn_help = create_button(
         parent, "❓ Help Guide", app.show_help, bg=COLOR_BTN_NEUTRAL, fg=TEXT_MUTED, font=FONT_BTN_SUB, pady=2

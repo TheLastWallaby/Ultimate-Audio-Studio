@@ -1,7 +1,10 @@
 """Step 2 View: Track hero card, transport controls, waveform viewer, and clip trimming."""
 
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk
+from typing import TYPE_CHECKING
 
 from app.ui.components import ToolTip, create_button
 from app.ui.theme import (
@@ -31,10 +34,18 @@ from app.ui.theme import (
     FONT_TIME_LARGE,
     TEXT_DARK,
     TEXT_MUTED,
+    register_scaled,
 )
 
+# Album-art thumbnail size at Normal text size (grows with Text Size).
+COVER_PX = 64
 
-def build_step2_view(parent, app):
+
+if TYPE_CHECKING:
+    from app.main import UltimateAudioStudio
+
+
+def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     """Construct Step 2 UI widgets on parent container and attach references to app."""
     # Header Badge
     f_hdr = tk.Frame(parent, bg="#fef3c7", padx=8, pady=4, highlightbackground="#fcd34d", highlightthickness=1)
@@ -50,6 +61,7 @@ def build_step2_view(parent, app):
     app.canvas_cover = tk.Canvas(
         app.f_track_card, width=60, height=60, bg="#e2e8f0", highlightthickness=1, highlightbackground=BORDER_MAIN
     )
+    register_scaled(app.canvas_cover, width=COVER_PX, height=COVER_PX)
     app.canvas_cover.pack(side=tk.LEFT, padx=(0, 8))
     app._draw_placeholder_cover()
 
@@ -89,6 +101,7 @@ def build_step2_view(parent, app):
     app.lbl_track_state.pack(side=tk.LEFT)
 
     app.canvas_vu = tk.Canvas(f_state_row, width=80, height=14, bg=BG_SUB_CARD, highlightthickness=0)
+    register_scaled(app.canvas_vu, width=80, height=14)
     app.canvas_vu.pack(side=tk.LEFT, padx=(8, 0))
     ToolTip(app.canvas_vu, "Audio Activity Indicator (Live playback levels)")
 
@@ -171,16 +184,16 @@ def build_step2_view(parent, app):
         from_=0,
         to=100,
         orient=tk.HORIZONTAL,
-        showvalue=0,
+        showvalue=False,
         bg=BG_CARD,
         fg=TEXT_DARK,
         troughcolor="#cbd5e1",
         highlightthickness=0,
         relief=tk.FLAT,
         command=app.on_volume_change,
-        sliderlength=18,
-        width=14,
     )
+    # Sliders are the hardest targets for unsteady hands: thicker troughs and longer handles.
+    register_scaled(app.scale_volume, width=22, sliderlength=32)
     vol_init = getattr(app, "_saved_volume", 80)
     app.scale_volume.set(vol_init)
     app.scale_volume.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
@@ -248,6 +261,7 @@ def build_step2_view(parent, app):
     app.canvas_waveform = tk.Canvas(
         f_wave_card, height=90, width=200, bg="#ffffff", highlightthickness=1, highlightbackground=BORDER_MAIN
     )
+    register_scaled(app.canvas_waveform, height=100)
     app.canvas_waveform.pack(fill=tk.X, pady=3)
 
     app.scale_progress = tk.Scale(
@@ -255,16 +269,15 @@ def build_step2_view(parent, app):
         from_=0,
         to=100,
         orient=tk.HORIZONTAL,
-        showvalue=0,
+        showvalue=False,
         bg=BG_SUB_CARD,
         fg=COLOR_PLAY,
         troughcolor="#e2e8f0",
         highlightthickness=0,
         command=app.on_progress_drag,
         resolution=0.1,
-        sliderlength=20,
-        width=14,
     )
+    register_scaled(app.scale_progress, width=22, sliderlength=34)
     app.scale_progress.pack(fill=tk.X)
     app.scale_progress.bind("<ButtonPress-1>", lambda e: app._mark_progress_drag(True))
     app.scale_progress.bind("<ButtonRelease-1>", app._on_progress_release)
@@ -317,7 +330,7 @@ def build_step2_view(parent, app):
         bg="#dbeafe",
         fg="#1d4ed8",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=2,
     )
     btn_ns_m1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
@@ -329,7 +342,7 @@ def build_step2_view(parent, app):
         bg="#dbeafe",
         fg="#1d4ed8",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=1,
     )
     btn_ns_mf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
@@ -341,7 +354,7 @@ def build_step2_view(parent, app):
         bg="#dbeafe",
         fg="#1d4ed8",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=1,
     )
     btn_ns_pf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
@@ -353,7 +366,7 @@ def build_step2_view(parent, app):
         bg="#dbeafe",
         fg="#1d4ed8",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=2,
     )
     btn_ns_p1.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -403,7 +416,7 @@ def build_step2_view(parent, app):
         bg="#fee2e2",
         fg="#b91c1c",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=2,
     )
     btn_ne_m1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
@@ -415,7 +428,7 @@ def build_step2_view(parent, app):
         bg="#fee2e2",
         fg="#b91c1c",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=1,
     )
     btn_ne_mf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
@@ -427,7 +440,7 @@ def build_step2_view(parent, app):
         bg="#fee2e2",
         fg="#b91c1c",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=1,
     )
     btn_ne_pf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
@@ -439,7 +452,7 @@ def build_step2_view(parent, app):
         bg="#fee2e2",
         fg="#b91c1c",
         font=FONT_SMALL_BOLD,
-        pady=1,
+        pady=3,
         padx=2,
     )
     btn_ne_p1.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -483,15 +496,14 @@ def build_step2_view(parent, app):
         to=12,
         resolution=0.5,
         orient=tk.HORIZONTAL,
-        showvalue=0,
+        showvalue=False,
         bg=BG_SUB_CARD,
         fg=TEXT_DARK,
         troughcolor="#e2e8f0",
         highlightthickness=0,
         command=app.on_gain_change,
-        sliderlength=18,
-        width=12,
     )
+    register_scaled(app.scale_gain, width=20, sliderlength=30)
     app.scale_gain.set(0.0)
     app.scale_gain.pack(fill=tk.X)
 
@@ -539,3 +551,18 @@ def build_step2_view(parent, app):
     )
     app.btn_save_clip.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
     ToolTip(app.btn_save_clip, "Save the part between Start and End as a new song in your Library")
+
+    # Only shown for a song that a clip was saved over (its untrimmed original is kept as a backup).
+    app.f_restore_original = tk.Frame(parent, bg=BG_CARD)
+    app.f_restore_original.pack(fill=tk.X)
+    app.btn_restore_original = create_button(
+        app.f_restore_original,
+        "↩ Restore Original Song",
+        app.restore_original_song,
+        bg=COLOR_BTN_NEUTRAL,
+        fg=TEXT_DARK,
+        hover_bg=COLOR_BTN_NEUTRAL_HV,
+        font=FONT_BTN_SUB,
+        pady=3,
+    )
+    ToolTip(app.btn_restore_original, "Undo the trim: put back the full song as it was before you saved a clip over it")

@@ -89,19 +89,23 @@ if BASE_PATH and BASE_PATH not in os.environ.get("PATH", ""):
 EXE_EXT = ".exe" if os.name == "nt" else ""
 
 
-candidate_ffmpeg = os.path.join(BASE_PATH, f"ffmpeg{EXE_EXT}")
-if is_valid_binary(candidate_ffmpeg):
-    ffmpeg_path = candidate_ffmpeg
-else:
-    alt = find_system_binary(f"ffmpeg{EXE_EXT}")
-    ffmpeg_path = alt if alt else candidate_ffmpeg
+def _locate_media_tool(name: str) -> str:
+    """Path of a bundled FFmpeg tool, else a genuine system copy, else the (missing) bundled path.
 
-candidate_ffprobe = os.path.join(BASE_PATH, f"ffprobe{EXE_EXT}")
-if is_valid_binary(candidate_ffprobe):
-    ffprobe_path = candidate_ffprobe
-else:
-    alt = find_system_binary(f"ffprobe{EXE_EXT}")
-    ffprobe_path = alt if alt else candidate_ffprobe
+    The packaged .exe always ships verified binaries (build_exe.ps1 rejects shims), so they are
+    trusted without running ``<tool> -version``: probing both tools cost two subprocess launches
+    on every start-up.
+    """
+    candidate = os.path.join(BASE_PATH, f"{name}{EXE_EXT}")
+    if getattr(sys, "frozen", False) and os.path.isfile(candidate):
+        return candidate
+    if is_valid_binary(candidate):
+        return candidate
+    return find_system_binary(f"{name}{EXE_EXT}") or candidate
+
+
+ffmpeg_path = _locate_media_tool("ffmpeg")
+ffprobe_path = _locate_media_tool("ffprobe")
 
 if ffmpeg_path and os.path.exists(ffmpeg_path):
     f_dir = os.path.dirname(os.path.abspath(ffmpeg_path))
@@ -125,7 +129,9 @@ YT_CACHE_DIR = str(_app_settings.paths.yt_cache_dir)
 COVER_CACHE_DIR = str(_app_settings.paths.cover_cache_dir)
 PREVIEW_CACHE_DIR = str(_app_settings.paths.preview_cache_dir)
 DEFAULT_PLAYLIST_NAME = "My Playlist"
-AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".ogg", ".flac")
+# Everything FFmpeg can decode that people commonly have. Windows Media Player rips CDs to WMA by
+# default; formats pygame cannot play directly are converted to WAV before playback (AudioEngine).
+AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".wma", ".aac", ".opus", ".aiff", ".aif")
 YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be)/", re.I)
 
 # Application version and update configuration

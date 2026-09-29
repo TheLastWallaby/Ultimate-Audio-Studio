@@ -143,7 +143,7 @@ flowchart LR
 - **Automated CI/CD Pipeline**: Releases are built and published automatically via GitHub Actions (`.github/workflows/release.yml`) on pushing a version tag.
 - **Automatic yt-dlp Releases**: When a change to the `yt-dlp` requirement lands on `main` (e.g. a merged Dependabot PR), `.github/workflows/yt-dlp-autorelease.yml` bumps the patch version with `.github/scripts/bump_version.py`, pushes the commit and tag, and calls `release.yml`. No manual steps are needed.
 - **Step-by-Step Publishing** (manual releases):
-  1. Update the version everywhere it is declared (`app/core/config.py` twice, `pyproject.toml`, `test_settings.py`), or run `python .github/scripts/bump_version.py` for a patch bump.
+  1. Update the version everywhere it is declared (`app/core/config.py` twice, `pyproject.toml`, `tests/test_settings.py`), or run `python .github/scripts/bump_version.py` for a patch bump.
   2. Commit and push the version bump to `main`.
   3. Create and push a matching Git tag:
      ```bash

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import simpledialog
 
 from app.config import PLAYLISTS_PATH, format_time, log_error, sanitize_filename
+from app.ui import dialogs
+from app.ui.components import listbox_nearest, listbox_selection
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 
@@ -83,10 +85,10 @@ class PlaylistMixin(AppBase):
             return
         name = sanitize_filename(name).strip()
         if not name:
-            messagebox.showwarning("Invalid Name", "Please enter a valid playlist name.")
+            dialogs.show_warning(self.root, "Invalid Name", "Please enter a valid playlist name.")
             return
         if not self.playlist_ctrl.create_playlist(name):
-            messagebox.showwarning("Already Exists", f"A playlist named '{name}' already exists.")
+            dialogs.show_warning(self.root, "Already Exists", f"A playlist named '{name}' already exists.")
             return
         self.save_playlists()
         self.refresh_playlist_dropdown()
@@ -103,10 +105,10 @@ class PlaylistMixin(AppBase):
             return
         name = sanitize_filename(name).strip()
         if not name:
-            messagebox.showwarning("Invalid Name", "Please enter a valid playlist name.")
+            dialogs.show_warning(self.root, "Invalid Name", "Please enter a valid playlist name.")
             return
         if not self.playlist_ctrl.rename_playlist(current, name):
-            messagebox.showwarning("Already Exists", f"A playlist named '{name}' already exists.")
+            dialogs.show_warning(self.root, "Already Exists", f"A playlist named '{name}' already exists.")
             return
         self.save_playlists()
         self.refresh_playlist_dropdown()
@@ -117,10 +119,16 @@ class PlaylistMixin(AppBase):
     def delete_playlist(self) -> None:
         current = self.active_playlist_name
         if len(self.playlists) <= 1:
-            messagebox.showwarning("Cannot Delete", "You must keep at least one playlist.")
+            dialogs.show_warning(self.root, "Cannot Delete", "You must keep at least one playlist.")
             return
-        ok = messagebox.askyesno(
-            "Delete Playlist", f"Delete playlist '{current}'?\n\n(This will not delete your audio files.)"
+        ok = dialogs.ask_yes_no(
+            self.root,
+            "Delete Playlist",
+            f"Delete the playlist '{current}'?\n\nYour songs stay in your Library; only the list is removed.",
+            yes="Delete playlist",
+            no="Keep it",
+            danger=True,
+            default_yes=False,
         )
         if not ok:
             return
@@ -128,7 +136,7 @@ class PlaylistMixin(AppBase):
             # Playback would otherwise continue into whichever playlist becomes active next.
             self.stop_audio(user=True)
         if not self.playlist_ctrl.delete_playlist(current):
-            messagebox.showwarning("Cannot Delete", "Could not delete playlist.")
+            dialogs.show_warning(self.root, "Cannot Delete", "Could not delete playlist.")
             return
         self.save_playlists()
         self.refresh_playlist_dropdown()
@@ -137,7 +145,7 @@ class PlaylistMixin(AppBase):
         self.set_status(f"Deleted playlist '{current}'.")
 
     def add_to_playlist(self) -> None:
-        sel = self.listbox_lib.curselection() if hasattr(self, "listbox_lib") else ()
+        sel = listbox_selection(self.listbox_lib) if hasattr(self, "listbox_lib") else ()
         if sel:
             selected_paths = []
             for idx in sel:
@@ -146,7 +154,7 @@ class PlaylistMixin(AppBase):
         elif self.selected_file_path:
             selected_paths = [self.selected_file_path]
         else:
-            messagebox.showwarning("No Song", "Click or select songs in the Library first.")
+            dialogs.show_warning(self.root, "No Song", "Click or select songs in the Library first.")
             return
 
         playlist = self.active_playlist_name
@@ -167,7 +175,7 @@ class PlaylistMixin(AppBase):
             self.set_status(f"Added {len(added)} songs to '{playlist}'{note}.")
 
     def pl_remove(self) -> None:
-        sel = self.listbox_pl.curselection()
+        sel = listbox_selection(self.listbox_pl)
         if not sel or sel[0] >= len(self.playlist_files):
             return
         idx = sel[0]
@@ -196,7 +204,7 @@ class PlaylistMixin(AppBase):
             log_error(f"_undo_remove_track: {e}")
 
     def pl_move_up(self) -> None:
-        sel = self.listbox_pl.curselection()
+        sel = listbox_selection(self.listbox_pl)
         if not sel or sel[0] <= 0:
             return
         idx = sel[0]
@@ -207,7 +215,7 @@ class PlaylistMixin(AppBase):
         self.listbox_pl.see(new_idx)
 
     def pl_move_down(self) -> None:
-        sel = self.listbox_pl.curselection()
+        sel = listbox_selection(self.listbox_pl)
         tracks = self.playlist_ctrl.get_active_tracks(self.active_playlist_name)
         if not sel or sel[0] >= len(tracks) - 1:
             return
@@ -220,7 +228,7 @@ class PlaylistMixin(AppBase):
 
     def _pl_drag_start(self, event: tk.Event[tk.Listbox]) -> None:
         """Remember which song the mouse went down on, for drag-to-reorder."""
-        idx = self.listbox_pl.nearest(event.y)
+        idx = listbox_nearest(self.listbox_pl, event.y)
         self._pl_drag_index = idx if 0 <= idx < len(self.playlist_files) else None
         self._pl_drag_moved = False
 
@@ -229,7 +237,7 @@ class PlaylistMixin(AppBase):
         src = getattr(self, "_pl_drag_index", None)
         if src is None:
             return
-        dst = self.listbox_pl.nearest(event.y)
+        dst = listbox_nearest(self.listbox_pl, event.y)
         if dst == src or not (0 <= dst < len(self.playlist_files)):
             return
         new_idx = self.playlist_ctrl.move_track(self.active_playlist_name, src, dst)
@@ -252,7 +260,7 @@ class PlaylistMixin(AppBase):
             self.set_status("Playlist order changed.")
 
     def on_playlist_double_click(self, _event: tk.Event[tk.Misc] | None = None) -> None:
-        sel = self.listbox_pl.curselection()
+        sel = listbox_selection(self.listbox_pl)
         if not sel or sel[0] >= len(self.playlist_files):
             return
         self.playlist_index = sel[0]
@@ -260,9 +268,9 @@ class PlaylistMixin(AppBase):
 
     def play_playlist(self) -> None:
         if not self.playlist_files:
-            messagebox.showwarning("Empty Playlist", "Add some songs to this playlist first.")
+            dialogs.show_warning(self.root, "Empty Playlist", "Add some songs to this playlist first.")
             return
-        sel = self.listbox_pl.curselection()
+        sel = listbox_selection(self.listbox_pl)
         self.playlist_index = sel[0] if sel else 0
         self._play_current_pl_track()
 
@@ -307,8 +315,10 @@ class PlaylistMixin(AppBase):
                 self.root.after(350, self._play_current_pl_track)
             else:
                 self.stop_audio(user=True)
-                messagebox.showwarning(
-                    "File Missing", f"Audio track not found:\n{path}\n\nPlease verify or remove it from the playlist."
+                dialogs.show_warning(
+                    self.root,
+                    "File Missing",
+                    f"Audio track not found:\n{path}\n\nPlease verify or remove it from the playlist.",
                 )
             return
         self.stop_audio()

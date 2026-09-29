@@ -6,7 +6,15 @@ import tkinter as tk
 from collections.abc import Callable
 from typing import Any
 
-from app.ui.theme import BG_INPUT, COLOR_BTN_NEUTRAL, COLOR_BTN_NEUTRAL_HV, FONT_BODY_BOLD, FONT_TOOLTIP, TEXT_DARK
+from app.ui.theme import (
+    BG_INPUT,
+    COLOR_BTN_NEUTRAL,
+    COLOR_BTN_NEUTRAL_HV,
+    FONT_BODY_BOLD,
+    FONT_TOOLTIP,
+    TEXT_DARK,
+    register_scaled,
+)
 
 # Button fills that are too close to the panel colour to read as buttons on their own;
 # these get a permanent dark 1px outline.
@@ -16,12 +24,12 @@ _LOW_CONTRAST_FILLS = {COLOR_BTN_NEUTRAL.lower(), "#ffffff", "#f8fafc", "#f1f5f9
 class ToolTip:
     """Accessible hover tooltip with hover debounce and automatic boundary dismissal."""
 
-    def __init__(self, widget, text, delay=350):
+    def __init__(self, widget: tk.Misc, text: str, delay: int = 350) -> None:
         self.widget = widget
         self.text = text
         self.delay = delay
-        self.tip = None
-        self._timer = None
+        self.tip: tk.Toplevel | None = None
+        self._timer: str | None = None
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
@@ -36,11 +44,11 @@ class ToolTip:
         except Exception:
             pass
 
-    def _schedule(self, event=None):
+    def _schedule(self, event: tk.Event[tk.Misc] | None = None) -> None:
         self._cancel()
         self._timer = self.widget.after(self.delay, lambda: self._show(event))
 
-    def _cancel(self):
+    def _cancel(self) -> None:
         if self._timer:
             try:
                 self.widget.after_cancel(self._timer)
@@ -48,7 +56,7 @@ class ToolTip:
                 pass
             self._timer = None
 
-    def _show(self, event=None):
+    def _show(self, event: tk.Event[tk.Misc] | None = None) -> None:
         self._cancel()
         if self.tip or not self.widget.winfo_exists() or not self.widget.winfo_viewable():
             return
@@ -85,7 +93,7 @@ class ToolTip:
                     pass
                 self.tip = None
 
-    def _hide(self, _event=None):
+    def _hide(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         self._cancel()
         if self.tip:
             try:
@@ -127,12 +135,12 @@ def create_button(
         relief=tk.SOLID if outlined else tk.FLAT,
         borderwidth=1 if outlined else 0,
         cursor="hand2",
-        padx=padx,
-        pady=pady,
         highlightthickness=0,
         takefocus=1,
         **kwargs,
     )
+    # Padding grows with Text Size and display scaling, so click targets grow with the text.
+    register_scaled(btn, padx=padx, pady=pady)
     if hover_bg:
         btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg))
         btn.bind("<Leave>", lambda e: btn.config(bg=bg))
@@ -239,10 +247,26 @@ def scrolled_listbox(parent: tk.Misc, **kwargs: Any) -> tuple[tk.Frame, tk.Listb
     return frame, listbox
 
 
-def draw_placeholder_cover(canvas):
-    """Draw a stylized retro vinyl record placeholder on a 60x60 canvas."""
+def draw_placeholder_cover(canvas: tk.Canvas) -> None:
+    """Draw a stylized retro vinyl record placeholder, sized to the canvas (designed at 60x60)."""
     canvas.delete("all")
-    canvas.create_oval(4, 4, 56, 56, fill="#1e293b", outline="#334155", width=2)
-    canvas.create_oval(14, 14, 46, 46, outline="#475569", width=1)
-    canvas.create_oval(20, 20, 40, 40, fill="#f59e0b", outline="#d97706", width=1)
-    canvas.create_oval(28, 28, 32, 32, fill="#0f172a", outline="")
+    k = int(canvas.cget("width")) / 60.0
+
+    def _oval(a: float, b: float, **kw: Any) -> None:
+        canvas.create_oval(a * k, a * k, b * k, b * k, **kw)
+
+    _oval(4, 56, fill="#1e293b", outline="#334155", width=2)
+    _oval(14, 46, outline="#475569", width=1)
+    _oval(20, 40, fill="#f59e0b", outline="#d97706", width=1)
+    _oval(28, 32, fill="#0f172a", outline="")
+
+
+# Typed adapters: typeshed leaves Listbox.curselection/nearest unannotated, which --strict rejects.
+def listbox_selection(listbox: tk.Listbox) -> tuple[int, ...]:
+    """Indices of the selected rows."""
+    return tuple(int(i) for i in listbox.curselection())  # type: ignore[no-untyped-call]
+
+
+def listbox_nearest(listbox: tk.Listbox, y: int) -> int:
+    """Index of the row nearest to canvas-relative ``y``."""
+    return int(listbox.nearest(y))  # type: ignore[no-untyped-call]

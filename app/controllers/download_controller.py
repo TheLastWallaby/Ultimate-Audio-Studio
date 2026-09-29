@@ -12,6 +12,7 @@ from app.services.downloader import (
     cleanup_partial_downloads,
     download_audio_worker,
     download_playlist_worker,
+    has_video_id,
     is_playlist_url,
     probe_playlist_info,
     resolve_download_query,
@@ -64,8 +65,26 @@ class DownloadController:
         return resolve_download_query(query)
 
     def is_playlist(self, url: str) -> bool:
-        """Check if URL points to a YouTube playlist."""
+        """Check if URL points to a YouTube playlist (a Mix link with a video counts as one song)."""
         return is_playlist_url(url)
+
+    def has_video(self, url: str) -> bool:
+        """Check if URL names a single video (so "just this song" can be offered)."""
+        return has_video_id(url)
+
+    def probe_playlist(self, url: str, on_done: Callable[[dict[str, Any] | None], None]) -> None:
+        """Read a playlist's title and songs in the background, as a job Stop can cancel.
+
+        ``on_done(info)`` gets ``{"title", "count", "entries"}`` or None when it could not be read.
+        """
+        job = self.reset_cancel()
+
+        def _worker() -> None:
+            info = probe_playlist_info(url)
+            if not job.is_set():
+                self._for_job(job, on_done)(info)
+
+        task_mgr.submit_task(_worker)
 
     def cleanup_partial(self, library_folder: str) -> None:
         """Clean up incomplete or temporary download artifacts."""
@@ -132,11 +151,13 @@ class DownloadController:
         on_batch_complete: Callable[[list[str], int], None],
         on_cancelled: Callable[[], None],
         on_error: Callable[[str], None],
+        probed: dict[str, Any] | None = None,
     ) -> None:
         """Scan a YouTube playlist, then download every track, as one cancellable job.
 
         The scan belongs to the job, so Stop works while scanning and ``is_downloading`` is already
-        true (an update restart is refused) before the first track starts.
+        true (an update restart is refused) before the first track starts. Pass ``probed`` (from
+        :meth:`probe_playlist`) to skip scanning again.
         """
         self.is_downloading = True
         job = self.reset_cancel()
@@ -156,7 +177,7 @@ class DownloadController:
             on_batch_complete(downloaded_files, total)
 
         def _worker() -> None:
-            info = probe_playlist_info(url)
+            info = probed if probed is not None else probe_playlist_info(url)
             if job.is_set():
                 self._for_job(job, _cancelled)()
                 return

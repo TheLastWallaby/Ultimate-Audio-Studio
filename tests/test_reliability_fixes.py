@@ -34,12 +34,12 @@ class TestCloseWhileBusy(unittest.TestCase):
         try:
             app._exporting = True
             with (
-                patch("tkinter.messagebox.askyesno", return_value=False) as ask,
+                patch("app.ui.dialogs.ask_yes_no", return_value=False) as ask,
                 patch.object(app, "on_close") as close,
             ):
                 app.request_close()
             ask.assert_called_once()
-            self.assertIn("the playlist export", ask.call_args[0][1])
+            self.assertIn("the playlist export", ask.call_args[0][2])
             close.assert_not_called()
             self.assertIn("Still working", app.status.cget("text"))
         finally:
@@ -48,7 +48,7 @@ class TestCloseWhileBusy(unittest.TestCase):
 
     def test_close_is_immediate_when_idle(self) -> None:
         app = _make_app()
-        with patch("tkinter.messagebox.askyesno") as ask, patch.object(app, "on_close") as close:
+        with patch("app.ui.dialogs.ask_yes_no") as ask, patch.object(app, "on_close") as close:
             app.request_close()
         ask.assert_not_called()
         close.assert_called_once()
@@ -292,7 +292,7 @@ class TestMainWindowHelpers(unittest.TestCase):
 
 class TestBumpVersionScript(unittest.TestCase):
     def test_next_patch(self) -> None:
-        path = Path(__file__).parent / ".github" / "scripts" / "bump_version.py"
+        path = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "bump_version.py"
         spec = importlib.util.spec_from_file_location("bump_version", path)
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)

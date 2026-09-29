@@ -18,7 +18,7 @@ DECLARATIONS: tuple[tuple[Path, str], ...] = (
     (PYPROJECT, r'(^version = ")(\d+\.\d+\.\d+)(")'),
     (ROOT / "app" / "core" / "config.py", r'(app_version: str = Field\(\s*default=")(\d+\.\d+\.\d+)(")'),
     (ROOT / "app" / "core" / "config.py", r'(\("app_version", None, ")(\d+\.\d+\.\d+)("\))'),
-    (ROOT / "test_settings.py", r'(assertEqual\(settings\.app\.app_version, ")(\d+\.\d+\.\d+)("\))'),
+    (ROOT / "tests" / "test_settings.py", r'(assertEqual\(settings\.app\.app_version, ")(\d+\.\d+\.\d+)("\))'),
 )
 
 

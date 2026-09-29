@@ -9,15 +9,15 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
-from tkinter import messagebox
 
 import pygame
 
 from app.config import COVER_CACHE_DIR, format_time, log_error
 from app.core.cache_manager import cache_mgr
-from app.core.metadata import extract_album_art
+from app.core.metadata import extract_album_art, read_track_metadata
 from app.core.task_manager import task_mgr
 from app.core.waveform import analyze_audio
+from app.ui import dialogs
 from app.ui.components import draw_placeholder_cover
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
@@ -101,7 +101,7 @@ class PlayerMixin(AppBase):
                 if item is None or getattr(self, "_is_shutting_down", False):
                     self._art_queue.task_done()
                     break
-                filepath, req_id = item
+                filepath, req_id, size = item
                 if req_id != self._art_req_id or getattr(self, "_is_shutting_down", False):
                     self._art_queue.task_done()
                     continue
@@ -109,8 +109,8 @@ class PlayerMixin(AppBase):
                 file_hash = hashlib.md5(
                     os.path.abspath(filepath).encode("utf-8", errors="ignore"), usedforsecurity=False
                 ).hexdigest()
-                out_png = os.path.join(COVER_CACHE_DIR, f"{file_hash}_art.png")
-                success = extract_album_art(filepath, out_png)
+                out_png = os.path.join(COVER_CACHE_DIR, f"{file_hash}_{size}_art.png")
+                success = extract_album_art(filepath, out_png, size)
 
                 def on_art_done(s: bool = success, out: str = out_png, f: str = filepath, r: int = req_id) -> None:
                     if r != self._art_req_id or getattr(self, "_is_shutting_down", False):
@@ -153,7 +153,7 @@ class PlayerMixin(AppBase):
                 self._draw_placeholder_cover()
                 return
 
-        self._art_queue.put((filepath, current_req))
+        self._art_queue.put((filepath, current_req, int(self.canvas_cover.cget("width"))))
 
     def _load_waveform(self, filepath: str) -> None:
         self._waveform_req_id += 1
@@ -313,15 +313,22 @@ class PlayerMixin(AppBase):
         base_name = title or os.path.basename(path)
         artist_name = "Unknown Artist"
 
-        meta = self._cached_metadata(path)
-        dur = meta.get("duration", 0.0)
+        # Never probe on the UI thread: ffprobe/ffmpeg (for files whose header has no length) can take
+        # seconds. Tags come from the fast header read; a missing duration is probed on a worker.
+        meta = self._cached_metadata(path, probe=False)
+        if not meta.get("duration") and os.path.isfile(path):
+            header = read_track_metadata(path, probe_fallback=False)
+            if header.duration > 0:
+                cache_mgr.set_metadata(path, header)
+            meta = header.to_dict()
+        dur = float(meta.get("duration") or 0.0)
         if meta.get("title"):
             base_name = meta["title"]
         if meta.get("artist"):
             artist_name = meta["artist"]
 
         if not os.path.exists(path):
-            messagebox.showerror("Error", f"Audio file not found:\n{path}")
+            dialogs.show_warning(self.root, "Error", f"Audio file not found:\n{path}")
             return False
 
         self.lbl_selected.config(text=base_name)
@@ -341,10 +348,36 @@ class PlayerMixin(AppBase):
 
         self._load_album_art(path)
         self._load_waveform(path)
+        self._update_restore_original_button()
+        if dur <= 0:
+            self._probe_duration_later(path)
         if self.audio_engine.needs_conversion(path):
             # Convert ahead of time so pressing Play is instant.
             task_mgr.submit_task(self.audio_engine.get_playable_audio_path, path)
         return True
+
+    def _probe_duration_later(self, path: str) -> None:
+        """Measure a song's length with ffprobe on a worker, then fill in the timeline."""
+
+        def _worker() -> None:
+            dur = self._cached_duration(path)
+            self._safe_after(0, self._apply_track_duration, path, dur)
+
+        task_mgr.submit_task(_worker)
+
+    def _apply_track_duration(self, path: str, dur: float) -> None:
+        if self.selected_file_path != path or dur <= 0 or self.track_duration > 0:
+            return
+        self.track_duration = dur
+        if self.clip_end_sec <= 0:
+            self.clip_end_sec = dur
+        self._updating_ui = True
+        self.scale_progress.config(to=dur)
+        self.lbl_prog_time.config(text=self._prog_label(float(self.scale_progress.get())))
+        self.lbl_end_time.config(text=f"End: {format_time(self.clip_end_sec)}")
+        self._updating_ui = False
+        self._update_clip_length_label()
+        self._render_waveform(full_redraw=True)
 
     def _mark_progress_drag(self, dragging: bool) -> None:
         self._progress_dragging = dragging
@@ -402,11 +435,12 @@ class PlayerMixin(AppBase):
         c.delete("all")
         colors_on = ["#22c55e", "#22c55e", "#22c55e", "#f59e0b", "#ef4444"]
         dim_color = "#cbd5e1"
+        k = int(c.cget("width")) / 80.0  # designed at 80x14; the canvas grows with Text Size
         for i in range(5):
-            x1 = 2 + i * 16
-            x2 = x1 + 12
+            x1 = (2 + i * 16) * k
+            x2 = x1 + 12 * k
             color = colors_on[i] if (i < level) else dim_color
-            c.create_rectangle(x1, 2, x2, 12, fill=color, outline="", width=0)
+            c.create_rectangle(x1, 2 * k, x2, 12 * k, fill=color, outline="", width=0)
 
     def _set_card_playing_state(self, state: str) -> None:
         if hasattr(self, "f_track_card"):
@@ -433,7 +467,7 @@ class PlayerMixin(AppBase):
                 pass
             self._selection_debounce_timer = None
         if not self.selected_file_path:
-            messagebox.showwarning("No Song", "Click a song in the Library first.")
+            dialogs.show_warning(self.root, "No Song", "Click a song in the Library first.")
             return
         if self.is_paused:
             self.pause_audio()
@@ -485,30 +519,15 @@ class PlayerMixin(AppBase):
         if self._pending_play_token is not None:
             self._pending_play_token = None
             self.set_busy(False)
-        if hasattr(self, "playback_ctrl"):
-            self.playback_ctrl.stop(user=user)
-        self._release_audio_file()
-        aud_file = getattr(self, "_audition_slice_file", None)
-        if aud_file:
-            self._audition_slice_file = None
-            self._is_audition_slice = False
-            try:
-                if os.path.exists(aud_file):
-                    os.remove(aud_file)
-            except Exception:
-                pass
-        self.is_playing_main = False
-        self.is_playing_playlist = False
-        self.is_paused = False
-        self.previewing_clip = False
-        self.play_clock_origin = None
+        # The controller owns playback state: it stops the mixer (releasing the file), clears the
+        # playing/paused/preview flags and the clock, and deletes any Test Clip preview slice.
+        self.playback_ctrl.stop(user=user)
         self._set_card_playing_state("stopped")
         if user:
             self._updating_ui = True
             self.scale_progress.set(0)
             self.lbl_prog_time.config(text=f"00:00 / {format_time(self.track_duration)}")
             self._updating_ui = False
-            self.play_start_offset = 0
             self.set_status("Stopped.", icon="⏹")
             self.refresh_playlist_listbox()
         self._render_waveform()
@@ -551,14 +570,10 @@ class PlayerMixin(AppBase):
                         self.set_status("Finished previewing clip.")
                         self._render_waveform()
                 else:
-                    now = time.monotonic()
-                    ended = False
-                    if hasattr(self, "playback_ctrl") and self.playback_ctrl.check_native_end_event():
-                        ended = True
-                    elif now >= getattr(self, "play_guard_until", 0):
-                        if not pygame.mixer.music.get_busy() or curr_pos >= (self.track_duration - 0.05):
-                            ended = True
-                    if ended:
+                    # The play guard covers the moment after load/seek when the mixer is not busy yet.
+                    if time.monotonic() >= self.play_guard_until and (
+                        not self.audio_engine.is_busy() or curr_pos >= (self.track_duration - 0.05)
+                    ):
                         self._song_finished()
 
             if hasattr(self, "root") and self.root and self.root.winfo_exists():

@@ -6,8 +6,10 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from app.core.config import get_settings
 from app.platform_utils import CREATE_NO_WINDOW
@@ -85,18 +87,36 @@ def find_system_binary(binary_name: str) -> str | None:
     return None
 
 
+class CancelToken(Protocol):
+    """Anything with ``is_set()`` (normally a ``threading.Event``)."""
+
+    def is_set(self) -> bool: ...
+
+
+CANCELLED_STDERR = "FFmpeg was stopped because the task was cancelled."
+_CANCEL_POLL_SEC = 0.25
+
+
 def run_ffmpeg(
     args: list[str],
     timeout: int = 60,
     ffmpeg_bin: str | Path | None = None,
+    cancel_event: CancelToken | None = None,
 ) -> subprocess.CompletedProcess[str] | ProcessResult:
-    """Run an FFmpeg command with standard silencing and timeout handling."""
+    """Run an FFmpeg command with standard silencing and timeout handling.
+
+    With ``cancel_event``, FFmpeg is killed within a fraction of a second once the event is set (a
+    loudness-normalized encode can otherwise run for minutes after the user pressed Stop); the
+    result then has returncode -1 and ``CANCELLED_STDERR``.
+    """
     if ffmpeg_bin is None:
         from app.config import ffmpeg_path
 
         ffmpeg_bin = ffmpeg_path
 
     cmd = [str(ffmpeg_bin), "-nostdin"] + args
+    if cancel_event is not None:
+        return _run_cancellable(cmd, timeout, cancel_event)
     try:
         return subprocess.run(
             cmd,
@@ -122,3 +142,38 @@ def run_ffmpeg(
             stdout="",
             stderr=str(e),
         )
+
+
+def _run_cancellable(cmd: list[str], timeout: int, cancel_event: CancelToken) -> ProcessResult:
+    """Run ``cmd`` like ``subprocess.run`` but poll ``cancel_event`` while it runs."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception as e:
+        logger.error("run_ffmpeg exception: %s", e)
+        return ProcessResult(returncode=-1, stdout="", stderr=str(e))
+    with proc:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                out, err = proc.communicate(timeout=_CANCEL_POLL_SEC)
+                return ProcessResult(returncode=proc.returncode, stdout=out or "", stderr=err or "")
+            except subprocess.TimeoutExpired:
+                cancelled = cancel_event.is_set()
+                if not cancelled and time.monotonic() < deadline:
+                    continue
+                proc.kill()
+                proc.communicate()
+                if cancelled:
+                    return ProcessResult(returncode=-1, stdout="", stderr=CANCELLED_STDERR)
+                logger.error("run_ffmpeg timed out after %ss: %s", timeout, " ".join(cmd[1:7]))
+                return ProcessResult(
+                    returncode=-1, stdout="", stderr=f"FFmpeg execution timed out after {timeout} seconds."
+                )

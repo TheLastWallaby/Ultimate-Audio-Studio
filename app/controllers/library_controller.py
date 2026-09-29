@@ -1,30 +1,37 @@
 """Library controller handling scanning, search filtering, renaming, file import, and safe deletion with undo."""
 
+from __future__ import annotations
+
 import contextlib
 import ctypes
 import os
 import shutil
 import uuid
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from app.config import AUDIO_EXTS, log_error
 from app.core.task_manager import task_mgr
+from app.services.clipper import original_backup_path
 
 try:
     from send2trash import send2trash as _send2trash
 except ImportError:
     _send2trash = None
 
+MetadataFn = Callable[[str], Mapping[str, Any]]
+
 UNDO_DIR_NAME = ".undo_trash"
 
 
-def _hide_path(path):
+def _hide_path(path: str) -> None:
     """Mark a folder hidden on Windows so the undo area does not clutter File Explorer."""
     if os.name == "nt":
         with contextlib.suppress(Exception):
             ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # FILE_ATTRIBUTE_HIDDEN
 
 
-def _trash_staged_file(staging_path, orig_path):
+def _trash_staged_file(staging_path: str, orig_path: str | None) -> None:
     """Move a staged file back to its original location, then to the Recycle Bin.
 
     Restoring it from the Recycle Bin later then returns it to the user's music folder under its
@@ -53,13 +60,13 @@ def _trash_staged_file(staging_path, orig_path):
 class LibraryController:
     """Manages audio files in the music library, search queries, renaming, and safe deletion with undo."""
 
-    def __init__(self, app):
+    def __init__(self, app: object) -> None:
         self.app = app
         # Each entry: (orig_path, staging_path, filename, [(playlist_name, [indices])])
         self._pending_deletes: list[tuple[str, str, str, list[tuple[str, list[int]]]]] = []
-        self._search_index = {}
+        self._search_index: dict[str, str] = {}
 
-    def scan_files(self, folder):
+    def scan_files(self, folder: str) -> list[str]:
         """Return sorted list of audio filenames in folder."""
         if not folder or not os.path.exists(folder):
             try:
@@ -72,14 +79,16 @@ class LibraryController:
             log_error(f"LibraryController.scan_files: {e}")
             return []
 
-    def scan_and_filter(self, folder, query="", get_metadata_fn=None):
+    def scan_and_filter(
+        self, folder: str, query: str = "", get_metadata_fn: MetadataFn | None = None
+    ) -> tuple[list[str], list[str]]:
         """Scan folder for audio files and filter by query."""
         files = self.scan_files(folder)
         visible = self.filter_files(files, folder, query, get_metadata_fn=get_metadata_fn)
         return files, visible
 
     @staticmethod
-    def build_import_plan(paths, library_folder):
+    def build_import_plan(paths: Sequence[str], library_folder: str) -> tuple[list[tuple[str, str]], list[str]]:
         """Build planned copies for dropped or selected files/folders."""
         audio_files = []
         for p in paths:
@@ -104,7 +113,7 @@ class LibraryController:
                 dest_exists.append(os.path.basename(dest))
         return planned, dest_exists
 
-    def update_search_index(self, folder, files, get_metadata_fn=None):
+    def update_search_index(self, folder: str, files: Sequence[str], get_metadata_fn: MetadataFn | None = None) -> None:
         """Pre-index searchable strings for library files."""
         for f in files:
             f_path = os.path.join(folder, f)
@@ -114,7 +123,7 @@ class LibraryController:
                 artist = meta.get("artist", "") if meta else ""
                 self._search_index[f_path] = f"{f} {title} {artist}".lower()
 
-    def invalidate_search_index(self, filepath=None):
+    def invalidate_search_index(self, filepath: str | None = None) -> None:
         """Invalidate search index for single file or entire library."""
         if filepath:
             self._search_index.pop(filepath, None)
@@ -125,7 +134,9 @@ class LibraryController:
         else:
             self._search_index.clear()
 
-    def filter_files(self, files, folder, query, get_metadata_fn=None):
+    def filter_files(
+        self, files: Sequence[str], folder: str, query: str, get_metadata_fn: MetadataFn | None = None
+    ) -> list[str]:
         """Filter files by search query matching filename, title, or artist via pre-indexed lookup."""
         q = (query or "").strip().lower()
         if not q:
@@ -144,7 +155,7 @@ class LibraryController:
                 matches.append(f)
         return matches
 
-    def rename_file(self, old_path, new_name, playlists):
+    def rename_file(self, old_path: str, new_name: str, playlists: dict[str, list[str]]) -> str:
         """Rename file on disk and update all playlists referencing it."""
         folder = os.path.dirname(old_path)
         new_path = os.path.join(folder, new_name)
@@ -152,6 +163,13 @@ class LibraryController:
             raise FileExistsError(f"A file named '{new_name}' already exists.")
 
         os.replace(old_path, new_path)
+        # A trimmed song's untrimmed backup follows the song, so "Restore Original Song" keeps working.
+        old_backup = original_backup_path(old_path)
+        if os.path.isfile(old_backup):
+            try:
+                os.replace(old_backup, original_backup_path(new_path))
+            except OSError as e:
+                log_error(f"rename backup {old_backup}: {e}")
         self.invalidate_search_index(old_path)
         self.invalidate_search_index(new_path)
         # Update references in playlists
@@ -206,6 +224,14 @@ class LibraryController:
                 os.rmdir(staging_dir)
             raise
 
+        # The untrimmed backup of a trimmed song goes (and comes back on Undo) with it.
+        backup = original_backup_path(filepath)
+        if os.path.isfile(backup):
+            try:
+                shutil.move(backup, original_backup_path(staging_path))
+            except OSError as e:
+                log_error(f"stage backup {backup}: {e}")
+
         # Remember playlists where this track was present
         target = os.path.abspath(filepath).lower()
         affected_playlists = []
@@ -230,6 +256,9 @@ class LibraryController:
             try:
                 if os.path.exists(staging_path):
                     shutil.move(staging_path, orig_path)
+                    staged_backup = original_backup_path(staging_path)
+                    if os.path.exists(staged_backup):
+                        shutil.move(staged_backup, original_backup_path(orig_path))
                     with contextlib.suppress(OSError):
                         os.rmdir(os.path.dirname(staging_path))
                 self.invalidate_search_index(orig_path)
@@ -249,10 +278,11 @@ class LibraryController:
         """Commit pending staged deletes to the Windows Recycle Bin."""
         pending, self._pending_deletes = self._pending_deletes, []
         for orig_path, staging_path, _fname, _aff in pending:
+            _trash_staged_file(original_backup_path(staging_path), original_backup_path(orig_path))
             _trash_staged_file(staging_path, orig_path)
 
     @staticmethod
-    def recover_stranded_deletes(folder):
+    def recover_stranded_deletes(folder: str | None) -> int:
         """Send files left in the undo area by a crash or forced exit to the Recycle Bin.
 
         Returns the number of files handled. Legacy '<name>.undo' files are supported too.
@@ -270,10 +300,15 @@ class LibraryController:
                 os.rmdir(root_dir)
         return handled
 
-    def import_external_files(self, planned_copies, is_shutting_down_fn, on_done):
+    def import_external_files(
+        self,
+        planned_copies: Sequence[tuple[str, str]],
+        is_shutting_down_fn: Callable[[], bool] | None,
+        on_done: Callable[[int], None] | None,
+    ) -> None:
         """Copy external files into library folder in background thread."""
 
-        def _worker():
+        def _worker() -> None:
             copied = 0
             for src, dest in planned_copies:
                 if is_shutting_down_fn and is_shutting_down_fn():

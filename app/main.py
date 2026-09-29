@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import faulthandler
 import importlib
 import logging
 import os
@@ -14,15 +15,18 @@ import tkinter as tk
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import ttk
 from types import TracebackType
-from typing import Any
+from typing import Any, TextIO
 
 import pygame
 
+from app import self_test
 from app.config import (
     APP_VERSION,
     DEFAULT_PLAYLIST_NAME,
+    ERROR_LOG_PATH,
     MUSIC_DIR,
     cleanup_old_executables,
     cleanup_temp_caches,
@@ -41,7 +45,25 @@ from app.controllers import (
 from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
-from app.platform_utils import Win32DragDropHandler, already_running, enable_windows_dpi
+from app.platform_utils import (
+    Win32DragDropHandler,
+    activate_existing_window,
+    already_running,
+    enable_windows_dpi,
+    release_instance_mutex,
+    set_keep_awake,
+    signal_named_event,
+    terminate_child_processes,
+)
+from app.self_test import SELF_TEST_FLAG
+from app.services.updater import (
+    UPDATE_OK_EVENT_NAME,
+    clear_pending_update,
+    failed_update_tag,
+    install_update,
+    load_pending_update,
+)
+from app.ui import dialogs
 from app.ui.components import ScrollableFrame, ToolTip, create_button
 from app.ui.error_dialog import show_error
 from app.ui.features.base import UiCallback
@@ -82,6 +104,8 @@ from app.ui.views.step3_export import build_step3_view
 from app.ui.waveform_view import WaveformView
 
 STATUS_BAR_BG = "#0f172a"
+# The window title starts with this; a second start finds the open window by it.
+WINDOW_TITLE_PREFIX = "Ultimate Audio Studio v"
 STATUS_FLASH_MS = 5000
 
 
@@ -104,7 +128,7 @@ class UltimateAudioStudio(
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title(f"Ultimate Audio Studio v{APP_VERSION}")
+        self.root.title(f"{WINDOW_TITLE_PREFIX}{APP_VERSION}")
 
         # Responsive geometry. Sizes are in physical pixels, so scale the design size by the
         # Windows display scaling (125%/150%...) and start maximized when it does not fit.
@@ -132,6 +156,7 @@ class UltimateAudioStudio(
         self.library_folder = self.default_lib_path
         self.library_files = []
         self.visible_files = []
+        self._fresh_songs: set[str] = set()
         self._art_cache = OrderedDict()
         self._max_art_cache = 64
         self._current_peaks = []
@@ -194,8 +219,6 @@ class UltimateAudioStudio(
         self._usb_fs_map = {}
         self.waveform_zoomed = False
         self._dragging_marker = None
-        self._is_audition_slice = False
-        self._audition_slice_file = None
 
         self._load_settings()
         init_fonts(self.root, self.text_size)
@@ -418,15 +441,17 @@ class UltimateAudioStudio(
     def request_close(self) -> None:
         """Window close button: warn before stopping a download, export, clip save, or import."""
         reason = self.busy_reason()
-        if reason and not messagebox.askyesno(
+        if reason and not dialogs.ask_yes_no(
+            self.root,
             "Still Working",
             f"Ultimate Audio Studio is still busy with {reason}.\n\n"
             "If you close now, it will be stopped and may be left unfinished "
-            "(for example, a USB drive with only some of the songs).\n\n"
-            "Close anyway?",
-            icon=messagebox.WARNING,
-            default=messagebox.NO,
-            parent=self.root,
+            "(for example, a USB drive with only some of the songs).",
+            yes="Close and stop it",
+            no="Keep working",
+            danger=True,
+            default_yes=False,
+            icon=dialogs.ICON_WARNING,
         ):
             self.set_status(f"Still working on {reason}. You can close the app when it has finished.", icon="⏳")
             return
@@ -435,6 +460,8 @@ class UltimateAudioStudio(
     def on_close(self) -> None:
         self._is_shutting_down = True
         self.download_ctrl.cancel()
+        self.export_ctrl.cancel()
+        self.update_ctrl.cancel_staging()
         task_mgr.shutdown(wait=False, cancel_futures=True)
         self._teardown_drag_and_drop()
         if hasattr(self, "_waveform_queue"):
@@ -528,6 +555,14 @@ class UltimateAudioStudio(
         """Switch Normal -> Large -> Extra Large and resize the whole app immediately."""
         self.text_size = next_text_size(self.text_size)
         apply_text_size(self.root, self.text_size)
+        # Canvas drawings do not follow widget sizes by themselves: redraw them at the new size.
+        self._art_cache.clear()
+        if self.selected_file_path:
+            self._load_album_art(self.selected_file_path)
+        else:
+            self._draw_placeholder_cover()
+        self._draw_vu_meter(0)
+        self._render_waveform(full_redraw=True)
         self._balance_columns()
         if hasattr(self, "btn_text_size"):
             self.btn_text_size.config(text=f"🔠 Text Size: {self.text_size}")
@@ -750,12 +785,15 @@ class UltimateAudioStudio(
     def set_busy(self, busy: bool, status: str | None = None) -> None:
         self._busy = busy
         self.root.config(cursor="watch" if busy else "")
+        # Keep Windows from sleeping mid-download/export (a finished search must not end that early).
+        set_keep_awake(busy or self.busy_reason() is not None)
         if status:
             self.set_status(status, icon="⏳" if busy else "ℹ️")
 
     def _check_ffmpeg(self) -> None:
         if not os.path.exists(ffmpeg_path):
-            messagebox.showwarning(
+            dialogs.show_warning(
+                self.root,
                 "Missing Helper File",
                 "The app could not find ffmpeg.exe.\n\n"
                 "Downloading, clipping, and CD export will not work until that file is included.",
@@ -830,6 +868,38 @@ class UltimateAudioStudio(
         ).pack(anchor="e")
 
 
+_CRASH_LOG_MAX_BYTES = 512 * 1024
+# faulthandler writes into this file at crash time, so it must stay open for the life of the process.
+_crash_log_file: TextIO | None = None
+
+
+def _install_crash_logging() -> None:
+    """Record crashes that the normal error log cannot see.
+
+    ``faulthandler`` dumps every thread's stack when native code (SDL/pygame, the ctypes window
+    procedure, FFmpeg bindings) kills the process; the packaged app has no console, so without a
+    file the crash would leave no trace. Uncaught exceptions in plain threads go to the error log.
+    """
+    global _crash_log_file
+    crash_log = Path(ERROR_LOG_PATH).with_name("audio_studio_crash.txt")
+    try:
+        crash_log.parent.mkdir(parents=True, exist_ok=True)
+        too_big = crash_log.is_file() and crash_log.stat().st_size > _CRASH_LOG_MAX_BYTES
+        _crash_log_file = open(crash_log, "w" if too_big else "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+    except OSError as e:
+        logging.getLogger(__name__).warning("crash log unavailable: %s", e)
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread else "unknown"
+        details = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        log_error(f"Uncaught exception in thread {name}:\n{details}")
+
+    threading.excepthook = _thread_hook
+
+
 def _close_splash() -> None:
     """Close the start-up splash screen shown by the packaged .exe (no-op when run from source)."""
     if not getattr(sys, "frozen", False):
@@ -840,20 +910,80 @@ def _close_splash() -> None:
         logging.getLogger(__name__).debug("splash close skipped: %s", e)
 
 
+def _show_already_running() -> None:
+    """A second start shows the window that is already open; the message is only a fallback."""
+    _close_splash()
+    if activate_existing_window(WINDOW_TITLE_PREFIX):
+        return
+    root = tk.Tk()
+    root.withdraw()
+    init_fonts(root)
+    dialogs.show_info(
+        root,
+        "Already Open",
+        "Ultimate Audio Studio is already open.\n\nLook for it on the taskbar at the bottom of the screen.",
+    )
+    root.destroy()
+
+
+def _install_pending_update_at_startup() -> str | None:
+    """Install a release downloaded during an earlier session, before any window opens.
+
+    On success this process exits (the new version takes over). Returns a message for the user when
+    the new version failed to start and the current one was restored, else None.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    pending = load_pending_update()
+    if pending is None:
+        return None
+    if pending.tag == failed_update_tag():
+        clear_pending_update()
+        return None
+    result = install_update(pending.exe_path, pending.tag)
+    already_running()  # take the single-instance lock back (it was released for the new version)
+    return result.message if result.rolled_back else None
+
+
+def _exit_process() -> None:
+    """End the process once the window has closed (settings, playlists and caches are already saved).
+
+    Helper programs are killed and the process exits at once, so a long FFmpeg encode or a network
+    read cannot keep an invisible copy of the app running and blocking the next start.
+    """
+    stopped = terminate_child_processes()
+    if stopped:
+        logging.getLogger(__name__).info("Stopped %d helper process(es) at exit", stopped)
+    release_instance_mutex()
+    logging.shutdown()
+    if _crash_log_file is not None:
+        with contextlib.suppress(OSError):
+            _crash_log_file.flush()
+    os._exit(0)
+
+
 def main() -> None:
     """Application entry point."""
-    if already_running():
+    _install_crash_logging()
+    if SELF_TEST_FLAG in sys.argv:
         _close_splash()
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showwarning("Already Running", "Ultimate Audio Studio is already running.")
+        sys.exit(self_test.main())
+    if already_running():
+        _show_already_running()
         sys.exit(0)
+
+    rollback_message = _install_pending_update_at_startup()
 
     enable_windows_dpi()
     root = tk.Tk()
     _app = UltimateAudioStudio(root)  # keep a reference for the lifetime of the main loop
+    # Tell a previous version waiting in install_update() that this one started properly.
+    signal_named_event(UPDATE_OK_EVENT_NAME)
     root.after_idle(_close_splash)  # once the window is drawn, so there is no blank gap
+    if rollback_message:
+        root.after(800, lambda: dialogs.show_warning(root, "Update Not Installed", rollback_message))
     root.mainloop()
+    _exit_process()
 
 
 if __name__ == "__main__":

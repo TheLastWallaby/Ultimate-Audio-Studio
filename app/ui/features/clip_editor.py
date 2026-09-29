@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, simpledialog
 
 from app.config import format_time, log_error
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
 from app.core.time_utils import parse_time
-from app.services.clipper import clip_audio_worker
+from app.services.clipper import clip_audio_worker, has_original_backup, restore_original
+from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 from app.ui.theme import COLOR_DOWNLOAD, TEXT_DARK
@@ -117,10 +118,11 @@ class ClipEditorMixin(AppBase):
             return
         val = self._parse_time_input(inp)
         if val is None:
-            messagebox.showwarning("Invalid Time", "Please enter a valid time (e.g. '01:30' or '90').")
+            dialogs.show_warning(self.root, "Invalid Time", "Please enter a valid time (e.g. '01:30' or '90').")
             return
         if val >= self.clip_end_sec:
-            messagebox.showwarning(
+            dialogs.show_warning(
+                self.root,
                 "Invalid Range",
                 f"Clip Start must be before Clip End ({format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())}).",
             )
@@ -147,10 +149,11 @@ class ClipEditorMixin(AppBase):
             return
         val = self._parse_time_input(inp)
         if val is None:
-            messagebox.showwarning("Invalid Time", "Please enter a valid time (e.g. '02:45' or '165').")
+            dialogs.show_warning(self.root, "Invalid Time", "Please enter a valid time (e.g. '02:45' or '165').")
             return
         if val <= self.clip_start_sec:
-            messagebox.showwarning(
+            dialogs.show_warning(
+                self.root,
                 "Invalid Range",
                 f"Clip End must be after Clip Start ({format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer())}).",
             )
@@ -173,12 +176,12 @@ class ClipEditorMixin(AppBase):
 
     def test_clip(self) -> None:
         if not self.selected_file_path:
-            messagebox.showwarning("No Song", "Click a song in the Library first.")
+            dialogs.show_warning(self.root, "No Song", "Click a song in the Library first.")
             return
         s_time = self.clip_start_sec
         e_time = self.clip_end_sec
         if s_time >= e_time:
-            messagebox.showwarning("Invalid Range", "Clip End must be after Clip Start.")
+            dialogs.show_warning(self.root, "Invalid Range", "Clip End must be after Clip Start.")
             return
         self.stop_audio()
 
@@ -220,12 +223,8 @@ class ClipEditorMixin(AppBase):
         loop: bool,
     ) -> None:
         try:
+            # Sets is_playing_main, previewing_clip and clip_end_time, and owns the preview slice file.
             self.playback_ctrl.start_audition(path, s_time, e_time, slice_path, loop=loop)
-            self._is_audition_slice = self.playback_ctrl._is_audition_slice
-            self._audition_slice_file = self.playback_ctrl._audition_slice_file
-            self.is_playing_main = True
-            self.previewing_clip = True
-            self.clip_end_time = e_time
             self._set_card_playing_state("playing")
             self._updating_ui = True
             self.scale_progress.set(s_time)
@@ -261,12 +260,12 @@ class ClipEditorMixin(AppBase):
 
     def save_clip(self) -> None:
         if not self.selected_file_path:
-            messagebox.showwarning("No Song", "Click a song in the Library first.")
+            dialogs.show_warning(self.root, "No Song", "Click a song in the Library first.")
             return
         s_time = self.clip_start_sec
         e_time = self.clip_end_sec
         if s_time >= e_time:
-            messagebox.showwarning("Invalid Range", "Clip End must be after Clip Start.")
+            dialogs.show_warning(self.root, "Invalid Range", "Clip End must be after Clip Start.")
             return
 
         dur = e_time - s_time
@@ -289,11 +288,16 @@ class ClipEditorMixin(AppBase):
 
         is_self_overwrite = os.path.abspath(save_name).lower() == os.path.abspath(self.selected_file_path).lower()
         if is_self_overwrite:
-            confirm = messagebox.askyesno(
-                "Confirm Overwrite",
-                f"You are about to overwrite the original song file:\n\n'{os.path.basename(save_name)}'\n\n"
-                "A backup of the original will be saved automatically as:\n"
-                f"'{os.path.basename(save_name)}.original.bak'\n\nDo you want to proceed?",
+            confirm = dialogs.ask_yes_no(
+                self.root,
+                "Replace the Original Song?",
+                f"You are about to replace the original song file:\n\n'{os.path.basename(save_name)}'\n\n"
+                "A backup of the original is kept automatically, and you can put it back later "
+                "with 'Restore Original Song'.",
+                yes="Replace with my clip",
+                no="Cancel",
+                default_yes=False,
+                icon=dialogs.ICON_WARNING,
             )
             if not confirm:
                 return
@@ -337,16 +341,62 @@ class ClipEditorMixin(AppBase):
         if hasattr(self, "library_ctrl"):
             self.library_ctrl.invalidate_search_index(full_path)
         self._art_cache.pop(full_path, None)
-        self.refresh_library(select_name=name)
-        if was_self_overwrite and self.selected_file_path == full_path:
-            self._load_track_ui(full_path, name)
         if was_self_overwrite:
-            self.notify_success(f"Clip saved! The original was backed up as '{name}.original.bak'.", icon="💾")
+            self.refresh_library(select_name=name)
+            if self.selected_file_path == full_path:
+                self._load_track_ui(full_path, name)
+            self.notify_success(
+                "Clip saved! The original song was kept as a backup: 'Restore Original Song' puts it back.",
+                icon="💾",
+            )
+        elif self._reveal_new_song(name):
+            self.notify_success("Clip saved and loaded: press PLAY to hear it.", icon="💾")
         else:
-            self.notify_success("Clip saved! It is highlighted in your Library on the left.", icon="💾")
+            self.notify_success("Clip saved! It is marked in green in your Library on the left.", icon="💾")
 
     def _save_error(self, err: str) -> None:
         self._saving_clip = False
         self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
         self.set_busy(False, "Could not save clip.")
         show_friendly_error(self.root, err, "save_clip")
+
+    def _update_restore_original_button(self) -> None:
+        """Show 'Restore Original Song' only for a song that a clip was saved over."""
+        if not hasattr(self, "btn_restore_original"):
+            return
+        if has_original_backup(self.selected_file_path):
+            if not self.btn_restore_original.winfo_ismapped():
+                self.btn_restore_original.pack(fill=tk.X, pady=(4, 0))
+        else:
+            self.btn_restore_original.pack_forget()
+
+    def restore_original_song(self) -> None:
+        """Put the untrimmed song back (the trimmed version goes to the Recycle Bin)."""
+        path = self.selected_file_path
+        if not path or not has_original_backup(path):
+            self._update_restore_original_button()
+            return
+        name = os.path.basename(path)
+        if not dialogs.ask_yes_no(
+            self.root,
+            "Restore the Original Song?",
+            f"This puts back the full, untrimmed '{name}' as it was before you saved a clip over it.\n\n"
+            "The trimmed version is moved to the Recycle Bin.",
+            yes="Restore the original",
+            no="Cancel",
+        ):
+            return
+        self.stop_audio(user=True)
+        self._release_audio_file()
+        try:
+            restore_original(path)
+        except OSError as e:
+            log_error(f"restore_original_song: {e}")
+            show_friendly_error(self.root, e, "generic")
+            return
+        cache_mgr.invalidate(path)
+        self.library_ctrl.invalidate_search_index(path)
+        self._art_cache.pop(path, None)
+        self.refresh_library(select_name=name)
+        self._load_track_ui(path, name)
+        self.notify_success(f"The original '{name}' is back in your Library.", icon="↩️")
