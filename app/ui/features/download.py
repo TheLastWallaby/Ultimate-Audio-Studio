@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import messagebox
+from typing import Any
 
 from app.config import YOUTUBE_RE, ffmpeg_path
 from app.core.errors import friendly_error
 from app.models import SearchResult
+from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 from app.ui.search_dialog import SearchChoiceDialog
@@ -70,27 +71,17 @@ class DownloadMixin(AppBase):
     def start_download(self) -> None:
         query = self.entry_url.get().strip()
         if not query:
-            messagebox.showwarning("Nothing to Download", "Type a song name or paste a YouTube link first.")
+            dialogs.show_warning(self.root, "Nothing to Download", "Type a song name or paste a YouTube link first.")
             return
         if not os.path.exists(ffmpeg_path):
-            messagebox.showerror("Cannot Download", "ffmpeg.exe is missing, so audio cannot be converted.")
+            dialogs.show_warning(self.root, "Cannot Download", "ffmpeg.exe is missing, so audio cannot be converted.")
             return
 
         target_url, is_search = self.download_ctrl.resolve_query(query)
         if not is_search:
             if self.download_ctrl.is_playlist(target_url):
-                choice = messagebox.askyesnocancel(
-                    "YouTube Playlist Detected",
-                    "This link points to a YouTube playlist.\n\n"
-                    "• Click 'Yes' to download all songs in this playlist\n"
-                    "• Click 'No' to download only this single video\n"
-                    "• Click 'Cancel' to abort",
-                )
-                if choice is None:
-                    return
-                elif choice is True:
-                    self._start_playlist_download(target_url)
-                    return
+                self._check_playlist(target_url)
+                return
             # Direct URL: download immediately without search dialog
             self._start_download_url(target_url)
             return
@@ -107,7 +98,56 @@ class DownloadMixin(AppBase):
             on_error=lambda err: self._safe_after(0, self._handle_search_error, err),
         )
 
-    def _start_playlist_download(self, url: str) -> None:
+    def _check_playlist(self, url: str) -> None:
+        """Read the playlist first, so the question can say how many songs it would download."""
+        self.btn_download.config(text="Checking...", state=tk.DISABLED)
+        self.btn_cancel_dl.config(state=tk.NORMAL)
+        self.set_busy(True, "Checking the YouTube playlist...")
+        self.download_ctrl.probe_playlist(
+            url, on_done=lambda info: self._safe_after(0, self._on_playlist_checked, url, info)
+        )
+
+    def _on_playlist_checked(self, url: str, info: dict[str, Any] | None) -> None:
+        self._reset_download_ui()
+        self.set_busy(False)
+        single_ok = self.download_ctrl.has_video(url)
+        if not info or not info.get("entries"):
+            if single_ok and dialogs.ask_yes_no(
+                self.root,
+                "Playlist Could Not Be Read",
+                "This link belongs to a YouTube playlist, but its list of songs could not be read "
+                "(it may be private or empty).",
+                yes="Download just this song",
+                no="Cancel",
+                icon=dialogs.ICON_WARNING,
+            ):
+                self._start_download_url(url)
+            elif not single_ok:
+                show_friendly_error(self.root, "Could not find any downloadable tracks in playlist.", "download")
+            return
+
+        count = int(info.get("count") or len(info["entries"]))
+        title = str(info.get("title") or "YouTube Playlist")
+        note = "\n\nThis may take a while; you can keep using the app meanwhile." if count > 25 else ""
+        buttons = [dialogs.DialogButton(f"Download all {count} songs", "all", "primary")]
+        if single_ok:
+            buttons.append(dialogs.DialogButton("Just this one song", "one"))
+        buttons.append(dialogs.DialogButton("Cancel", "cancel"))
+        choice = dialogs.ask_choice(
+            self.root,
+            "YouTube Playlist",
+            f'This link is the playlist "{title}" with {count} songs.{note}',
+            buttons,
+            cancel_value="cancel",
+        )
+        if choice == "all":
+            self._start_playlist_download(url, info)
+        elif choice == "one":
+            self._start_download_url(url)
+        else:
+            self.set_status("Ready")
+
+    def _start_playlist_download(self, url: str, probed: dict[str, Any] | None = None) -> None:
         self.btn_download.config(text="Scanning...", state=tk.DISABLED)
         self.btn_cancel_dl.config(state=tk.NORMAL)
         self.set_busy(True, "Scanning playlist tracks...")
@@ -158,6 +198,7 @@ class DownloadMixin(AppBase):
             ),
             on_cancelled=lambda: self._safe_after(0, self._download_cancelled),
             on_error=lambda err: self._safe_after(0, self._download_error, err),
+            probed=probed,
         )
 
     def _playlist_download_success(
@@ -177,7 +218,8 @@ class DownloadMixin(AppBase):
         if len(failures) > len(shown):
             lines.append(f"... and {len(failures) - len(shown)} more.")
         failed_list = "\n".join(lines)
-        messagebox.showwarning(
+        dialogs.show_warning(
+            self.root,
             "Some Songs Could Not Be Downloaded",
             f"{count} of {total} songs were saved to your Library.\n\n"
             f"These {len(failures)} song(s) could not be downloaded:\n{failed_list}\n\n"
@@ -188,7 +230,8 @@ class DownloadMixin(AppBase):
         self._reset_download_ui()
         self.set_busy(False)
         if not results:
-            messagebox.showinfo(
+            dialogs.show_info(
+                self.root,
                 "No Matches Found",
                 f'No results found on YouTube for "{query}".\n\n'
                 "Try including both the artist and song title, or paste a direct YouTube link.",
@@ -246,8 +289,10 @@ class DownloadMixin(AppBase):
         self.entry_url.delete(0, tk.END)
         self._reset_download_ui()
         self.set_busy(False)
-        self.refresh_library(select_name=filename)
-        self.notify_success("Download complete! The new song is highlighted in your Library on the left.")
+        if self._reveal_new_song(filename):
+            self.notify_success("Download complete! The new song is ready: press PLAY to listen.")
+        else:
+            self.notify_success("Download complete! The new song is marked in green in your Library on the left.")
 
     def _download_cancelled(self) -> None:
         self.download_ctrl.cleanup_partial(self.library_folder)

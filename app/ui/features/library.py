@@ -6,16 +6,21 @@ import os
 import time
 import tkinter as tk
 from collections.abc import Mapping
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, simpledialog
 from typing import Any
 
-from app.config import format_time, log_error, sanitize_filename
+from app.config import AUDIO_EXTS, format_time, log_error, sanitize_filename
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.metadata import read_track_metadata
 from app.core.task_manager import task_mgr
+from app.ui import dialogs
+from app.ui.components import listbox_selection
 from app.ui.error_dialog import show_error, show_friendly_error
 from app.ui.features.base import AppBase
+
+# Background of a just-added library row that was not selected (music was playing at the time).
+NEW_SONG_ROW_BG = "#dcfce7"
 
 
 class LibraryMixin(AppBase):
@@ -30,9 +35,10 @@ class LibraryMixin(AppBase):
         """Copy audio files/folders into the Library, asking before replacing existing songs."""
         planned, dest_exists = self.library_ctrl.build_import_plan(paths, self.library_folder)
         if not planned and not dest_exists:
-            messagebox.showinfo(
+            dialogs.show_info(
+                self.root,
                 "No Audio Files",
-                f"No compatible audio songs (.mp3, .wav, .m4a, .ogg, .flac) were found in the {source} files.",
+                f"No compatible audio songs ({', '.join(AUDIO_EXTS)}) were found in the {source} files.",
             )
             return
         if not planned and dest_exists:
@@ -40,9 +46,13 @@ class LibraryMixin(AppBase):
             return
 
         if dest_exists:
-            replace = messagebox.askyesno(
-                "Replace Files?",
-                f"{len(dest_exists)} of the {source} song(s) already exist in your Library.\n\nDo you want to replace them?",
+            replace = dialogs.ask_yes_no(
+                self.root,
+                "Songs Already in Your Library",
+                f"{len(dest_exists)} of the {source} song(s) are already in your Library.",
+                yes="Replace them",
+                no="Keep the ones I have",
+                default_yes=False,
             )
             if not replace:
                 planned = [(s, d) for (s, d) in planned if not os.path.exists(d)]
@@ -66,6 +76,26 @@ class LibraryMixin(AppBase):
         self.library_files = self.library_ctrl.scan_files(self.library_folder)
         self.apply_library_filter(select_name, preserve_view=preserve_view)
         self._warm_library_metadata()
+
+    def _reveal_new_song(self, filename: str) -> bool:
+        """Show a song that was just added (download, saved clip) and return True if it was loaded.
+
+        Selecting a row in code does not load it into the player, so PLAY used to play the previous
+        song while the new one was highlighted. When the player is idle the new song is highlighted
+        *and* loaded; while something is playing or paused that is left alone, and the new row is only
+        tinted green (not selected), so the highlight never disagrees with what PLAY will do.
+        """
+        path = os.path.join(self.library_folder, filename)
+        player_in_use = self.is_playing_main or self.is_playing_playlist or self.is_paused
+        if not player_in_use and os.path.isfile(path):
+            self.refresh_library(select_name=filename)
+            self.stop_audio()
+            return self._load_track_ui(path, filename)
+        self._fresh_songs.add(filename)
+        self.refresh_library()
+        if filename in self.visible_files:
+            self.listbox_lib.see(self.visible_files.index(filename))
+        return False
 
     def _warm_library_metadata(self) -> None:
         """Read tags/durations for songs not yet cached on a worker thread, then refresh the lists once."""
@@ -96,7 +126,7 @@ class LibraryMixin(AppBase):
             return
         self.library_ctrl.invalidate_search_index()
         self.apply_library_filter(preserve_view=True)
-        pl_selection = self.listbox_pl.curselection()
+        pl_selection = listbox_selection(self.listbox_pl)
         pl_view = self.listbox_pl.yview()[0]
         self.refresh_playlist_listbox()
         for idx in pl_selection:
@@ -123,7 +153,7 @@ class LibraryMixin(AppBase):
         prev_view = None
         if preserve_view:
             prev_selected = {
-                self.visible_files[i] for i in self.listbox_lib.curselection() if i < len(self.visible_files)
+                self.visible_files[i] for i in listbox_selection(self.listbox_lib) if i < len(self.visible_files)
             }
             prev_view = self.listbox_lib.yview()[0]
         if hasattr(self, "library_ctrl"):
@@ -143,6 +173,8 @@ class LibraryMixin(AppBase):
             dur = self._cached_duration(f_path, probe=False)
             dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
             self.listbox_lib.insert(tk.END, f"{self._display_name(f_path, f)}{dur_str}")
+            if f in self._fresh_songs:
+                self.listbox_lib.itemconfig(idx, background=NEW_SONG_ROW_BG)
             if select_name and f == select_name:
                 select_idx = idx
             elif f in prev_selected:
@@ -219,12 +251,12 @@ class LibraryMixin(AppBase):
         try:
             os.startfile(self.library_folder)
         except Exception as e:
-            messagebox.showerror("Error", f"Could not open folder:\n{e}")
+            dialogs.show_warning(self.root, "Error", f"Could not open folder:\n{e}")
 
     def add_external_file(self) -> None:
         files = filedialog.askopenfilenames(
             title="Select Music Files to Import",
-            filetypes=[("Audio Files", "*.mp3;*.wav;*.m4a;*.ogg;*.flac"), ("All Files", "*.*")],
+            filetypes=[("Audio Files", ";".join(f"*{ext}" for ext in AUDIO_EXTS)), ("All Files", "*.*")],
             parent=self.root,
         )
         if not files:
@@ -251,9 +283,9 @@ class LibraryMixin(AppBase):
                 self._timer_watch_library = self.root.after(12000, self._watch_library)
 
     def rename_library_file(self) -> None:
-        sel = self.listbox_lib.curselection()
+        sel = listbox_selection(self.listbox_lib)
         if not sel or sel[0] >= len(self.visible_files):
-            messagebox.showwarning("Select a Song", "Please click a song in the library listbox first.")
+            dialogs.show_warning(self.root, "Select a Song", "Please click a song in the library listbox first.")
             return
         old_name = self.visible_files[sel[0]]
         old_path = os.path.join(self.library_folder, old_name)
@@ -268,7 +300,7 @@ class LibraryMixin(AppBase):
         new_path = os.path.join(self.library_folder, new_name)
 
         if os.path.exists(new_path) and new_path.lower() != old_path.lower():
-            messagebox.showwarning("File Exists", f"A file named '{new_name}' already exists in your library.")
+            dialogs.show_warning(self.root, "File Exists", f"A file named '{new_name}' already exists in your library.")
             return
 
         was_playing_renamed = self.selected_file_path == old_path and (self.is_playing_main or self.is_playing_playlist)
@@ -292,9 +324,9 @@ class LibraryMixin(AppBase):
 
     def delete_library_file(self) -> None:
         """Move every selected song to the Recycle Bin (one confirmation, one Undo)."""
-        sel = [i for i in self.listbox_lib.curselection() if i < len(self.visible_files)]
+        sel = [i for i in listbox_selection(self.listbox_lib) if i < len(self.visible_files)]
         if not sel:
-            messagebox.showwarning("Select a Song", "Please click a song in the library listbox first.")
+            dialogs.show_warning(self.root, "Select a Song", "Please click a song in the library listbox first.")
             return
         names = [self.visible_files[i] for i in sel]
         paths = [os.path.join(self.library_folder, name) for name in names]
@@ -309,7 +341,15 @@ class LibraryMixin(AppBase):
             question = (
                 f"Are you sure you want to delete these {len(names)} songs?\n\n{listed}{more}\n\nThey will be moved"
             )
-        if not messagebox.askyesno(title, f"{question} safely to your Windows Recycle Bin."):
+        if not dialogs.ask_yes_no(
+            self.root,
+            title,
+            f"{question} safely to your Windows Recycle Bin.",
+            yes="Delete" if len(names) == 1 else f"Delete {len(names)} songs",
+            no="Keep",
+            danger=True,
+            default_yes=False,
+        ):
             return
 
         if self.selected_file_path in paths:
@@ -320,6 +360,7 @@ class LibraryMixin(AppBase):
             self._draw_placeholder_cover()
             self._current_peaks = []
             self._render_waveform(full_redraw=True)
+            self._update_restore_original_button()
 
         self._release_audio_file()
         time.sleep(0.05)
@@ -359,11 +400,14 @@ class LibraryMixin(AppBase):
             log_error(f"_undo_delete_file: {e}")
 
     def on_library_select(self, event: tk.Event[tk.Misc] | None = None) -> None:
-        sel = self.listbox_lib.curselection()
+        sel = listbox_selection(self.listbox_lib)
         if not sel or sel[0] >= len(self.visible_files):
             return
         filename = self.visible_files[sel[0]]
         new_path = os.path.join(self.library_folder, filename)
+        if filename in self._fresh_songs:
+            self._fresh_songs.discard(filename)
+            self.listbox_lib.itemconfig(sel[0], background="")
         if new_path == self.selected_file_path:
             return
 
@@ -388,7 +432,7 @@ class LibraryMixin(AppBase):
             except Exception:
                 pass
             self._selection_debounce_timer = None
-        sel = self.listbox_lib.curselection()
+        sel = listbox_selection(self.listbox_lib)
         if not sel or sel[0] >= len(self.visible_files):
             return
         filename = self.visible_files[sel[0]]

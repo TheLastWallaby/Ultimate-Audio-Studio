@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import messagebox
 
 from app.config import log_error, sanitize_filename
+from app.core.cache_manager import cache_mgr
+from app.core.task_manager import task_mgr
 from app.platform_utils import find_windows_media_player, list_removable_drives
+from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
+
+EXPORT_BUTTON_TEXT = "⚡ Export Playlist Now"
 
 
 class ExportMixin(AppBase):
@@ -57,163 +61,260 @@ class ExportMixin(AppBase):
     def eject_selected_usb(self) -> None:
         choice = self.usb_choice.get()
         if not choice or choice not in self._usb_map:
-            messagebox.showinfo("No Drive", "Please select a connected USB drive to safely eject.")
+            dialogs.show_info(self.root, "No Drive", "Please select a connected USB drive to safely eject.")
             return
         drive_path = self._usb_map[choice]
         ok, msg = self.export_ctrl.eject_usb_drive(drive_path)
         self.refresh_usb_drives()
         if ok:
-            messagebox.showinfo(
-                "Safe to Remove Hardware", f"The USB drive ({choice}) was safely ejected.\n\nYou may now unplug it."
+            dialogs.show_info(
+                self.root,
+                "Safe to Remove Hardware",
+                f"The USB drive ({choice}) was safely ejected.\n\nYou may now unplug it.",
             )
             self.set_status(f"USB drive {choice} safely ejected.")
         else:
-            messagebox.showwarning(
+            dialogs.show_warning(
+                self.root,
                 "Ejection Failed",
                 f"Could not eject drive ({choice}):\n{msg}\n\nPlease ensure no open files or Explorer windows are accessing it.",
             )
 
     def export_playlist(self) -> None:
+        """Check the songs' lengths off the UI thread when needed, then ask the export questions."""
         if not self.playlist_files:
-            messagebox.showwarning("Empty Playlist", "Add some songs to this playlist before exporting.")
+            dialogs.show_warning(self.root, "Empty Playlist", "Add some songs to this playlist before exporting.")
+            return
+        files = list(self.playlist_files)
+        # Durations drive the disk-space and 80-minute checks; reading an uncached one can start
+        # ffprobe, which must not freeze the window. Usually they were read in the background already.
+        uncached = [f for f in files if os.path.isfile(f) and cache_mgr.get_duration(f) is None]
+        if not uncached:
+            self._export_after_preflight(files)
+            return
+        self.btn_export.config(text="Checking songs...", state=tk.DISABLED)
+        self.set_busy(True, f"Checking {len(uncached)} song(s) before exporting...")
+
+        def _worker() -> None:
+            for path in uncached:
+                if getattr(self, "_is_shutting_down", False):
+                    return
+                self._cached_duration(path)
+            self._safe_after(0, _ready)
+
+        def _ready() -> None:
+            self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
+            self.set_busy(False)
+            self._export_after_preflight(files)
+
+        task_mgr.submit_task(_worker)
+
+    def _cached_duration_only(self, path: str) -> float:
+        return self._cached_duration(path, probe=False)
+
+    def _export_after_preflight(self, files: list[str]) -> None:
+        normalize = bool(self.even_volume.get())
+        if self.export_var.get() == "USB":
+            self._export_to_usb(files, normalize)
+        else:
+            self._export_to_cd(files, normalize)
+
+    def _export_to_usb(self, files: list[str], normalize: bool) -> None:
+        choice = self.usb_choice.get()
+        if not choice or choice not in self._usb_map:
+            dialogs.show_warning(
+                self.root, "No USB Drive", "Please insert a USB flash drive and select it from the list."
+            )
             return
 
-        dest_type = self.export_var.get()
-        normalize = self.even_volume.get()
+        drive_root = self._usb_map[choice]
+        if not os.path.exists(drive_root):
+            dialogs.show_warning(
+                self.root, "Drive Missing", "The selected USB drive can no longer be found. Please plug it in again."
+            )
+            return
 
-        if dest_type == "USB":
-            choice = self.usb_choice.get()
-            if not choice or choice not in self._usb_map:
-                messagebox.showwarning("No USB Drive", "Please insert a USB flash drive and select it from the list.")
+        fs_type = self._usb_fs_map.get(choice, "")
+        if self.export_ctrl.is_ntfs(fs_type) and not dialogs.ask_yes_no(
+            self.root,
+            "This Drive May Not Play in a Car",
+            f"The selected drive ({choice}) is formatted as NTFS.\n\n"
+            "Many car stereos and older stereos only read FAT32 or exFAT drives, and will show "
+            "'No Device' or 'Read Error' for this one.",
+            yes="Export anyway",
+            no="Cancel",
+            default_yes=False,
+            icon=dialogs.ICON_WARNING,
+        ):
+            return
+
+        # An earlier export of this playlist: its numbered files would otherwise stay on the drive, so
+        # songs removed or moved since keep playing (and in the wrong order).
+        playlist_folder = self.export_ctrl.usb_playlist_folder(drive_root, self.active_playlist_name)
+        previous = self.export_ctrl.previous_export_files(playlist_folder)
+        clear_existing = False
+        freed_bytes = 0
+        if previous:
+            songs = sum(1 for p in previous if not p.lower().endswith((".m3u", ".m3u8")))
+            answer = dialogs.ask_choice(
+                self.root,
+                "Playlist Already on This Drive",
+                f"The drive already has {songs} song(s) from an earlier export of "
+                f"'{self.active_playlist_name}'.\n\n"
+                "Replacing them makes the drive match your playlist exactly. Keeping them can leave "
+                "songs you have removed or moved since.",
+                [
+                    dialogs.DialogButton("Replace the old songs", "replace", "primary"),
+                    dialogs.DialogButton("Keep them and add these", "keep"),
+                    dialogs.DialogButton("Cancel", "cancel"),
+                ],
+                cancel_value="cancel",
+            )
+            if answer == "cancel":
                 return
+            clear_existing = answer == "replace"
+            if clear_existing:
+                freed_bytes = sum(os.path.getsize(p) for p in previous if os.path.isfile(p))
 
-            dest_folder = self._usb_map[choice]
-            if not os.path.exists(dest_folder):
-                messagebox.showerror("Drive Missing", "Selected USB drive is no longer accessible. Please re-insert.")
+        # Pre-flight disk space validation
+        est_bytes = self.export_ctrl.estimate_playlist_bytes(files, self._cached_duration_only)
+        has_space, free_bytes = self.export_ctrl.check_usb_space(drive_root, est_bytes, freed_bytes)
+        if not has_space:
+            free_mb = free_bytes / (1024 * 1024)
+            needed_mb = est_bytes / (1024 * 1024)
+            dialogs.show_warning(
+                self.root,
+                "Not Enough Space on the USB Drive",
+                f"The selected USB drive only has {free_mb:.0f} MB of free space.\n\n"
+                f"This playlist needs about {needed_mb:.0f} MB.\n\n"
+                "Please delete files from the USB flash drive or use a drive with more free space.",
+            )
+            return
+
+        self._begin_export("Exporting...", f"Exporting {len(files)} songs to the USB flash drive...")
+        self.export_ctrl.start_usb_export(
+            drive_root,
+            self.active_playlist_name,
+            files,
+            normalize,
+            on_progress=lambda pct: self._safe_after(0, self._update_export_progress, pct),
+            on_status=lambda text: self._safe_after(0, self.set_status, text),
+            on_success=lambda sc, tot, sk: self._safe_after(0, self._usb_export_success, sc, tot, sk),
+            on_error=lambda err: self._safe_after(0, self._export_error, err),
+            is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
+            duration_fn=self._cached_duration,
+            on_cancelled=lambda done, tot: self._safe_after(0, self._export_cancelled, done, tot, "USB"),
+            clear_existing=clear_existing,
+        )
+
+    def _export_to_cd(self, files: list[str], normalize: bool) -> None:
+        cd_folder = self.export_ctrl.get_cd_burn_folder()
+        existing_cd_files = self.export_ctrl.get_cd_existing_files(cd_folder)
+        if existing_cd_files:
+            answer = dialogs.ask_choice(
+                self.root,
+                "Previous CD Files Found",
+                f"The CD folder ('My_CD_Burn_Folder' on your Desktop) still has {len(existing_cd_files)} "
+                "file(s) from an earlier export.",
+                [
+                    dialogs.DialogButton("Remove them and start fresh", "clear", "primary"),
+                    dialogs.DialogButton("Keep them and add these", "keep"),
+                    dialogs.DialogButton("Cancel", "cancel"),
+                ],
+                cancel_value="cancel",
+            )
+            if answer == "cancel":
                 return
+            if answer == "clear":
+                self.export_ctrl.clear_cd_folder(cd_folder)
 
-            fs_type = self._usb_fs_map.get(choice, "")
-            if self.export_ctrl.is_ntfs(fs_type):
-                warn = messagebox.askyesno(
-                    "NTFS Filesystem Warning",
-                    f"The selected drive ({choice}) is formatted as NTFS.\n\n"
-                    "Many car stereos and older stereos ONLY recognize FAT32 or exFAT drives, and will show 'No Device' or 'Read Error'.\n\n"
-                    "Do you want to continue exporting anyway?",
-                )
-                if not warn:
-                    return
+        # 80-minute CD capacity validation
+        total_sec = self.export_ctrl.get_playlist_duration(files, self._cached_duration_only)
+        if total_sec > 80 * 60 and not dialogs.ask_yes_no(
+            self.root,
+            "Playlist Is Longer Than One CD",
+            "An audio CD holds 80 minutes of music.\n\n"
+            f"This playlist is {int(total_sec // 60)} minutes long, so some songs will not fit on one blank CD.",
+            yes="Prepare all songs anyway",
+            no="Cancel",
+            icon=dialogs.ICON_WARNING,
+        ):
+            return
 
-            # Pre-flight disk space validation
-            est_bytes = self.export_ctrl.estimate_playlist_bytes(self.playlist_files, self._cached_duration)
-            has_space, free_bytes = self.export_ctrl.check_usb_space(dest_folder, est_bytes)
-            if not has_space:
-                free_mb = free_bytes / (1024 * 1024)
-                needed_mb = est_bytes / (1024 * 1024)
-                messagebox.showwarning(
-                    "Insufficient USB Disk Space",
-                    f"The selected USB drive only has {free_mb:.0f} MB of free space.\n\n"
-                    f"This playlist requires approximately {needed_mb:.0f} MB.\n\n"
-                    "Please delete files from your USB flash drive or use a drive with more free space.",
-                )
-                return
+        self._begin_export("Preparing CD...", f"Preparing {len(files)} CD audio tracks...")
+        self.export_ctrl.start_cd_export(
+            cd_folder,
+            files,
+            normalize,
+            on_progress=lambda pct: self._safe_after(0, self._update_export_progress, pct),
+            on_status=lambda text: self._safe_after(0, self.set_status, text),
+            on_success=lambda fld, sc, tot, sk: self._safe_after(0, self._cd_export_success, fld, sc, tot, sk),
+            on_error=lambda err: self._safe_after(0, self._export_error, err),
+            is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
+            on_cancelled=lambda done, tot: self._safe_after(0, self._export_cancelled, done, tot, "CD"),
+        )
 
-            self._exporting = True
-            self.btn_export.config(text="Exporting...", state=tk.DISABLED)
-            self.prog_export.pack(fill=tk.X, pady=(4, 2))
-            self.prog_export["value"] = 0
-            self.set_busy(True, f"Exporting {len(self.playlist_files)} songs to USB flash drive...")
+    def _begin_export(self, button_text: str, status: str) -> None:
+        self._exporting = True
+        self.btn_export.config(text=button_text, state=tk.DISABLED)
+        self.prog_export.pack(fill=tk.X, pady=(4, 2), before=self.btn_export)
+        self.prog_export["value"] = 0
+        self.btn_cancel_export.config(text="⏹ Stop Export", state=tk.NORMAL)
+        self.btn_cancel_export.pack(fill=tk.X, pady=(1, 2), after=self.btn_export)
+        self.set_busy(True, status)
 
-            self.export_ctrl.start_usb_export(
-                dest_folder,
-                self.active_playlist_name,
-                self.playlist_files,
-                normalize,
-                on_progress=lambda pct: self._safe_after(0, lambda: self._update_export_progress(pct)),
-                on_status=lambda text: self._safe_after(0, lambda: self.set_status(text)),
-                on_success=lambda sc, tot, sk: self._safe_after(0, self._usb_export_success, sc, tot, sk),
-                on_error=lambda err: self._safe_after(0, self._export_error, err),
-                is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
-                duration_fn=self._cached_duration,
+    def _end_export(self, status: str) -> None:
+        self._exporting = False
+        self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
+        self.prog_export.pack_forget()
+        self.btn_cancel_export.pack_forget()
+        self.set_busy(False, status)
+
+    def cancel_export(self) -> None:
+        if not self._exporting:
+            return
+        self.export_ctrl.cancel()
+        self.btn_cancel_export.config(text="Stopping...", state=tk.DISABLED)
+        self.set_status("Stopping the export...", icon="⏳")
+
+    def _export_cancelled(self, done: int, total: int, target: str) -> None:
+        if target == "USB":
+            self._end_export(
+                f"Export stopped. {done} of {total} songs were copied to the USB drive. "
+                "Eject the drive before unplugging it."
             )
         else:
-            # CD Burn Folder Export
-            cd_folder = self.export_ctrl.get_cd_burn_folder()
-            existing_cd_files = self.export_ctrl.get_cd_existing_files(cd_folder)
-            if existing_cd_files:
-                clear_old = messagebox.askyesnocancel(
-                    "Clear Previous CD Files?",
-                    f"The CD burn folder ('My_CD_Burn_Folder') already contains {len(existing_cd_files)} file(s) from a previous export.\n\n"
-                    "Click 'Yes' to remove old files and start fresh.\n"
-                    "Click 'No' to keep old files and add these songs.\n"
-                    "Click 'Cancel' to stop.",
-                )
-                if clear_old is None:
-                    return
-                elif clear_old:
-                    self.export_ctrl.clear_cd_folder(cd_folder)
-
-            # 80-minute CD capacity validation
-            total_sec = self.export_ctrl.get_playlist_duration(self.playlist_files, self._cached_duration)
-            if total_sec > 80 * 60:
-                mins = int(total_sec // 60)
-                ok = messagebox.askyesno(
-                    "Playlist Exceeds 80 Minutes",
-                    f"Standard audio CDs hold 80 minutes of music.\n\n"
-                    f"Your playlist is currently {mins} minutes long, so some songs might not fit on one blank CD.\n\n"
-                    "Do you still want to prepare all tracks?",
-                )
-                if not ok:
-                    return
-
-            self._exporting = True
-            self.btn_export.config(text="Preparing CD...", state=tk.DISABLED)
-            self.prog_export.pack(fill=tk.X, pady=(4, 2))
-            self.prog_export["value"] = 0
-            self.set_busy(True, f"Preparing {len(self.playlist_files)} CD audio tracks...")
-
-            self.export_ctrl.start_cd_export(
-                cd_folder,
-                self.playlist_files,
-                normalize,
-                on_progress=lambda pct: self._safe_after(0, lambda: self._update_export_progress(pct)),
-                on_status=lambda text: self._safe_after(0, lambda: self.set_status(text)),
-                on_success=lambda fld, sc, tot, sk: self._safe_after(0, self._cd_export_success, fld, sc, tot, sk),
-                on_error=lambda err: self._safe_after(0, self._export_error, err),
-                is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
-            )
+            self._end_export(f"Export stopped. {done} of {total} CD tracks were prepared.")
 
     def _update_export_progress(self, pct: float) -> None:
         if hasattr(self, "prog_export"):
             self.prog_export["value"] = pct
 
     def _usb_export_success(self, success_count: int, total: int, skipped: list[str]) -> None:
-        self._exporting = False
-        self.btn_export.config(text="⚡ Export Playlist Now", state=tk.NORMAL)
-        self.prog_export.pack_forget()
-        self.set_busy(False, "USB export finished. Eject the drive before unplugging it.")
-        pl_name = self.active_playlist_name or "Playlist"
-        clean_pl = sanitize_filename(pl_name)
+        self._end_export("USB export finished. Eject the drive before unplugging it.")
+        clean_pl = sanitize_filename(self.active_playlist_name or "Playlist")
         if skipped:
-            msg = f"Exported {success_count} of {total} song(s) to the USB flash drive (with '00_{clean_pl}.m3u' playlist).\n\n{len(skipped)} song(s) could not be processed:\n"
+            msg = (
+                f"Exported {success_count} of {total} song(s) to the USB flash drive (with '00_{clean_pl}.m3u' "
+                f"playlist).\n\n{len(skipped)} song(s) could not be processed:\n"
+            )
             msg += "\n".join(f"• {s}" for s in skipped[:6])
             if len(skipped) > 6:
                 msg += f"\n... and {len(skipped) - 6} more."
-            messagebox.showwarning("Export Completed with Warnings", msg)
+            dialogs.show_warning(self.root, "Export Finished with Some Problems", msg)
+            title = "Eject USB Drive"
             question = "Would you like to safely eject the USB flash drive now so you can unplug it?"
         else:
+            title = "Export Finished"
             question = (
                 f"Your playlist was copied to the USB flash drive, with a '00_{clean_pl}.m3u' playlist file "
-                "for car stereos and media players.\n\n"
-                "Before unplugging it, the drive should be ejected.\n\nEject the USB flash drive now?"
+                "for car stereos and media players.\n\nBefore unplugging it, the drive should be ejected."
             )
-        if messagebox.askyesno("Export Successful" if not skipped else "Eject USB Drive", question):
+        if dialogs.ask_yes_no(self.root, title, question, yes="Eject the drive now", no="Not now", icon="✅"):
             self.eject_selected_usb()
 
     def _cd_export_success(self, cd_folder: str, success_count: int, total: int, skipped: list[str]) -> None:
-        self._exporting = False
-        self.btn_export.config(text="⚡ Export Playlist Now", state=tk.NORMAL)
-        self.prog_export.pack_forget()
-        self.set_busy(False, "CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
+        self._end_export("CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
         warn_text = ""
         if skipped:
             warn_text = f"\n\nNote: {len(skipped)} song(s) were skipped:\n" + "\n".join(f"• {s}" for s in skipped[:5])
@@ -232,17 +333,27 @@ class ExportMixin(AppBase):
         )
         msg = f"Prepared {success_count} of {total} CD track(s) in 'My_CD_Burn_Folder' on your Desktop.{warn_text}\n\n{steps}"
         if wmp:
-            if messagebox.askyesno("Ready to Burn", msg + "\n\nOpen Windows Media Player and the CD folder now?"):
+            if dialogs.ask_yes_no(
+                self.root,
+                "Ready to Burn",
+                msg,
+                yes="Open Media Player and the CD folder",
+                no="Not now",
+                icon="💿",
+            ):
                 try:
                     os.startfile(cd_folder)
                     os.startfile(wmp)
                 except OSError as e:
                     log_error(f"open CD burn tools: {e}")
         else:
-            messagebox.showinfo(
+            dialogs.show_info(
+                self.root,
                 "Ready to Burn",
                 msg + "\n\nWindows Media Player is not installed on this PC. You can add it in "
                 "Settings > Apps > Optional features > 'Windows Media Player Legacy'.",
+                button="Open the CD folder",
+                icon="💿",
             )
             try:
                 os.startfile(cd_folder)
@@ -250,9 +361,5 @@ class ExportMixin(AppBase):
                 pass
 
     def _export_error(self, err: str) -> None:
-        self._exporting = False
-        self.btn_export.config(text="⚡ Export Playlist Now", state=tk.NORMAL)
-        if hasattr(self, "prog_export"):
-            self.prog_export.pack_forget()
-        self.set_busy(False, "Export failed.")
+        self._end_export("Export failed.")
         show_friendly_error(self.root, err, "export")

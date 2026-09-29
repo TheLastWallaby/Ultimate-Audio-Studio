@@ -120,8 +120,6 @@ class AppBase:
         text_size: str
         waveform_zoomed: bool
         _dragging_marker: str | None
-        _is_audition_slice: bool
-        _audition_slice_file: str | None
         _current_peaks: list[float]
         _current_loudness: float | None
         _current_cover_img: tk.PhotoImage | None
@@ -133,9 +131,10 @@ class AppBase:
         _active_waveform_cancel: threading.Event
         _active_waveform_proc: subprocess.Popen[bytes] | None
         _waveform_queue: queue.Queue[tuple[str, int, threading.Event] | None]
-        _art_queue: queue.Queue[tuple[str, int] | None]
+        _art_queue: queue.Queue[tuple[str, int, int] | None]
         _ui_callback_queue: queue.Queue[tuple[UiCallback, tuple[Any, ...]]]
         _library_meta_gen: int
+        _fresh_songs: set[str]
         _pending_play_token: object | None
         _updating_ui: bool
         _progress_dragging: bool
@@ -211,12 +210,15 @@ class AppBase:
         scale_gain: tk.Scale
         chk_loop_clip: tk.Checkbutton
         btn_save_clip: tk.Button
+        f_restore_original: tk.Frame
+        btn_restore_original: tk.Button
         cmb_playlists: ttk.Combobox
         listbox_pl: tk.Listbox
         cmb_usb: ttk.Combobox
         btn_usb_eject: tk.Button
         prog_export: ttk.Progressbar
         btn_export: tk.Button
+        btn_cancel_export: tk.Button
 
         # --- Methods called across feature modules (defined in main.py or another mixin) ---
         def set_status(self, text: str, icon: str = "ℹ️") -> None: ...
@@ -234,8 +236,14 @@ class AppBase:
         def pause_audio(self) -> None: ...
         def stop_audio(self, user: bool = False) -> None: ...
         def _current_play_seconds(self) -> float: ...
+        def _prog_label(self, current: float) -> str: ...
+        def _seek_playback(self, seconds: float) -> None: ...
         def _draw_placeholder_cover(self) -> None: ...
+        def _load_album_art(self, filepath: str) -> None: ...
+        def _draw_vu_meter(self, level: int = 0) -> None: ...
         def _load_track_ui(self, path: str, title: str | None = None) -> bool: ...
+        def _reveal_new_song(self, filename: str) -> bool: ...
+        def _update_restore_original_button(self) -> None: ...
         def _release_audio_file(self) -> None: ...
         def _render_waveform(self, full_redraw: bool = False) -> None: ...
         def _set_card_playing_state(self, state: str) -> None: ...

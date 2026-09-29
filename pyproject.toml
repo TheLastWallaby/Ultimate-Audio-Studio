@@ -39,10 +39,12 @@ ignore = ["E501", "B008", "UP007"]
 "simple_audio_clipper.py" = ["E402"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
+pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = ["real_dialogs: show the real modal dialogs instead of auto-cancelling them"]
 
 [tool.mypy]
 python_version = "3.10"

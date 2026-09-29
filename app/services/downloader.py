@@ -1,26 +1,25 @@
 """Background yt-dlp downloader worker with search routing, progress reporting, and cancellation."""
 
+from __future__ import annotations
+
 import functools
 import hashlib
 import os
 import re
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yt_dlp
+from yt_dlp.utils import DownloadCancelled
 
 from app.config import BASE_PATH, PREVIEW_CACHE_DIR, YOUTUBE_RE, YT_CACHE_DIR, ffmpeg_path, format_time, log_error
 from app.models import SearchResult
 
-try:
-    from yt_dlp.utils import DownloadCancelled
-except Exception:
-
-    class DownloadCancelled(Exception):
-        pass
+ProgressCallback = Callable[[float, str, str, bool], None]
 
 
 @functools.lru_cache(maxsize=1)
@@ -34,7 +33,7 @@ def find_deno_runtime() -> str | None:
     if bundled.is_file():
         return str(bundled)
     try:
-        import deno  # type: ignore[import-untyped]
+        import deno
 
         return str(deno.find_deno_bin())
     except (ImportError, FileNotFoundError):
@@ -47,6 +46,52 @@ def _js_runtime_opts() -> dict[str, Any]:
     return {"js_runtimes": {"deno": {"path": deno_bin}}} if deno_bin else {}
 
 
+# Words that mark a bracketed part of a YouTube title as video noise rather than part of the song name,
+# e.g. "(Official Music Video)", "[HD]", "(Lyrics)", "[Remastered 2009]". "(Live)", "(Acoustic)" stay.
+_NOISE_WORDS = (
+    r"official|video|audio|lyrics?|visuali[sz]er|hd|hq|4k|8k|1080p|720p|remaster(?:ed)?|"
+    r"m/?v|explicit|clean version|high quality|full song|with lyrics"
+)
+_NOISE_BRACKET_RE = re.compile(rf"\s*[\(\[【]([^\)\]】]*\b(?:{_NOISE_WORDS})\b[^\)\]】]*)[\)\]】]", re.IGNORECASE)
+_NOISE_SUFFIX_RE = re.compile(
+    r"\s*[|\-–—]\s*(?:official\b.*|lyrics?|lyric video|audio|video|hd|hq|4k)\s*$", re.IGNORECASE
+)
+
+
+_ARTIST_SEPARATOR_RE = re.compile(r"\s[-–—]\s")
+
+
+def clean_song_title(title: str) -> str:
+    """Drop video noise from a YouTube title: "Song (Official Video) [4K]" -> "Song"."""
+    cleaned = _NOISE_BRACKET_RE.sub("", title or "")
+    cleaned = _NOISE_SUFFIX_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|–—")
+    return cleaned or (title or "").strip()
+
+
+class TitleCleanerPP(yt_dlp.postprocessor.PostProcessor):  # type: ignore[misc]
+    """yt-dlp pre-process step: clean the title before it becomes the file name and the MP3 tags.
+
+    When YouTube gives no artist (most music videos), an "Artist - Song" title is split so the song
+    shows as "Song — Artist" in the Library instead of carrying the channel name as its artist.
+    """
+
+    def run(self, info: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        title = info.get("title")
+        if isinstance(title, str):
+            info["title"] = clean_song_title(title)
+        if isinstance(info.get("track"), str):
+            info["track"] = clean_song_title(info["track"])
+        cleaned = str(info.get("title") or "")
+        parts = _ARTIST_SEPARATOR_RE.split(cleaned, maxsplit=1)
+        if not info.get("artist") and not info.get("artists") and not info.get("track") and len(parts) == 2:
+            artist, track = parts[0].strip(), parts[1].strip()
+            if artist and track:
+                info["artist"] = artist
+                info["track"] = track
+        return [], info
+
+
 def resolve_download_query(query: str) -> tuple[str, bool]:
     """Detect whether input is a direct URL or a search phrase."""
     q = query.strip()
@@ -55,12 +100,40 @@ def resolve_download_query(query: str) -> tuple[str, bool]:
     return q, False
 
 
+def _url_list_and_video(url: str) -> tuple[str | None, str | None, str]:
+    """Return (playlist id, video id, path) found in a YouTube URL (None when absent)."""
+    parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+    params = urllib.parse.parse_qs(parsed.query)
+    list_id = (params.get("list") or [""])[0] or None
+    video_id = (params.get("v") or [""])[0] or None
+    path = parsed.path or ""
+    if parsed.netloc.lower().endswith("youtu.be") and path.strip("/"):
+        video_id = path.strip("/").split("/")[0]
+    elif path.startswith(("/shorts/", "/live/")):
+        video_id = path.split("/")[2] or video_id
+    return list_id, video_id, path
+
+
+def has_video_id(url: str) -> bool:
+    """True when a YouTube URL points at one particular video (even if it also names a playlist)."""
+    return bool(_url_list_and_video(url.strip())[1])
+
+
 def is_playlist_url(query: str) -> bool:
-    """Check if query is a YouTube URL referencing a playlist."""
+    """Check if query is a YouTube URL that should be offered as a playlist download.
+
+    A "Mix" (``list=RD...``) is YouTube's endless auto-generated radio list: links copied while
+    listening to a song often carry one, and they are treated as that single song.
+    """
     q = query.strip()
     if not (YOUTUBE_RE.search(q) or q.lower().startswith(("http://", "https://"))):
         return False
-    return "list=" in q or "/playlist" in q
+    list_id, video_id, path = _url_list_and_video(q)
+    if not list_id:
+        return "/playlist" in path
+    # RDCLAK... are fixed, curated YouTube Music playlists rather than endless mixes.
+    is_mix = list_id.startswith("RD") and not list_id.startswith("RDCLAK")
+    return not (is_mix and video_id)
 
 
 def probe_playlist_info(url: str) -> dict[str, Any] | None:
@@ -116,26 +189,26 @@ def search_youtube(query: str, max_results: int = 10) -> list[SearchResult]:
         return []
 
     results = []
-    for e in entries:
-        if not e:
+    for entry in entries:
+        if not entry:
             continue
         # Filter out active non-downloadable live streams
-        if e.get("is_live") or e.get("live_status") == "is_live":
+        if entry.get("is_live") or entry.get("live_status") == "is_live":
             continue
-        vid_id = e.get("id")
-        url = e.get("url")
+        vid_id = entry.get("id")
+        url = entry.get("url")
         if not url or not url.startswith("http"):
             if vid_id:
                 url = f"https://www.youtube.com/watch?v={vid_id}"
             else:
                 continue
-        dur_sec = e.get("duration")
+        dur_sec = entry.get("duration")
         dur_str = format_time(dur_sec) if (dur_sec and dur_sec > 0) else "--:--"
         results.append(
             SearchResult(
                 id=vid_id or "",
-                title=e.get("title") or "Unknown Title",
-                uploader=e.get("uploader") or e.get("channel") or "Unknown Artist",
+                title=entry.get("title") or "Unknown Title",
+                uploader=entry.get("uploader") or entry.get("channel") or "Unknown Artist",
                 duration_sec=dur_sec,
                 duration_str=dur_str,
                 url=url,
@@ -144,7 +217,13 @@ def search_youtube(query: str, max_results: int = 10) -> list[SearchResult]:
     return results
 
 
-def search_youtube_worker(query, max_results, cancel_event, on_success, on_error):
+def search_youtube_worker(
+    query: str,
+    max_results: int,
+    cancel_event: threading.Event | None,
+    on_success: Callable[[list[SearchResult]], None],
+    on_error: Callable[[str], None],
+) -> None:
     """Execute search in a worker thread."""
     try:
         if cancel_event and cancel_event.is_set():
@@ -158,7 +237,7 @@ def search_youtube_worker(query, max_results, cancel_event, on_success, on_error
         on_error(str(e))
 
 
-def _cleanup_temp_preview(out_base):
+def _cleanup_temp_preview(out_base: str) -> None:
     """Remove temporary files created during preview extraction."""
     try:
         parent = os.path.dirname(out_base)
@@ -174,7 +253,7 @@ def _cleanup_temp_preview(out_base):
         pass
 
 
-def fetch_preview_audio(url, max_seconds=30, cancel_event=None):
+def fetch_preview_audio(url: str, max_seconds: int = 30, cancel_event: threading.Event | None = None) -> str | None:
     """Fetch or generate a short audio preview MP3 for a YouTube URL, caching in PREVIEW_CACHE_DIR."""
     if not url:
         return None
@@ -192,7 +271,7 @@ def fetch_preview_audio(url, max_seconds=30, cancel_event=None):
     out_base = os.path.join(PREVIEW_CACHE_DIR, f"temp_prev_{url_hash}_{int(time.time() * 1000)}")
     outtmpl = out_base + ".%(ext)s"
 
-    def _hook(d):
+    def _hook(_d: dict[str, Any]) -> None:
         if cancel_event and cancel_event.is_set():
             raise DownloadCancelled("Preview cancelled")
 
@@ -269,14 +348,16 @@ def fetch_preview_worker(
         if cancel_event and cancel_event.is_set():
             return
         if preview_path and os.path.exists(preview_path):
-            on_success(preview_path)
-        else:
+            if on_success:
+                on_success(preview_path)
+        elif on_error:
             on_error("Preview file could not be generated.")
     except DownloadCancelled:
         pass
     except Exception as e:
         log_error(f"fetch_preview_worker: {e}")
-        on_error(str(e))
+        if on_error:
+            on_error(str(e))
 
 
 def cleanup_partial_downloads(library_folder: str) -> None:
@@ -295,7 +376,15 @@ def cleanup_partial_downloads(library_folder: str) -> None:
         pass
 
 
-def download_audio_worker(target_url, library_folder, cancel_event, on_progress, on_success, on_cancelled, on_error):
+def download_audio_worker(
+    target_url: str,
+    library_folder: str,
+    cancel_event: threading.Event,
+    on_progress: ProgressCallback,
+    on_success: Callable[[str], None],
+    on_cancelled: Callable[[], None],
+    on_error: Callable[[str], None],
+) -> None:
     """Execute download in a worker thread using yt-dlp."""
     os.makedirs(library_folder, exist_ok=True)
     os.makedirs(YT_CACHE_DIR, exist_ok=True)
@@ -303,7 +392,7 @@ def download_audio_worker(target_url, library_folder, cancel_event, on_progress,
 
     last_ui_time = [0.0]
 
-    def _hook(d):
+    def _hook(d: dict[str, Any]) -> None:
         if cancel_event.is_set():
             raise DownloadCancelled("Stopped by user")
         status = d.get("status")
@@ -358,6 +447,7 @@ def download_audio_worker(target_url, library_folder, cancel_event, on_progress,
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.add_post_processor(TitleCleanerPP(), when="pre_process")
             info = ydl.extract_info(target_url, download=True)
             if cancel_event.is_set():
                 raise DownloadCancelled("Stopped by user")

@@ -1,14 +1,19 @@
 """Search results selection dialog allowing users to preview and pick which YouTube result to download."""
 
+from __future__ import annotations
+
 import queue
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
+from collections.abc import Callable
 from tkinter import ttk
+from typing import TYPE_CHECKING, Any, Literal
 
 import pygame
 
 from app.config import format_time, log_error
+from app.models import SearchResult
 from app.services.downloader import fetch_preview_worker
 from app.ui.components import create_button
 from app.ui.theme import (
@@ -36,11 +41,23 @@ from app.ui.theme import (
     TEXT_MUTED,
 )
 
+if TYPE_CHECKING:
+    from app.core.audio_engine import AudioEngine
+
 
 class SearchChoiceDialog:
     """Modal dialog presenting multiple YouTube search results with preview playback, title, artist, and duration."""
 
-    def __init__(self, parent, query, results, on_select, on_cancel=None, audio_engine=None, on_preview_play=None):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        query: str,
+        results: list[SearchResult],
+        on_select: Callable[[SearchResult], None],
+        on_cancel: Callable[[], None] | None = None,
+        audio_engine: AudioEngine | None = None,
+        on_preview_play: Callable[[], None] | None = None,
+    ) -> None:
         self.parent = parent
         self.query = query
         self.results = results or []
@@ -48,26 +65,27 @@ class SearchChoiceDialog:
         self.on_cancel = on_cancel
         self.audio_engine = audio_engine
         self.on_preview_play = on_preview_play
-        self.chosen_item = None
+        self.chosen_item: SearchResult | None = None
+        self._loading_more = False
 
         # Preview state tracking
         self._preview_cancel_event = threading.Event()
         self._preview_request_id = 0
         self._is_previewing = False
         self._is_loading_preview = False
-        self._preview_active_url = None
-        self._preview_poll_job = None
+        self._preview_active_url: str | None = None
+        self._preview_poll_job: str | None = None
         self._preview_duration = 30.0
         self._closed = False
-        self._ui_queue = queue.Queue()
-        self._drain_timer = None
+        self._ui_queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
+        self._drain_timer: str | None = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("Choose Version to Download")
         self.win.geometry("760x560")
         self.win.minsize(640, 460)
         self.win.configure(bg=BG_CARD)
-        self.win.transient(parent)
+        self.win.transient(parent.winfo_toplevel())
 
         self._drain_ui_queue()
 
@@ -88,12 +106,12 @@ class SearchChoiceDialog:
         except Exception:
             pass
 
-    def _safe_dispatch(self, callback, *args):
+    def _safe_dispatch(self, callback: Callable[..., Any], *args: Any) -> None:
         """Safely schedule a callback on Tkinter main thread via queue."""
         if not self._closed:
             self._ui_queue.put((callback, args))
 
-    def _drain_ui_queue(self):
+    def _drain_ui_queue(self) -> None:
         """Drain queued background callbacks on the main GUI thread."""
         if self._closed:
             return
@@ -115,7 +133,7 @@ class SearchChoiceDialog:
             except Exception:
                 pass
 
-    def _center_window(self):
+    def _center_window(self) -> None:
         self.win.update_idletasks()
         try:
             pw = self.parent.winfo_width()
@@ -131,7 +149,7 @@ class SearchChoiceDialog:
         except Exception:
             pass
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         container = tk.Frame(self.win, bg=BG_CARD, padx=16, pady=12)
         container.pack(fill=tk.BOTH, expand=True)
 
@@ -157,7 +175,7 @@ class SearchChoiceDialog:
 
         tk.Label(
             self.f_btns, text="💡 Tip: Double-click a song to download.", font=FONT_BODY, fg=TEXT_MUTED, bg=BG_CARD
-        ).pack(side=tk.LEFT, anchor="c")
+        ).pack(side=tk.LEFT, anchor="center")
 
         self.btn_more = create_button(
             self.f_btns,
@@ -322,7 +340,7 @@ class SearchChoiceDialog:
                 values=(item.get("title", ""), item.get("uploader", ""), item.get("duration_str", "--:--")),
             )
 
-    def _on_tree_select(self, _event=None):
+    def _on_tree_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         sel = self.tree.selection()
         if not sel:
             return
@@ -343,7 +361,7 @@ class SearchChoiceDialog:
         except Exception:
             pass
 
-    def _toggle_preview(self):
+    def _toggle_preview(self) -> None:
         if self._is_previewing or self._is_loading_preview:
             self._stop_preview()
             return
@@ -360,7 +378,7 @@ class SearchChoiceDialog:
         except Exception:
             pass
 
-    def _start_preview(self, item):
+    def _start_preview(self, item: SearchResult) -> None:
         url = item.get("url")
         if not url:
             return
@@ -385,10 +403,10 @@ class SearchChoiceDialog:
         self._style_play_button("⏳ Loading...", COLOR_PAUSE, COLOR_PAUSE_HV, state=tk.NORMAL)
         self.btn_preview_stop.config(state=tk.NORMAL)
 
-        def _on_succ(filepath):
+        def _on_succ(filepath: str) -> None:
             self._safe_dispatch(self._on_preview_ready, req_id, item, filepath)
 
-        def _on_err(err):
+        def _on_err(err: str) -> None:
             self._safe_dispatch(self._on_preview_failed, req_id, err)
 
         threading.Thread(
@@ -397,7 +415,9 @@ class SearchChoiceDialog:
             daemon=True,
         ).start()
 
-    def _style_play_button(self, text, bg, hover_bg, state=tk.NORMAL):
+    def _style_play_button(
+        self, text: str, bg: str, hover_bg: str, state: Literal["normal", "active", "disabled"] = "normal"
+    ) -> None:
         try:
             self.btn_preview_play.config(text=text, bg=bg, activebackground=hover_bg or bg, state=state)
             self.btn_preview_play.bind("<Enter>", lambda e: self.btn_preview_play.config(bg=hover_bg))
@@ -405,7 +425,7 @@ class SearchChoiceDialog:
         except Exception:
             pass
 
-    def _on_preview_ready(self, req_id, item, filepath):
+    def _on_preview_ready(self, req_id: int, item: SearchResult, filepath: str) -> None:
         if self._closed or req_id != self._preview_request_id:
             return
         self._is_loading_preview = False
@@ -431,7 +451,7 @@ class SearchChoiceDialog:
 
         self._start_timeline_poll()
 
-    def _on_preview_failed(self, req_id, err):
+    def _on_preview_failed(self, req_id: int, err: str) -> None:
         if self._closed or req_id != self._preview_request_id:
             return
         self._is_loading_preview = False
@@ -444,11 +464,11 @@ class SearchChoiceDialog:
         self.lbl_preview_time.config(text="--:--", fg=TEXT_MUTED)
         self.prog_preview["value"] = 0
 
-    def _start_timeline_poll(self):
+    def _start_timeline_poll(self) -> None:
         self._stop_timeline_poll()
         self._poll_timeline()
 
-    def _stop_timeline_poll(self):
+    def _stop_timeline_poll(self) -> None:
         if self._preview_poll_job:
             try:
                 self.win.after_cancel(self._preview_poll_job)
@@ -456,7 +476,7 @@ class SearchChoiceDialog:
                 pass
             self._preview_poll_job = None
 
-    def _poll_timeline(self):
+    def _poll_timeline(self) -> None:
         if self._closed or not self._is_previewing:
             return
 
@@ -486,7 +506,7 @@ class SearchChoiceDialog:
         if not self._closed and self.win.winfo_exists():
             self._preview_poll_job = self.win.after(100, self._poll_timeline)
 
-    def _stop_preview(self, reset_status=True):
+    def _stop_preview(self, reset_status: bool = True) -> None:
         self._preview_cancel_event.set()
         self._preview_request_id += 1
         self._stop_timeline_poll()
@@ -518,7 +538,7 @@ class SearchChoiceDialog:
         except Exception:
             pass
 
-    def _do_select(self):
+    def _do_select(self) -> None:
         # Validate the choice before shutting the dialog down; otherwise an empty click would leave
         # the dialog open but with its preview and UI queue permanently stopped.
         sel = self.tree.selection()
@@ -538,10 +558,9 @@ class SearchChoiceDialog:
                 self.win.destroy()
             except Exception:
                 pass
-            if self.on_select:
-                self.on_select(chosen)
+            self.on_select(chosen)
 
-    def _do_cancel(self):
+    def _do_cancel(self) -> None:
         self._closed = True
         self._stop_preview(reset_status=False)
         try:
@@ -552,15 +571,15 @@ class SearchChoiceDialog:
         if self.on_cancel:
             self.on_cancel()
 
-    def _load_more_results(self):
-        if getattr(self, "_loading_more", False) or self._closed:
+    def _load_more_results(self) -> None:
+        if self._loading_more or self._closed:
             return
         self._loading_more = True
         self.btn_more.config(text="Searching...", state=tk.DISABLED)
         self.lbl_preview_status.config(text="Searching for more matches on YouTube...", fg=TEXT_DARK)
         next_count = len(self.results) + 8
 
-        def _worker():
+        def _worker() -> None:
             try:
                 from app.services.downloader import search_youtube
 
@@ -568,7 +587,7 @@ class SearchChoiceDialog:
                 if self._closed:
                     return
 
-                def _apply():
+                def _apply() -> None:
                     self._loading_more = False
                     if self._closed:
                         return
@@ -601,7 +620,7 @@ class SearchChoiceDialog:
             except Exception as e:
                 log_error(f"_load_more_results: {e}")
 
-                def _err():
+                def _err() -> None:
                     self._loading_more = False
                     if not self._closed:
                         self.btn_more.config(text="➕ Show More Results", state=tk.NORMAL)

@@ -1,5 +1,11 @@
 """Interactive canvas waveform renderer with peak mirroring, marker dragging, and zoom support."""
 
+from __future__ import annotations
+
+import math
+import tkinter as tk
+from typing import TYPE_CHECKING
+
 from app.config import format_time
 from app.core.waveform import get_waveform_bounds, time_from_waveform_x, time_to_waveform_x
 from app.ui.theme import (
@@ -8,9 +14,14 @@ from app.ui.theme import (
     COLOR_DOWNLOAD,
     COLOR_PLAY,
     FONT_BODY,
-    FONT_FAMILY,
+    FONT_SMALL_BOLD,
+    FONT_WAVE_RULER,
     TEXT_MUTED,
+    scaled_px,
 )
+
+if TYPE_CHECKING:
+    from app.ui.features.base import AppBase
 
 
 class WaveformView:
@@ -18,12 +29,12 @@ class WaveformView:
 
     MARKER_HIT_TOLERANCE = 22
 
-    def __init__(self, canvas, app):
+    def __init__(self, canvas: tk.Canvas, app: AppBase) -> None:
         self.canvas = canvas
         self.app = app
-        self._resize_timer = None
-        self._bar_colors = []
-        self._last_sig = None
+        self._resize_timer: str | None = None
+        self._bar_colors: list[str] = []
+        self._last_sig: tuple[object, ...] | None = None
 
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<Motion>", self.on_hover)
@@ -31,7 +42,7 @@ class WaveformView:
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
 
-    def _on_configure(self, _event=None):
+    def _on_configure(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         if self._resize_timer:
             try:
                 self.app.root.after_cancel(self._resize_timer)
@@ -39,7 +50,7 @@ class WaveformView:
                 pass
         self._resize_timer = self.app.root.after(80, lambda: self.render(full_redraw=True))
 
-    def get_bounds(self):
+    def get_bounds(self) -> tuple[float, float]:
         return get_waveform_bounds(
             getattr(self.app, "track_duration", 0.0),
             getattr(self.app, "clip_start_sec", 0.0),
@@ -47,21 +58,21 @@ class WaveformView:
             zoomed=getattr(self.app, "waveform_zoomed", False),
         )
 
-    def time_to_x(self, t, w):
+    def time_to_x(self, t: float, w: float) -> float:
         z_start, z_end = self.get_bounds()
         return time_to_waveform_x(t, w, z_start, z_end)
 
-    def time_from_x(self, px, w):
+    def time_from_x(self, px: float, w: float) -> float:
         z_start, z_end = self.get_bounds()
         return min(getattr(self.app, "track_duration", 0.0), time_from_waveform_x(px, w, z_start, z_end))
 
-    def get_marker_x_coords(self):
+    def get_marker_x_coords(self) -> tuple[float, float]:
         w = max(1, self.canvas.winfo_width())
         xs = self.time_to_x(self.app.clip_start_sec, w)
         xe = self.time_to_x(self.app.clip_end_sec, w)
         return xs, xe
 
-    def toggle_zoom(self):
+    def toggle_zoom(self) -> None:
         self.app.waveform_zoomed = not getattr(self.app, "waveform_zoomed", False)
         if hasattr(self.app, "btn_zoom"):
             if self.app.waveform_zoomed:
@@ -72,7 +83,7 @@ class WaveformView:
                 self.app.set_status("Waveform showing full song.")
         self.render(full_redraw=True)
 
-    def on_hover(self, event):
+    def on_hover(self, event: tk.Event[tk.Misc]) -> None:
         if not self.app.selected_file_path or self.app.track_duration <= 0 or self.app._progress_dragging:
             return
         xs, xe = self.get_marker_x_coords()
@@ -82,7 +93,7 @@ class WaveformView:
         else:
             self.canvas.config(cursor="")
 
-    def render(self, full_redraw=False):
+    def render(self, full_redraw: bool = False) -> None:
         c = self.canvas
         w = c.winfo_width()
         if w <= 1:
@@ -92,6 +103,8 @@ class WaveformView:
             h = 90
 
         mid_y = h / 2.0
+        # Marker handle half-width and height grow with Text Size (easier to see and grab).
+        hw, hh = scaled_px(c, 8), scaled_px(c, 12)
         dur = max(0.1, self.app.track_duration)
         s_time = self.app.clip_start_sec
         e_time = self.app.clip_end_sec
@@ -146,15 +159,19 @@ class WaveformView:
             else:
                 step = 120.0
 
-            import math
-
             curr_t = math.ceil(z_start / step) * step
             while curr_t <= z_end:
                 tx = self.time_to_x(curr_t, w)
                 if 22 <= tx <= w - 22:
                     c.create_line(tx, h - 6, tx, h, fill="#cbd5e1", width=1, tags="ruler")
                     c.create_text(
-                        tx, h - 8, text=format_time(curr_t), fill="#64748b", font=(FONT_FAMILY, 7), tags="ruler"
+                        tx,
+                        h - 7,
+                        text=format_time(curr_t),
+                        fill="#475569",
+                        font=FONT_WAVE_RULER,
+                        anchor="s",
+                        tags="ruler",
                     )
                 curr_t += step
 
@@ -199,16 +216,16 @@ class WaveformView:
             # Zoom indicator badge on canvas
             if getattr(self.app, "waveform_zoomed", False):
                 c.create_text(
-                    w - 60, 10, text="🔍 Zoomed View", fill="#0369a1", font=(FONT_FAMILY, 10, "bold"), tags="zoom_tag"
+                    w - 6, 4, text="🔍 Zoomed View", fill="#0369a1", font=FONT_SMALL_BOLD, anchor="ne", tags="zoom_tag"
                 )
 
             # Start Marker Line & Top Handle (Blue)
             c.create_line(xs, 0, xs, h, fill="#2563eb", width=2, tags="marker_s_line")
-            c.create_polygon(xs, 0, xs - 8, 12, xs + 8, 12, fill="#2563eb", tags="marker_s_poly")
+            c.create_polygon(xs, 0, xs - hw, hh, xs + hw, hh, fill="#2563eb", tags="marker_s_poly")
 
             # End Marker Line & Top Handle (Red)
             c.create_line(xe, 0, xe, h, fill="#dc2626", width=2, tags="marker_e_line")
-            c.create_polygon(xe, 0, xe - 8, 12, xe + 8, 12, fill="#dc2626", tags="marker_e_poly")
+            c.create_polygon(xe, 0, xe - hw, hh, xe + hw, hh, fill="#dc2626", tags="marker_e_poly")
 
             # Playhead Needle (Dark Slate with Red Knob)
             c.create_line(xp, 0, xp, h, fill="#0f172a", width=2, tags="needle")
@@ -222,10 +239,10 @@ class WaveformView:
             c.coords("bg_right", xe, 0, w, h)
 
             c.coords("marker_s_line", xs, 0, xs, h)
-            c.coords("marker_s_poly", xs, 0, xs - 8, 12, xs + 8, 12)
+            c.coords("marker_s_poly", xs, 0, xs - hw, hh, xs + hw, hh)
 
             c.coords("marker_e_line", xe, 0, xe, h)
-            c.coords("marker_e_poly", xe, 0, xe - 8, 12, xe + 8, 12)
+            c.coords("marker_e_poly", xe, 0, xe - hw, hh, xe + hw, hh)
 
             c.coords("needle", xp, 0, xp, h)
             c.coords("knob", xp - 5, mid_y - 5, xp + 5, mid_y + 5)
@@ -233,15 +250,16 @@ class WaveformView:
             if getattr(self.app, "waveform_zoomed", False):
                 if not c.find_withtag("zoom_tag"):
                     c.create_text(
-                        w - 60,
-                        10,
+                        w - 6,
+                        4,
                         text="🔍 Zoomed View",
                         fill="#0369a1",
-                        font=(FONT_FAMILY, 10, "bold"),
+                        font=FONT_SMALL_BOLD,
+                        anchor="ne",
                         tags="zoom_tag",
                     )
                 else:
-                    c.coords("zoom_tag", w - 60, 10)
+                    c.coords("zoom_tag", w - 6, 4)
             else:
                 c.delete("zoom_tag")
 
@@ -265,7 +283,7 @@ class WaveformView:
             c.tag_raise("needle")
             c.tag_raise("knob")
 
-    def on_click(self, event):
+    def on_click(self, event: tk.Event[tk.Misc]) -> None:
         if not self.app.selected_file_path or self.app.track_duration <= 0:
             return
         w = max(1, self.canvas.winfo_width())
@@ -296,7 +314,7 @@ class WaveformView:
             # The controller records the paused position, so Resume continues from the clicked spot.
             self.app.playback_ctrl.seek(target_sec, self.app.track_duration)
 
-    def on_drag(self, event):
+    def on_drag(self, event: tk.Event[tk.Misc]) -> None:
         if not self.app.selected_file_path or self.app.track_duration <= 0:
             return
         self.app._progress_dragging = True
@@ -324,7 +342,7 @@ class WaveformView:
             self.app._updating_ui = False
             self.render()
 
-    def on_release(self, _event=None):
+    def on_release(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         if not self.app._progress_dragging:
             return
         self.app._progress_dragging = False

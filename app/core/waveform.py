@@ -264,7 +264,9 @@ def extract_waveform_peaks(
     return analyze_audio(audio_path, n_bars, cancel_event, on_process_spawned).peaks
 
 
-def get_waveform_bounds(track_duration, clip_start, clip_end, zoomed=False):
+def get_waveform_bounds(
+    track_duration: float, clip_start: float, clip_end: float, zoomed: bool = False
+) -> tuple[float, float]:
     """Calculate the visible start and end seconds on the waveform canvas."""
     if not zoomed or track_duration <= 0:
         return 0.0, max(track_duration, 1.0)
@@ -275,14 +277,14 @@ def get_waveform_bounds(track_duration, clip_start, clip_end, zoomed=False):
     return start_b, max(end_b, start_b + 0.1)
 
 
-def time_to_waveform_x(t, w, start_bound, end_bound):
+def time_to_waveform_x(t: float, w: float, start_bound: float, end_bound: float) -> float:
     """Translate a time in seconds to an x-pixel coordinate within width w."""
     span = max(0.1, end_bound - start_bound)
     clamped_t = max(start_bound, min(end_bound, t))
     return ((clamped_t - start_bound) / span) * w
 
 
-def time_from_waveform_x(px, w, start_bound, end_bound):
+def time_from_waveform_x(px: float, w: float, start_bound: float, end_bound: float) -> float:
     """Translate an x-pixel coordinate within width w to a time in seconds."""
     span = max(0.1, end_bound - start_bound)
     ratio = max(0.0, min(1.0, px / max(1.0, float(w))))

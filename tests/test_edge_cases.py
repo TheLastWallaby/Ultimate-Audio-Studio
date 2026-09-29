@@ -70,7 +70,7 @@ class TestEdgeCasesAndFailureScenarios(unittest.TestCase):
             app.playlist_files = [non_existent_file]
             app.playlist_index = 0
 
-            with patch.object(app, "set_status") as mock_status, patch("tkinter.messagebox.showwarning") as mock_warn:
+            with patch.object(app, "set_status") as mock_status, patch("app.ui.dialogs.show_warning") as mock_warn:
                 app._play_current_pl_track()
 
                 mock_status.assert_called()

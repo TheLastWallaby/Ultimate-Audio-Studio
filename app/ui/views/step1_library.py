@@ -1,7 +1,10 @@
 """Step 1 View: YouTube downloader, music library, search filter, and file tools."""
 
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk
+from typing import TYPE_CHECKING
 
 from app.ui.components import ToolTip, create_button, scrolled_listbox
 from app.ui.theme import (
@@ -28,8 +31,11 @@ from app.ui.theme import (
     TEXT_MUTED,
 )
 
+if TYPE_CHECKING:
+    from app.main import UltimateAudioStudio
 
-def build_step1_view(parent, app):
+
+def build_step1_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     """Construct Step 1 UI widgets on parent container and attach references to app."""
     # Header Badge
     f_hdr = tk.Frame(parent, bg="#e0f2fe", padx=8, pady=4, highlightbackground="#7dd3fc", highlightthickness=1)

@@ -58,7 +58,7 @@ class TestCacheManagerThreadSafety(unittest.TestCase):
 
 
 class TestUSBExportFsTypeResolution(unittest.TestCase):
-    @patch("tkinter.messagebox.askyesno", return_value=False)
+    @patch("app.ui.dialogs.ask_yes_no", return_value=False)
     def test_export_playlist_ntfs_check_no_nameerror(self, mock_ask):
         """Verify that export_playlist does not crash with NameError when evaluating fs_type."""
         root = tk.Tk()
@@ -153,7 +153,7 @@ class TestModelMappingProtocolAndCacheMetadata(unittest.TestCase):
             self.assertEqual(cached["artist"], "Artist")
             self.assertEqual(cached["duration"], 200.0)
 
-    @patch("tkinter.messagebox.showinfo")
+    @patch("app.ui.dialogs.show_info")
     def test_download_success_clears_busy_and_updates_library(self, mock_info):
         root = tk.Tk()
         root.withdraw()
@@ -182,7 +182,7 @@ class TestModelMappingProtocolAndCacheMetadata(unittest.TestCase):
         finally:
             app.on_close()
 
-    @patch("tkinter.messagebox.showinfo")
+    @patch("app.ui.dialogs.show_info")
     def test_clip_save_success_updates_library(self, mock_info):
         root = tk.Tk()
         root.withdraw()

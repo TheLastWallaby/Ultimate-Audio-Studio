@@ -1,35 +1,85 @@
 """Audio clipping, volume boosting, fading, and audition slice generation."""
 
+from __future__ import annotations
+
+import contextlib
 import os
 import shutil
 import time
+from collections.abc import Callable
 
 from pydub import AudioSegment
 
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
+from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, fade_duration, mp3_output_args
 
-# LAME VBR V2 (~190 kbps), the same quality as downloads and USB export: a clip of a YouTube-sourced
-# song gains nothing from 320 kbps CBR except a ~1.7x larger file.
-MP3_VBR_QUALITY = "2"
+try:
+    from send2trash import send2trash as _send2trash
+except ImportError:  # pragma: no cover - send2trash is a hard dependency; kept for source runs without it
+    _send2trash = None
+
+__all__ = [
+    "MP3_VBR_QUALITY",
+    "ORIGINAL_BACKUP_SUFFIX",
+    "clip_audio_worker",
+    "create_audition_slice",
+    "has_original_backup",
+    "original_backup_path",
+    "restore_original",
+]
+
+ORIGINAL_BACKUP_SUFFIX = ".original.bak"
 
 
-def create_audition_slice(filepath, s_time, e_time, gain_db=0.0, soften=False, fade_sec=1.5):
+def original_backup_path(song_path: str) -> str:
+    """Where the untrimmed song is kept after a clip was saved over it."""
+    return song_path + ORIGINAL_BACKUP_SUFFIX
+
+
+def has_original_backup(song_path: str | None) -> bool:
+    """True when a clip replaced this song and its original can still be restored."""
+    return bool(song_path) and os.path.isfile(original_backup_path(str(song_path)))
+
+
+def _replace_with_retry(src: str, dest: str) -> None:
+    """``os.replace`` that retries while Windows search indexing or antivirus briefly holds a file."""
+    for attempt in range(5):
+        try:
+            os.replace(src, dest)
+            return
+        except PermissionError:
+            time.sleep(0.08 * (attempt + 1))
+    os.replace(src, dest)
+
+
+def restore_original(song_path: str) -> None:
+    """Put the untrimmed original back in place of the trimmed song.
+
+    The trimmed version goes to the Recycle Bin (under its own name, so it can be recovered).
+    Raises OSError when the backup is missing or a file is locked.
+    """
+    backup = original_backup_path(song_path)
+    if not os.path.isfile(backup):
+        raise FileNotFoundError(f"No original backup found for {os.path.basename(song_path)}")
+    if os.path.exists(song_path) and _send2trash is not None:
+        _send2trash(song_path)
+    _replace_with_retry(backup, song_path)
+
+
+def create_audition_slice(
+    filepath: str,
+    s_time: float,
+    e_time: float,
+    gain_db: float = 0.0,
+    soften: bool = False,
+    fade_sec: float = 1.5,
+) -> str | None:
     """Generate a temporary rendered preview slice with volume boost and fade applied for 'Test Clip'."""
     if not filepath or not os.path.exists(filepath) or not os.path.exists(ffmpeg_path):
         return None
     try:
         os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
         clip_dur = max(0.05, e_time - s_time)
-        fade_dur = min(float(fade_sec or 1.5), clip_dur / 2.0) if soften else 0.0
-        filter_parts = ["asetpts=PTS-STARTPTS"]
-        if gain_db > 0.05:
-            filter_parts.append(f"volume={gain_db:.1f}dB,alimiter=limit=0.95:attack=5:release=50")
-        elif gain_db < -0.05:
-            filter_parts.append(f"volume={gain_db:.1f}dB")
-        if soften and fade_dur > 0.01:
-            out_start = max(0.0, clip_dur - fade_dur)
-            filter_parts.append(f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={out_start:.3f}:d={fade_dur:.3f}")
-
         slice_file = os.path.join(PREVIEW_CACHE_DIR, f"audition_{os.getpid()}_{int(time.time() * 1000)}.wav")
         args = [
             "-y",
@@ -41,7 +91,7 @@ def create_audition_slice(filepath, s_time, e_time, gain_db=0.0, soften=False, f
             "-t",
             f"{clip_dur:.3f}",
             "-af",
-            ",".join(filter_parts),
+            clip_filter_chain(clip_dur, gain_db, soften, fade_sec),
             "-ar",
             "44100",
             "-ac",
@@ -58,18 +108,27 @@ def create_audition_slice(filepath, s_time, e_time, gain_db=0.0, soften=False, f
     return None
 
 
+def _clip_args(filepath: str, s_time: float, dur: float, audio_filter: str, wav: bool, cover: str) -> list[str]:
+    if wav:
+        args = ["-y", "-accurate_seek", "-ss", f"{s_time:.3f}", "-i", filepath, "-t", f"{dur:.3f}"]
+        return args + ["-af", audio_filter, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]
+    # Place -ss after -i for MP3 so stream 0:v (attached cover art at t=0) is preserved
+    args = ["-y", "-i", filepath, "-ss", f"{s_time:.3f}", "-t", f"{dur:.3f}", "-af", audio_filter]
+    return args + mp3_output_args("copy" if cover == "copy" else "mjpeg")
+
+
 def clip_audio_worker(
-    filepath,
-    s_time,
-    e_time,
-    save_name,
-    soften=False,
-    gain_db=0.0,
-    is_self_overwrite=False,
-    on_success=None,
-    on_error=None,
-    fade_sec=1.5,
-):
+    filepath: str,
+    s_time: float,
+    e_time: float,
+    save_name: str,
+    soften: bool = False,
+    gain_db: float = 0.0,
+    is_self_overwrite: bool = False,
+    on_success: Callable[[str, str, bool], None] | None = None,
+    on_error: Callable[[str], None] | None = None,
+    fade_sec: float = 1.5,
+) -> None:
     """Export sample-accurate clipped audio file with backup protection and Windows lock retries."""
     save_dir = os.path.dirname(os.path.abspath(save_name))
     os.makedirs(save_dir, exist_ok=True)
@@ -79,85 +138,22 @@ def clip_audio_worker(
 
     try:
         dur = max(0.01, e_time - s_time)
-        fade_dur = min(float(fade_sec or 1.5), dur / 2.0) if soften else 0.0
+        audio_filter = clip_filter_chain(dur, gain_db, soften, fade_sec)
 
-        filter_parts = ["asetpts=PTS-STARTPTS"]
-        if gain_db > 0.05:
-            filter_parts.append(f"volume={gain_db:.1f}dB,alimiter=limit=0.95:attack=5:release=50")
-        elif gain_db < -0.05:
-            filter_parts.append(f"volume={gain_db:.1f}dB")
-        if soften and fade_dur > 0.01:
-            out_start = max(0.0, dur - fade_dur)
-            filter_parts.append(f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={out_start:.3f}:d={fade_dur:.3f}")
-
-        if wav:
-            args = ["-y", "-accurate_seek", "-ss", f"{s_time:.3f}", "-i", filepath, "-t", f"{dur:.3f}"]
-            args += ["-af", ",".join(filter_parts)]
-            args += ["-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]
-        else:
-            # Place -ss after -i for MP3 so stream 0:v (attached cover art at t=0) is preserved
-            args = ["-y", "-i", filepath, "-ss", f"{s_time:.3f}", "-t", f"{dur:.3f}"]
-            args += ["-af", ",".join(filter_parts)]
-            args += [
-                "-map",
-                "0:a",
-                "-map",
-                "0:v?",
-                "-c:v",
-                "copy",
-                "-disposition:v:0",
-                "attached_pic",
-                "-map_metadata",
-                "0",
-                "-id3v2_version",
-                "3",
-                "-c:a",
-                "libmp3lame",
-                "-q:a",
-                MP3_VBR_QUALITY,
-            ]
-        args.append(tmp_save)
-        result = run_ffmpeg(args)
-
+        result = run_ffmpeg(_clip_args(filepath, s_time, dur, audio_filter, wav, "copy") + [tmp_save])
         if result.returncode != 0 and not wav:
             # Retry transcoding video stream to mjpeg in case source art was PNG
-            if os.path.exists(tmp_save):
-                try:
-                    os.remove(tmp_save)
-                except Exception:
-                    pass
-            args_retry = ["-y", "-i", filepath, "-ss", f"{s_time:.3f}", "-t", f"{dur:.3f}"]
-            args_retry += ["-af", ",".join(filter_parts)]
-            args_retry += [
-                "-map",
-                "0:a",
-                "-map",
-                "0:v?",
-                "-c:v:0",
-                "mjpeg",
-                "-disposition:v:0",
-                "attached_pic",
-                "-map_metadata",
-                "0",
-                "-id3v2_version",
-                "3",
-                "-c:a",
-                "libmp3lame",
-                "-q:a",
-                MP3_VBR_QUALITY,
-                tmp_save,
-            ]
-            result = run_ffmpeg(args_retry)
+            with contextlib.suppress(OSError):
+                os.remove(tmp_save)
+            result = run_ffmpeg(_clip_args(filepath, s_time, dur, audio_filter, wav, "mjpeg") + [tmp_save])
         if result.returncode != 0 or not os.path.exists(tmp_save) or os.path.getsize(tmp_save) == 0:
-            if os.path.exists(tmp_save):
-                try:
-                    os.remove(tmp_save)
-                except Exception:
-                    pass
+            with contextlib.suppress(OSError):
+                os.remove(tmp_save)
             audio = AudioSegment.from_file(filepath)
             clipped = audio[s_time * 1000 : e_time * 1000]
             if abs(gain_db) > 0.05:
                 clipped = clipped + gain_db
+            fade_dur = fade_duration(dur, soften, fade_sec)
             if soften and fade_dur > 0.01:
                 fade_ms = int(fade_dur * 1000)
                 clipped = clipped.fade_in(fade_ms).fade_out(fade_ms)
@@ -171,34 +167,23 @@ def clip_audio_worker(
 
         if is_self_overwrite:
             time.sleep(0.05)
-            # Safeguard original file with automatic backup
+            # Safeguard original file with automatic backup (the first original is kept across re-trims)
             try:
-                bak_path = save_name + ".original.bak"
+                bak_path = original_backup_path(save_name)
                 if not os.path.exists(bak_path):
                     shutil.copy2(save_name, bak_path)
             except Exception as bak_err:
                 log_error(f"backup original failed: {bak_err}")
 
-        # Resilient file replace retry loop against Windows file indexing / antivirus locks
-        replaced = False
-        for attempt in range(5):
-            try:
-                os.replace(tmp_save, save_name)
-                replaced = True
-                break
-            except PermissionError:
-                time.sleep(0.08 * (attempt + 1))
-        if not replaced:
-            os.replace(tmp_save, save_name)
+        # Resilient file replace against Windows file indexing / antivirus locks
+        _replace_with_retry(tmp_save, save_name)
 
         if on_success:
             on_success(os.path.basename(save_name), save_name, is_self_overwrite)
     except Exception as e:
-        if os.path.exists(tmp_save):
-            try:
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp_save):
                 os.remove(tmp_save)
-            except Exception:
-                pass
         log_error(f"clip_audio_worker: {e}")
         if on_error:
             on_error(str(e))

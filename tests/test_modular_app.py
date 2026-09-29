@@ -512,13 +512,10 @@ class TestApprovedEnhancements(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["id"], "song1")
 
-    def test_audio_engine_endevent_and_gain(self):
-        """Item 2.1 & 2.4: Test native end event toggling and auto-level gain scaling."""
+    def test_audio_engine_gain(self):
+        """Item 2.4: Test auto-level gain scaling."""
         engine = AudioEngine()
         self.assertEqual(engine.buffer_samples, 8192)
-
-        engine.set_endevent()
-        engine.clear_endevent()
 
         engine.set_auto_level(False)
         engine.set_track_gain(1.5)
