@@ -17,10 +17,12 @@ dependencies = [
     "certifi",
     "audioop-lts>=0.2.1; python_version>='3.13'",
     "send2trash>=1.8",
-    "pyinstaller>=6.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.0.0",
 ]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
 
 [tool.ruff]
 target-version = "py310"
