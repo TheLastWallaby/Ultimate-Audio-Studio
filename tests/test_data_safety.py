@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.config import DEFAULT_PLAYLIST_NAME
+from app.controllers.library_controller import ImportResult, LibraryController
 from app.controllers.playlist_controller import PlaylistController, PlaylistLoadResult, last_good_path
 from app.main import UltimateAudioStudio
 from app.services import exporter
@@ -356,3 +358,140 @@ def test_cd_export_hands_the_removal_to_the_export_job(studio: UltimateAudioStud
     assert "1 track(s)" in ask.call_args[0][2]  # the user's own file is not counted
     assert start.call_args.kwargs["clear_existing"] is True
     assert _names(cd) == ["01 - Old.wav", "my notes.txt"]  # the window itself deletes nothing
+
+
+# --- Replacing a Library song with an imported one -------------------------------------------------
+
+
+class _FakeRecycleBin:
+    """Stands in for send2trash: moves files into a folder, so a test can check what was recycled."""
+
+    def __init__(self, folder: Path, fail_for: str = "") -> None:
+        self.folder = folder
+        self.fail_for = fail_for
+        folder.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, path: str) -> None:
+        if self.fail_for and Path(path).name == self.fail_for:
+            raise OSError(32, "The process cannot access the file because it is being used by another process")
+        Path(path).replace(self.folder / Path(path).name)
+
+
+def _import_now(planned: list[tuple[str, str]]) -> ImportResult:
+    results: list[ImportResult] = []
+    done = threading.Event()
+
+    def _on_done(result: ImportResult) -> None:
+        results.append(result)
+        done.set()
+
+    LibraryController(None).import_external_files(planned, is_shutting_down_fn=None, on_done=_on_done)
+    assert done.wait(timeout=10), "the import never reported back"
+    return results[0]
+
+
+def test_replaced_song_goes_to_the_recycle_bin(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    mine = library / "Song.mp3"
+    mine.write_bytes(b"my copy")
+    incoming = tmp_path / "usb" / "Song.mp3"
+    incoming.parent.mkdir()
+    incoming.write_bytes(b"the new copy")
+    recycle_bin = _FakeRecycleBin(tmp_path / "bin")
+
+    with patch("app.controllers.library_controller._send2trash", recycle_bin):
+        result = _import_now([(str(incoming), str(mine))])
+
+    assert result == ImportResult(copied=("Song.mp3",), replaced=("Song.mp3",))
+    assert mine.read_bytes() == b"the new copy"
+    assert (recycle_bin.folder / "Song.mp3").read_bytes() == b"my copy"
+    assert _names(library) == ["Song.mp3"]
+
+
+def test_backup_of_the_replaced_song_is_recycled_too(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    mine = library / "Song.mp3"
+    mine.write_bytes(b"my trimmed copy")
+    Path(original_backup_path(str(mine))).write_bytes(b"my untrimmed copy")
+    incoming = tmp_path / "usb" / "Song.mp3"
+    incoming.parent.mkdir()
+    incoming.write_bytes(b"the new copy")
+    recycle_bin = _FakeRecycleBin(tmp_path / "bin")
+
+    with patch("app.controllers.library_controller._send2trash", recycle_bin):
+        _import_now([(str(incoming), str(mine))])
+
+    # Otherwise 'Restore Original' would put the old song back over the new one.
+    assert not has_original_backup(str(mine))
+    assert _names(recycle_bin.folder) == ["Song.mp3", "Song.mp3.original.bak"]
+
+
+def test_backup_that_cannot_be_recycled_is_set_aside(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    mine = library / "Song.mp3"
+    mine.write_bytes(b"my trimmed copy")
+    Path(original_backup_path(str(mine))).write_bytes(b"my untrimmed copy")
+    incoming = tmp_path / "usb" / "Song.mp3"
+    incoming.parent.mkdir()
+    incoming.write_bytes(b"the new copy")
+    recycle_bin = _FakeRecycleBin(tmp_path / "bin", fail_for="Song.mp3.original.bak")
+
+    with patch("app.controllers.library_controller._send2trash", recycle_bin):
+        result = _import_now([(str(incoming), str(mine))])
+
+    assert result.replaced == ("Song.mp3",)
+    assert not has_original_backup(str(mine))
+    kept = [p for p in library.iterdir() if p.name.startswith("Song.mp3.original.bak.replaced-")]
+    assert [p.read_bytes() for p in kept] == [b"my untrimmed copy"]
+
+
+def test_song_that_cannot_be_recycled_is_left_as_it_was(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    mine = library / "Song.mp3"
+    mine.write_bytes(b"my copy")
+    incoming = tmp_path / "usb" / "Song.mp3"
+    incoming.parent.mkdir()
+    incoming.write_bytes(b"the new copy")
+    recycle_bin = _FakeRecycleBin(tmp_path / "bin", fail_for="Song.mp3")
+
+    with patch("app.controllers.library_controller._send2trash", recycle_bin):
+        result = _import_now([(str(incoming), str(mine))])
+
+    assert result == ImportResult(failed=("Song.mp3",))
+    assert mine.read_bytes() == b"my copy"
+    assert _names(library) == ["Song.mp3"]  # no half-made copy left behind
+
+
+def test_replacing_the_song_in_the_player_releases_and_reloads_it(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    mine = library / "Song.mp3"
+    mine.write_bytes(b"ID3" + bytes(64))
+    incoming = tmp_path / "usb" / "Song.mp3"
+    incoming.parent.mkdir()
+    incoming.write_bytes(b"ID3" + bytes(128))
+    studio.library_folder = str(library)
+    studio.refresh_library()
+    studio._load_track_ui(str(mine), mine.name)
+    recycle_bin = _FakeRecycleBin(tmp_path / "bin")
+
+    with (
+        patch("app.controllers.library_controller._send2trash", recycle_bin),
+        patch("app.ui.dialogs.ask_yes_no", return_value=True),
+        patch.object(studio, "_release_audio_file", wraps=studio._release_audio_file) as release,
+        patch.object(studio, "_load_track_ui", wraps=studio._load_track_ui) as reload,
+    ):
+        studio._import_paths([str(incoming)])
+        deadline = time.monotonic() + 5
+        while studio._importing and time.monotonic() < deadline:
+            studio.root.update()
+            time.sleep(0.01)
+
+    release.assert_called()
+    reload.assert_called_once_with(str(mine), "Song.mp3")
+    assert mine.read_bytes() == b"ID3" + bytes(128)
+    assert "Recycle Bin" in studio.status.cget("text")

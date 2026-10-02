@@ -7,6 +7,7 @@ import ctypes
 import logging
 import os
 import shutil
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import AUDIO_EXTS, log_error
-from app.core.file_utils import copy_file_atomic
+from app.core.file_utils import copy_file_atomic, replace_with_retry
 from app.core.task_manager import task_mgr
 from app.services.clipper import original_backup_path
 
@@ -37,6 +38,7 @@ class ImportResult:
     copied: tuple[str, ...] = ()  # songs now in the Library (under these names)
     renamed: tuple[str, ...] = ()  # the copied songs that were given a new name to avoid a clash
     failed: tuple[str, ...] = ()  # songs that could not be copied
+    replaced: tuple[str, ...] = ()  # the copied songs that replaced one already there (now in the Recycle Bin)
 
 
 def _path_key(path: Path) -> str:
@@ -85,6 +87,43 @@ def _trash_staged_file(staging_path: str, orig_path: str | None) -> None:
         log_error(f"flush_pending_trash: {e}")
     with contextlib.suppress(OSError):
         os.rmdir(os.path.dirname(staging_path))
+
+
+def _replace_song(src: Path, dest: Path) -> None:
+    """Put ``src`` in place of the Library song ``dest``; the old song goes to the Recycle Bin.
+
+    The new copy is complete before the old song is touched, so a failed copy leaves it as it was.
+    A backup kept from trimming the old song belongs to the old song: it is recycled too, or else
+    'Restore Original' would put the old song back over the new one. Raises OSError when the new
+    song could not be put in place; the old song is then still in the Library or the Recycle Bin.
+    """
+    if _send2trash is None:
+        raise OSError("the Recycle Bin cannot be used, so the old song was left in place")
+    # Not an audio file name, so the Library list never shows the copy while it is being made.
+    incoming = dest.with_name(f"{dest.name}.{os.getpid()}.incoming")
+    try:
+        copy_file_atomic(src, incoming)
+        _send2trash(str(dest))
+        replace_with_retry(incoming, dest)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            incoming.unlink()
+
+    old_backup = Path(original_backup_path(str(dest)))
+    if not old_backup.exists():
+        return
+    try:
+        _send2trash(str(old_backup))
+        return
+    except OSError as err:
+        logger.warning("Could not recycle %s: %s", old_backup.name, err)
+    # Renamed so it can no longer be "restored" over the new song; the old original stays on disk.
+    kept = old_backup.with_name(f"{old_backup.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        replace_with_retry(old_backup, kept)
+    except OSError as err:
+        # The new song is in place, so the import itself succeeded and is reported as such.
+        logger.error("Could not set the old backup %s aside: %s", old_backup.name, err)
 
 
 class LibraryController:
@@ -353,26 +392,35 @@ class LibraryController:
 
         Each file is copied under a temporary name and renamed when complete, so a source that
         vanishes halfway never leaves a cut-off song (or damages one that was being replaced).
+        A song that is already in the Library is replaced only after the old one is in the
+        Recycle Bin, where the user can get it back.
         """
 
         def _worker() -> None:
             copied: list[str] = []
             renamed: list[str] = []
             failed: list[str] = []
+            replaced: list[str] = []
             for src, dest in planned_copies:
                 if is_shutting_down_fn and is_shutting_down_fn():
                     break
-                src_name, dest_name = Path(src).name, Path(dest).name
+                src_path, dest_path = Path(src), Path(dest)
+                replacing = dest_path.exists()
                 try:
-                    copy_file_atomic(src, dest)
+                    if replacing:
+                        _replace_song(src_path, dest_path)
+                    else:
+                        copy_file_atomic(src_path, dest_path)
                 except OSError as err:
-                    logger.error("Import of %s failed: %s", src, err)
-                    failed.append(src_name)
+                    logger.error("Import of %s failed: %s", src_path, err)
+                    failed.append(src_path.name)
                     continue
-                copied.append(dest_name)
-                if dest_name != src_name:
-                    renamed.append(dest_name)
+                copied.append(dest_path.name)
+                if dest_path.name != src_path.name:
+                    renamed.append(dest_path.name)
+                if replacing:
+                    replaced.append(dest_path.name)
             if on_done:
-                on_done(ImportResult(tuple(copied), tuple(renamed), tuple(failed)))
+                on_done(ImportResult(tuple(copied), tuple(renamed), tuple(failed), tuple(replaced)))
 
         task_mgr.submit_task(_worker)
