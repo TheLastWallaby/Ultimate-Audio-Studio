@@ -44,7 +44,7 @@ class TestCentralizedSettings(unittest.TestCase):
         settings = Settings()
         self.assertIsInstance(settings.app, AppConfig)
         self.assertEqual(settings.app.app_name, "Ultimate Audio Studio")
-        self.assertEqual(settings.app.app_version, "1.2.0")
+        self.assertEqual(settings.app.app_version, "1.2.1")
         self.assertEqual(settings.app.environment, "production")
         self.assertFalse(settings.app.debug)
 
