@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -17,7 +20,10 @@ import yt_dlp
 from yt_dlp.utils import DownloadCancelled
 
 from app.config import BASE_PATH, PREVIEW_CACHE_DIR, YOUTUBE_RE, YT_CACHE_DIR, ffmpeg_path, format_time, log_error
+from app.core.file_utils import copy_file_atomic, unused_path
 from app.models import SearchResult
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, str, str, bool], None]
 
@@ -376,6 +382,12 @@ def cleanup_partial_downloads(library_folder: str) -> None:
         pass
 
 
+def _finished_mp3(work_dir: Path) -> Path | None:
+    """The MP3 a download left in its work folder (the newest, should there be more than one)."""
+    mp3s = sorted(work_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return mp3s[0] if mp3s else None
+
+
 def download_audio_worker(
     target_url: str,
     library_folder: str,
@@ -385,10 +397,22 @@ def download_audio_worker(
     on_cancelled: Callable[[], None],
     on_error: Callable[[str], None],
 ) -> None:
-    """Execute download in a worker thread using yt-dlp."""
-    os.makedirs(library_folder, exist_ok=True)
-    os.makedirs(YT_CACHE_DIR, exist_ok=True)
-    before_files = set(os.listdir(library_folder)) if os.path.exists(library_folder) else set()
+    """Download one song as an MP3 into the Library on a worker thread.
+
+    yt-dlp works in a folder of its own, and the finished MP3 is then copied into the Library
+    under a free name ("Song (2).mp3" when "Song.mp3" is there). Downloading straight into the
+    Library would replace a song with the same title: yt-dlp's MP3 conversion overwrites it.
+    """
+    library = Path(library_folder)
+    try:
+        library.mkdir(parents=True, exist_ok=True)
+        downloads_dir = Path(YT_CACHE_DIR) / "downloads"
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="song-", dir=downloads_dir))
+    except OSError as err:
+        logger.error("download_audio_worker could not prepare its folders: %s", err)
+        on_error(str(err))
+        return
 
     last_ui_time = [0.0]
 
@@ -397,7 +421,7 @@ def download_audio_worker(
             raise DownloadCancelled("Stopped by user")
         status = d.get("status")
         if status == "downloading":
-            now = time.time()
+            now = time.monotonic()
             if now - last_ui_time[0] < 0.06:
                 return
             last_ui_time[0] = now
@@ -411,7 +435,7 @@ def download_audio_worker(
                 pct_raw = re.sub(r"\x1b\[[0-9;]*m", "", str(d.get("_percent_str") or "0%")).replace("%", "").strip()
                 try:
                     pct = float(pct_raw)
-                except Exception:
+                except ValueError:
                     pct = 0.0
             speed = re.sub(r"\x1b\[[0-9;]*m", "", str(d.get("_speed_str") or "")).strip()
             eta = re.sub(r"\x1b\[[0-9;]*m", "", str(d.get("_eta_str") or "")).strip()
@@ -421,7 +445,7 @@ def download_audio_worker(
 
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": os.path.join(library_folder, "%(title).180B.%(ext)s"),
+        "outtmpl": str(work_dir / "%(title).180B.%(ext)s"),
         "ffmpeg_location": os.path.dirname(os.path.abspath(ffmpeg_path)) or os.path.abspath(ffmpeg_path),
         "writethumbnail": True,
         "postprocessors": [
@@ -448,48 +472,25 @@ def download_audio_worker(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.add_post_processor(TitleCleanerPP(), when="pre_process")
-            info = ydl.extract_info(target_url, download=True)
-            if cancel_event.is_set():
-                raise DownloadCancelled("Stopped by user")
-            entries = list(info.get("entries") or []) if (info and isinstance(info, dict)) else []
-            if entries:
-                entry = entries[0]
-                prepared = (
-                    entry.get("requested_downloads") and entry["requested_downloads"][0].get("filepath")
-                ) or ydl.prepare_filename(entry)
-            elif info and info.get("requested_downloads"):
-                prepared = info["requested_downloads"][0].get("filepath") or info["requested_downloads"][0].get(
-                    "filename"
-                )
-            else:
-                prepared = ydl.prepare_filename(info) if info else None
-
-        final_name = None
-        if prepared:
-            base = os.path.splitext(os.path.basename(prepared))[0]
-            candidate = base + ".mp3"
-            if os.path.exists(os.path.join(library_folder, candidate)):
-                final_name = candidate
-
-        # If candidate wasn't directly matched, accept only an MP3 created by this download.
-        if not final_name and os.path.exists(library_folder):
-            after_files = set(os.listdir(library_folder))
-            new_mp3s = [f for f in (after_files - before_files) if f.lower().endswith(".mp3")]
-            if new_mp3s:
-                new_mp3s.sort(key=lambda x: os.path.getmtime(os.path.join(library_folder, x)), reverse=True)
-                final_name = new_mp3s[0]
-
-        if not final_name:
+            ydl.extract_info(target_url, download=True)
+        if cancel_event.is_set():
+            raise DownloadCancelled("Stopped by user")
+        song = _finished_mp3(work_dir)
+        if song is None:
             raise FileNotFoundError("Download finished but the converted MP3 file could not be found.")
-
-        on_success(final_name)
+        dest = unused_path(library / song.name)
+        copy_file_atomic(song, dest)
+        on_success(dest.name)
     except DownloadCancelled:
-        cleanup_partial_downloads(library_folder)
         on_cancelled()
-    except Exception as e:
-        cleanup_partial_downloads(library_folder)
-        log_error(f"download_audio_worker: {e}")
+    except Exception as e:  # last-resort guard: a worker must always report back to the window
+        logger.error("download_audio_worker: %s", e)
         on_error(str(e))
+    finally:
+        try:
+            shutil.rmtree(work_dir)
+        except OSError as err:
+            logger.warning("Could not remove the download folder %s: %s", work_dir, err)
 
 
 def download_playlist_worker(
