@@ -393,8 +393,8 @@ class TestApprovedEnhancements(unittest.TestCase):
 
             success_called = []
 
-            def on_succ(cnt, total, skipped):
-                success_called.append((cnt, total, skipped))
+            def on_succ(report):
+                success_called.append((report.exported, report.total, list(report.skipped)))
 
             usb_export_worker(
                 dest_folder=td_dest,

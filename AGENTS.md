@@ -36,7 +36,7 @@ Ultimate Audio Studio is a Windows desktop app (Tkinter, pygame, FFmpeg, yt-dlp)
 | `app/core/` | `audio_engine`, `task_manager`, `metadata`, `waveform`, `cache_manager`, `process_utils`, `file_utils`, `errors`, and `config` (pydantic settings, `UAS_*` overrides). |
 | `app/config.py` | Constants, tool paths, `settings_mgr`, logging setup. |
 | `app/platform_utils.py` | Windows-specific calls (drives, eject, mutex, drag and drop). |
-| `tests/` | Pytest suite. `conftest.py` auto-cancels the `app/ui/dialogs.py` dialogs. |
+| `tests/` | Pytest suite. `conftest.py` isolates it from the real Music folder (see Section 6). |
 
 Keep the layering: services and controllers never import Tkinter widgets; UI code never runs FFmpeg, network, or large file operations directly.
 
@@ -126,7 +126,7 @@ Keep the layering: services and controllers never import Tkinter widgets; UI cod
 
 ### D. The user's files
 The user's songs, playlists, and exports are the only things that cannot be regenerated. Any change that writes, replaces, or deletes them must follow these rules.
-- **Write, then swap.** Write to a temporary file in the same folder, verify it is non-empty, then `os.replace` it into place (`atomic_save_json`, `_replace_with_retry`). Never write directly onto a file the user already has.
+- **Write, then swap.** Write to a temporary file in the same folder, verify it is non-empty, then `os.replace` it into place. Use `atomic_save_json` and `copy_file_atomic` from `app/core/file_utils.py`. Never write directly onto a file the user already has.
 - **Back up before replacing.** Do not replace an original unless a complete backup exists. If the backup fails, stop and report it.
 - **Ask everything first.** Finish all checks and questions before the first destructive step, so that Cancel always leaves things as they were.
 - **Deleting a song** goes through the undo staging area and then the Recycle Bin (`send2trash`), never `os.remove`.
@@ -165,9 +165,13 @@ Run all six before you call a change finished.
 - Every bug fix comes with a test that fails without the fix. Every new behavior comes with a test.
 - Test failure paths, not only success: a locked file, a full or removed drive, a failed FFmpeg run, Cancel pressed at each step, and shutdown during a job.
 - Use `tmp_path` for files. Tests must never touch the real Music folder, a real drive, or the network.
-- `conftest.py` answers every dialog from `app/ui/dialogs.py` with its cancel value (they all route through `ask_choice`). Patch the dialog to test another answer, or mark the test `@pytest.mark.real_dialogs`. The error dialogs in `app/ui/error_dialog.py` are not covered and must be patched, or they will hang the run.
-- `task_mgr` is a process-wide singleton, and shutting an app instance down disables it for the rest of the run. Tests that depend on background work must not rely on its state from an earlier test.
 - Do not assert on a mock alone when the outcome can be checked on disk.
+- `conftest.py` sets up the following for every test; do not work around it:
+  - **A throwaway Music folder.** The `UAS_*` paths (Library, playlists, settings, error log) point at a temporary folder, set before anything imports `app`.
+  - **Dialogs never block.** Every dialog from `app/ui/dialogs.py` returns its cancel value, and error dialogs are dismissed. Patch the dialog to test another answer, or mark the test `@pytest.mark.real_dialogs`.
+  - **A running worker pool.** Closing a window shuts the shared `task_mgr` down; it is restarted before each test.
+- Use the `studio` fixture for a real, hidden main window. It closes the window afterwards.
+- Background results reach the window through its event loop, so a test must pump it (`root.update()`) until the result arrives.
 
 ---
 

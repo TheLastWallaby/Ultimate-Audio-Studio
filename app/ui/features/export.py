@@ -2,22 +2,51 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import tkinter as tk
+from collections.abc import Sequence
+from pathlib import Path
 
-from app.config import log_error, sanitize_filename
+from app.config import sanitize_filename
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
 from app.platform_utils import find_windows_media_player, list_removable_drives
+from app.services.exporter import ExportReport
 from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 
+logger = logging.getLogger(__name__)
+
 EXPORT_BUTTON_TEXT = "⚡ Export Playlist Now"
+
+
+def _listed(names: Sequence[str], limit: int = 6) -> str:
+    """Bullet list of the first ``limit`` names, with a count of the rest."""
+    lines = "\n".join(f"• {name}" for name in names[:limit])
+    return lines + (f"\n... and {len(names) - limit} more." if len(names) > limit else "")
+
+
+def export_problems(report: ExportReport) -> str:
+    """Plain-language list of everything an export did not do as asked; empty when it did it all."""
+    parts = []
+    if report.skipped:
+        parts.append(f"{len(report.skipped)} song(s) could not be processed:\n{_listed(report.skipped)}")
+    if report.not_leveled:
+        parts.append(
+            f"{len(report.not_leveled)} song(s) were exported at their original volume, because their "
+            f"volume could not be evened out:\n{_listed(report.not_leveled)}"
+        )
+    return "\n\n".join(parts)
 
 
 class ExportMixin(AppBase):
     """Step 3 export: USB drive detection/eject and USB/CD playlist export."""
+
+    # Root of the USB drive an export is writing to right now; it must not be ejected meanwhile.
+    _export_drive_root: str | None = None
 
     def _on_usb_hotplug(self) -> None:
         if getattr(self, "_is_shutting_down", False):
@@ -44,13 +73,16 @@ class ExportMixin(AppBase):
         self._timer_hotplug_debounce = self.root.after(800, _do_hotplug)
 
     def refresh_usb_drives(self) -> None:
+        """Re-read the plugged-in USB drives, keeping the chosen one selected while it is still there."""
+        previous = self.usb_choice.get()
         drives = list_removable_drives()
         self._usb_map = {label: path for path, label, _ in drives}
         self._usb_fs_map = {label: fs for _, label, fs in drives}
         options = list(self._usb_map.keys())
         self.cmb_usb["values"] = options
         if options:
-            self.cmb_usb.current(0)
+            # Plugging in a second drive must not switch the export (or the eject) to it unasked.
+            self.cmb_usb.current(options.index(previous) if previous in options else 0)
             self.set_status(f"Found {len(options)} USB flash drive(s).")
         else:
             self.usb_choice.set("No USB drives detected")
@@ -59,11 +91,24 @@ class ExportMixin(AppBase):
             self.btn_usb_eject.config(state=tk.NORMAL if options else tk.DISABLED)
 
     def eject_selected_usb(self) -> None:
+        """Eject the drive chosen in the list (the Eject button)."""
         choice = self.usb_choice.get()
         if not choice or choice not in self._usb_map:
             dialogs.show_info(self.root, "No Drive", "Please select a connected USB drive to safely eject.")
             return
-        drive_path = self._usb_map[choice]
+        self._eject_drive(choice, self._usb_map[choice])
+
+    def _eject_drive(self, choice: str, drive_path: str) -> None:
+        """Safely eject one specific drive and tell the user whether it can be unplugged."""
+        exporting_to = self._export_drive_root
+        if exporting_to is not None and Path(drive_path) == Path(exporting_to):
+            dialogs.show_info(
+                self.root,
+                "Export Still Running",
+                "Songs are still being copied to this USB drive, so it cannot be ejected yet.\n\n"
+                "Wait for the export to finish, or click 'Stop Export' first.",
+            )
+            return
         ok, msg = self.export_ctrl.eject_usb_drive(drive_path)
         self.refresh_usb_drives()
         if ok:
@@ -128,7 +173,7 @@ class ExportMixin(AppBase):
             return
 
         drive_root = self._usb_map[choice]
-        if not os.path.exists(drive_root):
+        if not Path(drive_root).exists():
             dialogs.show_warning(
                 self.root, "Drive Missing", "The selected USB drive can no longer be found. Please plug it in again."
             )
@@ -174,7 +219,7 @@ class ExportMixin(AppBase):
                 return
             clear_existing = answer == "replace"
             if clear_existing:
-                freed_bytes = sum(os.path.getsize(p) for p in previous if os.path.isfile(p))
+                freed_bytes = sum(Path(p).stat().st_size for p in previous if Path(p).is_file())
 
         # Pre-flight disk space validation
         est_bytes = self.export_ctrl.estimate_playlist_bytes(files, self._cached_duration_only)
@@ -191,6 +236,7 @@ class ExportMixin(AppBase):
             )
             return
 
+        self._export_drive_root = drive_root
         self._begin_export("Exporting...", f"Exporting {len(files)} songs to the USB flash drive...")
         self.export_ctrl.start_usb_export(
             drive_root,
@@ -199,7 +245,8 @@ class ExportMixin(AppBase):
             normalize,
             on_progress=lambda pct: self._safe_after(0, self._update_export_progress, pct),
             on_status=lambda text: self._safe_after(0, self.set_status, text),
-            on_success=lambda sc, tot, sk: self._safe_after(0, self._usb_export_success, sc, tot, sk),
+            # The drive is fixed here: by the time the export ends, another one may be selected.
+            on_success=lambda report: self._safe_after(0, self._usb_export_success, report, choice, drive_root),
             on_error=lambda err: self._safe_after(0, self._export_error, err),
             is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
             duration_fn=self._cached_duration,
@@ -250,7 +297,7 @@ class ExportMixin(AppBase):
             normalize,
             on_progress=lambda pct: self._safe_after(0, self._update_export_progress, pct),
             on_status=lambda text: self._safe_after(0, self.set_status, text),
-            on_success=lambda fld, sc, tot, sk: self._safe_after(0, self._cd_export_success, fld, sc, tot, sk),
+            on_success=lambda report: self._safe_after(0, self._cd_export_success, cd_folder, report),
             on_error=lambda err: self._safe_after(0, self._export_error, err),
             is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
             on_cancelled=lambda done, tot: self._safe_after(0, self._export_cancelled, done, tot, "CD"),
@@ -268,6 +315,7 @@ class ExportMixin(AppBase):
 
     def _end_export(self, status: str) -> None:
         self._exporting = False
+        self._export_drive_root = None
         self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
         self.prog_export.pack_forget()
         self.btn_cancel_export.pack_forget()
@@ -293,17 +341,16 @@ class ExportMixin(AppBase):
         if hasattr(self, "prog_export"):
             self.prog_export["value"] = pct
 
-    def _usb_export_success(self, success_count: int, total: int, skipped: list[str]) -> None:
+    def _usb_export_success(self, report: ExportReport, drive_label: str, drive_root: str) -> None:
+        """Report a finished USB export and offer to eject the drive it was written to."""
         self._end_export("USB export finished. Eject the drive before unplugging it.")
         clean_pl = sanitize_filename(self.active_playlist_name or "Playlist")
-        if skipped:
+        problems = export_problems(report)
+        if problems:
             msg = (
-                f"Exported {success_count} of {total} song(s) to the USB flash drive (with '00_{clean_pl}.m3u' "
-                f"playlist).\n\n{len(skipped)} song(s) could not be processed:\n"
+                f"Exported {report.exported} of {report.total} song(s) to the USB flash drive (with "
+                f"'00_{clean_pl}.m3u' playlist).\n\n{problems}"
             )
-            msg += "\n".join(f"• {s}" for s in skipped[:6])
-            if len(skipped) > 6:
-                msg += f"\n... and {len(skipped) - 6} more."
             dialogs.show_warning(self.root, "Export Finished with Some Problems", msg)
             title = "Eject USB Drive"
             question = "Would you like to safely eject the USB flash drive now so you can unplug it?"
@@ -314,13 +361,13 @@ class ExportMixin(AppBase):
                 "for car stereos and media players.\n\nBefore unplugging it, the drive should be ejected."
             )
         if dialogs.ask_yes_no(self.root, title, question, yes="Eject the drive now", no="Not now", icon="✅"):
-            self.eject_selected_usb()
+            self._eject_drive(drive_label, drive_root)
 
-    def _cd_export_success(self, cd_folder: str, success_count: int, total: int, skipped: list[str]) -> None:
+    def _cd_export_success(self, cd_folder: str, report: ExportReport) -> None:
+        """Report the prepared CD tracks and hand over to Windows Media Player for burning."""
         self._end_export("CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
-        warn_text = ""
-        if skipped:
-            warn_text = f"\n\nNote: {len(skipped)} song(s) were skipped:\n" + "\n".join(f"• {s}" for s in skipped[:5])
+        problems = export_problems(report)
+        warn_text = f"\n\nNote: {problems}" if problems else ""
 
         # File Explorer's 'Send to / Burn to disc' makes a DATA disc that most CD players and car
         # stereos cannot play. An audio CD must be burned with Windows Media Player's Burn list.
@@ -334,7 +381,7 @@ class ExportMixin(AppBase):
             "5. Click 'Start burn'.\n\n"
             "Please do not use File Explorer's 'Send to' for this: it makes a data disc that most CD players cannot play."
         )
-        msg = f"Prepared {success_count} of {total} CD track(s) in 'My_CD_Burn_Folder' on your Desktop.{warn_text}\n\n{steps}"
+        msg = f"Prepared {report.exported} of {report.total} CD track(s) in 'My_CD_Burn_Folder' on your Desktop.{warn_text}\n\n{steps}"
         if wmp:
             if dialogs.ask_yes_no(
                 self.root,
@@ -348,7 +395,7 @@ class ExportMixin(AppBase):
                     os.startfile(cd_folder)
                     os.startfile(wmp)
                 except OSError as e:
-                    log_error(f"open CD burn tools: {e}")
+                    logger.error("Could not open the CD burn tools: %s", e)
         else:
             dialogs.show_info(
                 self.root,
@@ -358,10 +405,8 @@ class ExportMixin(AppBase):
                 button="Open the CD folder",
                 icon="💿",
             )
-            try:
+            with contextlib.suppress(OSError):  # the folder path is in the message above
                 os.startfile(cd_folder)
-            except OSError:
-                pass
 
     def _export_error(self, err: str) -> None:
         self._end_export("Export failed.")

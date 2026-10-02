@@ -78,6 +78,20 @@ class TaskManager:
         except Exception:
             pass
 
+    def restart(self) -> None:
+        """Start a fresh worker pool after :meth:`shutdown`; does nothing while the pool is running.
+
+        The pool is shared by the whole process, so anything that opens and closes the app more than
+        once in one process (the test suite) needs it back, or later background work is silently dropped.
+        """
+        with self._lock:
+            if not self._is_shutting_down:
+                return
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers, thread_name_prefix="UAS_Worker"
+            )
+            self._is_shutting_down = False
+
 
 # Global singleton instance
 task_mgr = TaskManager(max_workers=6)

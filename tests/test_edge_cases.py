@@ -109,7 +109,7 @@ class TestEdgeCasesAndFailureScenarios(unittest.TestCase):
                     files_to_export=[src_file],
                     normalize=False,
                     on_status=lambda s: status_messages.append(s),
-                    on_success=lambda s, t, sk: completed_results.append((s, t, sk)),
+                    on_success=lambda r: completed_results.append((r.exported, r.total, list(r.skipped))),
                 )
 
             self.assertEqual(len(completed_results), 1)

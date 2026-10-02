@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, simpledialog
 
 from app.config import format_time, log_error
@@ -197,15 +198,23 @@ class ClipEditorMixin(AppBase):
 
         def _prepare() -> None:
             # Both steps can run FFmpeg for seconds, so they stay off the Tkinter thread.
-            self.audio_engine.get_playable_audio_path(path)
+            prepared = self.audio_engine.prepare_for_playback(path)
             slice_path = self.playback_ctrl.prepare_audition(path, s_time, e_time, gain_db, soften, fade_sec)
-            self._safe_after(0, _start, slice_path)
+            self._safe_after(0, _start, slice_path, prepared)
 
-        def _start(slice_path: str | None) -> None:
+        def _start(slice_path: str | None, prepared: bool) -> None:
             if self._pending_play_token is not token or self.selected_file_path != path:
                 self.playback_ctrl.discard_audition(slice_path)
                 return
             self._pending_play_token = None
+            if slice_path is None and not prepared:
+                # Without a rendered slice the song itself is played, which would repeat the failed
+                # conversion on this thread and freeze the window.
+                self.set_busy(False, "This clip could not be played.")
+                show_friendly_error(
+                    self.root, f"FFmpeg could not convert '{Path(path).name}' for playback.", "playback"
+                )
+                return
             self.set_busy(False)
             self._start_test_clip(path, s_time, e_time, slice_path, gain_db, soften, fade_sec, loop)
 

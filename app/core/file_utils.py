@@ -7,9 +7,41 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
+
+
+def replace_with_retry(src: str | Path, dest: str | Path) -> None:
+    """``os.replace`` that retries while Windows search indexing or antivirus briefly holds a file."""
+    for attempt in range(5):
+        try:
+            os.replace(src, dest)
+            return
+        except PermissionError:
+            time.sleep(0.08 * (attempt + 1))
+    os.replace(src, dest)
+
+
+def copy_file_atomic(src: str | Path, dest: str | Path) -> None:
+    """Copy ``src`` to ``dest`` so that ``dest`` ends up either complete or exactly as it was.
+
+    The copy is written next to ``dest`` under a temporary name, checked against the size of the
+    source, and only then renamed into place. A source that disappears halfway (an unplugged drive,
+    a full disk) therefore never leaves a cut-off file under the real name. Raises OSError.
+    """
+    src, dest = Path(src), Path(dest)
+    partial = dest.with_name(f"{dest.name}.{os.getpid()}.partial")
+    try:
+        shutil.copy2(src, partial)
+        if partial.stat().st_size != src.stat().st_size:
+            raise OSError(f"the copy of {src.name} is incomplete")
+        replace_with_retry(partial, dest)
+    except OSError:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise
 
 
 def atomic_save_json(filepath: str | Path, data: Any) -> None:

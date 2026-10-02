@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import DEFAULT_PLAYLIST_NAME, atomic_save_json
+from app.core.file_utils import copy_file_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +67,10 @@ def _set_aside(path: Path) -> Path | None:
 
 def _keep_as_last_good(path: Path) -> None:
     """Copy a playlists file that just loaded correctly, as the fallback for a later damaged one."""
-    backup = last_good_path(path)
-    partial = backup.with_name(f"{backup.name}.{os.getpid()}.partial")
     try:
-        shutil.copy2(path, partial)
-        partial.replace(backup)
+        copy_file_atomic(path, last_good_path(path))
     except OSError as err:
         logger.warning("Could not keep a spare copy of the playlists file: %s", err)
-        with contextlib.suppress(OSError):
-            partial.unlink()
 
 
 class PlaylistController:

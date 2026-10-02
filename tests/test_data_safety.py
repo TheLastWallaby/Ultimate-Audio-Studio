@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import json
 import threading
-import tkinter as tk
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-
-import pytest
 
 from app.config import DEFAULT_PLAYLIST_NAME
 from app.controllers.playlist_controller import PlaylistController, PlaylistLoadResult, last_good_path
@@ -31,19 +28,6 @@ def _fake_ffmpeg(payload: bytes = b"trimmed") -> Callable[..., SimpleNamespace]:
 
 def _names(folder: Path) -> list[str]:
     return sorted(p.name for p in folder.iterdir())
-
-
-@pytest.fixture
-def studio(tmp_path: Path) -> Iterator[UltimateAudioStudio]:
-    """The real window, with its playlists file redirected so a test never touches the user's own."""
-    with patch("app.ui.features.playlists.PLAYLISTS_PATH", str(tmp_path / "studio_playlists.json")):
-        root = tk.Tk()
-        root.withdraw()
-        window = UltimateAudioStudio(root)
-        try:
-            yield window
-        finally:
-            window.on_close()
 
 
 # --- Saving a clip over the song it was cut from ---------------------------------------------------
@@ -82,7 +66,7 @@ def test_failed_backup_leaves_the_original_song_untouched(tmp_path: Path) -> Non
     song = tmp_path / "song.mp3"
     song.write_bytes(b"original")
 
-    with patch("app.services.clipper.shutil.copy2", side_effect=OSError(28, "No space left on device")):
+    with patch("shutil.copy2", side_effect=OSError(28, "No space left on device")):
         saved, errors = _trim_in_place(song)
 
     assert saved == []
@@ -100,7 +84,7 @@ def test_interrupted_backup_is_never_mistaken_for_a_backup(tmp_path: Path) -> No
         Path(dst).write_bytes(Path(src).read_bytes()[:3])
         raise OSError("The device is not ready")
 
-    with patch("app.services.clipper.shutil.copy2", side_effect=_drive_removed_mid_copy):
+    with patch("shutil.copy2", side_effect=_drive_removed_mid_copy):
         saved, errors = _trim_in_place(song)
 
     assert saved == []
@@ -117,7 +101,7 @@ def test_short_backup_copy_stops_the_replace(tmp_path: Path) -> None:
     def _silently_short_copy(src: str | Path, dst: str | Path, **_kwargs: object) -> None:
         Path(dst).write_bytes(Path(src).read_bytes()[:3])
 
-    with patch("app.services.clipper.shutil.copy2", side_effect=_silently_short_copy):
+    with patch("shutil.copy2", side_effect=_silently_short_copy):
         saved, errors = _trim_in_place(song)
 
     assert saved == []
@@ -326,14 +310,12 @@ def test_cd_export_removes_only_tracks_this_app_made(tmp_path: Path) -> None:
     cd.mkdir()
     for name in ("01 - Old.wav", "02 - Removed.wav", "Family Recording.wav", "my notes.txt"):
         (cd / name).write_bytes(b"x")
-    done: list[tuple[str, int, int, list[str]]] = []
+    done: list[exporter.ExportReport] = []
 
     with patch("app.services.exporter.run_ffmpeg", side_effect=_fake_ffmpeg(b"RIFF")):
-        exporter.cd_export_worker(
-            str(cd), [_make_song(tmp_path)], on_success=lambda *result: done.append(result), clear_existing=True
-        )
+        exporter.cd_export_worker(str(cd), [_make_song(tmp_path)], on_success=done.append, clear_existing=True)
 
-    assert done == [(str(cd), 1, 1, [])]
+    assert done == [exporter.ExportReport(total=1, exported=1)]
     assert _names(cd) == ["01 - song0.wav", "Family Recording.wav", "my notes.txt"]
 
 

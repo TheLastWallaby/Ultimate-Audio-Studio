@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from app.config import log_error, sanitize_filename
 from app.core.task_manager import task_mgr
 from app.platform_utils import get_desktop_dir, safely_eject_usb_drive
-from app.services.exporter import cd_export_worker, find_previous_export, usb_export_worker
+from app.services.exporter import ExportReport, cd_export_worker, find_previous_export, usb_export_worker
 
 DurationFn = Callable[[str], float]
 
@@ -86,7 +86,7 @@ class ExportController:
         normalize: bool,
         on_progress: Callable[[float], None],
         on_status: Callable[[str], None],
-        on_success: Callable[[int, int, list[str]], None],
+        on_success: Callable[[ExportReport], None],
         on_error: Callable[[str], None],
         is_shutting_down_fn: Callable[[], bool],
         duration_fn: DurationFn,
@@ -120,7 +120,7 @@ class ExportController:
         normalize: bool,
         on_progress: Callable[[float], None],
         on_status: Callable[[str], None],
-        on_success: Callable[[str, int, int, list[str]], None],
+        on_success: Callable[[ExportReport], None],
         on_error: Callable[[str], None],
         is_shutting_down_fn: Callable[[], bool],
         on_cancelled: Callable[[int, int], None] | None = None,

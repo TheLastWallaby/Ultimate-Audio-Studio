@@ -74,7 +74,8 @@ class TestUSBExportFsTypeResolution(unittest.TestCase):
         app.export_var.set("USB")
         app.playlist_files = ["song1.mp3"]
 
-        with patch("os.path.exists", return_value=True):
+        # The fake drive must look plugged in, however the app checks for it.
+        with patch("os.path.exists", return_value=True), patch("pathlib.Path.exists", return_value=True):
             # Calling export_playlist should evaluate is_ntfs(fs_type) safely and trigger the askyesno warning
             app.export_playlist()
 
