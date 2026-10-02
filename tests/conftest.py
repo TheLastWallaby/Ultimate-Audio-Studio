@@ -2,10 +2,12 @@
 
 import atexit
 import contextlib
+import functools
 import os
 import shutil
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,37 @@ os.environ.update(
     }
 )
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
+
+TK_STARTUP_ATTEMPTS = 3
+
+
+def _retry_tk_startup() -> None:
+    """Make ``tk.Tk()`` try again when Tcl fails to start with "Can't find a usable init.tcl".
+
+    On the Windows CI runners that error appears now and then while a window is being created,
+    before any test code runs, and the same test passes on the next run. The suite opens well over
+    a hundred windows, so one such hiccup would otherwise fail a whole CI run (and block a release).
+    Any other start-up error, or one that keeps happening, is raised as usual.
+    """
+    import tkinter as tk
+
+    real_init = tk.Tk.__init__
+
+    @functools.wraps(real_init)
+    def _init_with_retry(self: tk.Tk, *args: Any, **kwargs: Any) -> None:
+        for attempt in range(1, TK_STARTUP_ATTEMPTS + 1):
+            try:
+                real_init(self, *args, **kwargs)
+                return
+            except tk.TclError as err:
+                if "init.tcl" not in str(err) or attempt == TK_STARTUP_ATTEMPTS:
+                    raise
+                time.sleep(0.2 * attempt)
+
+    tk.Tk.__init__ = _init_with_retry  # type: ignore[method-assign]
+
+
+_retry_tk_startup()
 
 
 import pytest  # noqa: E402

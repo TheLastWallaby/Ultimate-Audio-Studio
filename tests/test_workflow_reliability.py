@@ -95,6 +95,61 @@ def test_tests_never_use_the_real_music_folder() -> None:
         assert not Path(path).is_relative_to(real_music), path
 
 
+INIT_TCL_ERROR = "Can't find a usable init.tcl in the following directories: \n    {C:\\Python\\tcl\\tcl8.6}"
+
+
+def _tcl_startup_failing(times: int, message: str) -> tuple[Callable[..., object], list[str]]:
+    """A stand-in for Tcl's start-up that fails ``times`` times with ``message``, then works."""
+    real_create = tk._tkinter.create  # type: ignore[attr-defined]
+    calls: list[str] = []
+
+    def _create(*args: object, **kwargs: object) -> object:
+        calls.append("create")
+        if len(calls) <= times:
+            raise tk.TclError(message)
+        return real_create(*args, **kwargs)
+
+    return _create, calls
+
+
+def test_window_startup_is_retried_when_tcl_cannot_find_its_library() -> None:
+    create, calls = _tcl_startup_failing(1, INIT_TCL_ERROR)
+
+    with patch.object(tk._tkinter, "create", side_effect=create), patch("time.sleep"):  # type: ignore[attr-defined]
+        root = tk.Tk()
+    root.destroy()
+
+    assert len(calls) == 2
+
+
+def test_window_startup_gives_up_when_tcl_keeps_failing() -> None:
+    create, calls = _tcl_startup_failing(99, INIT_TCL_ERROR)
+
+    with patch.object(tk._tkinter, "create", side_effect=create), patch("time.sleep"):  # type: ignore[attr-defined]
+        try:
+            tk.Tk()
+        except tk.TclError as err:
+            assert "init.tcl" in str(err)
+        else:
+            raise AssertionError("a window was created although Tcl never started")
+
+    assert len(calls) == 3  # TK_STARTUP_ATTEMPTS in conftest.py
+
+
+def test_other_window_startup_errors_are_not_retried() -> None:
+    create, calls = _tcl_startup_failing(1, "couldn't connect to display")
+
+    with patch.object(tk._tkinter, "create", side_effect=create), patch("time.sleep"):  # type: ignore[attr-defined]
+        try:
+            tk.Tk()
+        except tk.TclError as err:
+            assert "display" in str(err)
+        else:
+            raise AssertionError("an unrelated start-up error was swallowed")
+
+    assert len(calls) == 1
+
+
 # --- Import -------------------------------------------------------------------------------------------
 
 
