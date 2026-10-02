@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import simpledialog
 
 from app.config import PLAYLISTS_PATH, format_time, log_error, sanitize_filename
+from app.controllers.playlist_controller import PlaylistLoadResult
 from app.ui import dialogs
 from app.ui.components import listbox_nearest, listbox_selection
 from app.ui.error_dialog import show_friendly_error
@@ -16,14 +17,47 @@ from app.ui.features.base import AppBase
 class PlaylistMixin(AppBase):
     """Step 3 playlists: create/rename/delete, add/remove/reorder songs, playlist playback."""
 
+    # True while saving keeps failing, so the warning is shown once and not after every change.
+    _playlist_save_failing = False
+
     def load_playlists(self) -> None:
-        self.playlist_ctrl.load(PLAYLISTS_PATH)
+        result = self.playlist_ctrl.load(PLAYLISTS_PATH)
         saved_active = getattr(self, "_saved_active_playlist", "")
         if saved_active in self.playlists:
             self.active_playlist_name = saved_active
         self._relink_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
+        if result.needs_notice:
+            # After the window is up: a dialog during start-up would appear before the app does.
+            self.root.after(800, self._report_playlist_load, result)
+
+    def _report_playlist_load(self, result: PlaylistLoadResult) -> None:
+        """Tell the user that their playlists file was unreadable and what the app did about it."""
+        if getattr(self, "_is_shutting_down", False):
+            return
+        if result.restored_from_backup:
+            dialogs.show_warning(
+                self.root,
+                "Playlists Restored",
+                "Your saved playlists could not be opened, so they were restored from an earlier copy.\n\n"
+                "Changes you made the last time you used the app may be missing. Please check your "
+                "playlists and add any missing songs again.",
+            )
+            return
+        kept = (
+            f"\n\nThe file that could not be opened was kept as '{result.damaged_copy.name}' in your "
+            f"'{result.damaged_copy.parent.name}' folder, in case someone can help you recover it."
+            if result.damaged_copy
+            else ""
+        )
+        dialogs.show_warning(
+            self.root,
+            "Playlists Could Not Be Opened",
+            "Your saved playlists could not be opened, so the app started with an empty playlist.\n\n"
+            "Your songs are safe: they are still in your Library, and you can add them to a playlist "
+            f"again.{kept}",
+        )
 
     def _relink_playlists(self) -> int:
         """Reconnect playlist songs that moved into the current Library folder (same file name)."""
@@ -43,7 +77,22 @@ class PlaylistMixin(AppBase):
             self.playlist_index = tracks.index(self.selected_file_path)
 
     def save_playlists(self) -> None:
-        self.playlist_ctrl.save(PLAYLISTS_PATH)
+        """Save the playlists, warning the user (once per run of failures) when that did not work."""
+        if self.playlist_ctrl.save(PLAYLISTS_PATH):
+            self._playlist_save_failing = False
+            return
+        already_warned = self._playlist_save_failing
+        self._playlist_save_failing = True
+        if already_warned or getattr(self, "_is_shutting_down", False):
+            return
+        dialogs.show_warning(
+            self.root,
+            "Playlists Not Saved",
+            "Your playlist changes could not be saved on this computer.\n\n"
+            "• Check that your Music folder is available and the disk is not full.\n"
+            "• The app tries again each time you change a playlist, and when you close it.\n\n"
+            "If saving still fails when the app is closed, these changes will be lost.",
+        )
 
     def refresh_playlist_dropdown(self) -> None:
         names = self.playlist_ctrl.get_playlist_names()

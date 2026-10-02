@@ -33,6 +33,7 @@ from app.config import (
     ffmpeg_path,
     log_error,
     settings_mgr,
+    setup_logging,
 )
 from app.controllers import (
     DownloadController,
@@ -964,6 +965,7 @@ def _exit_process() -> None:
 
 def main() -> None:
     """Application entry point."""
+    setup_logging()  # before anything logs: module loggers only reach the error log through this handler
     _install_crash_logging()
     if SELF_TEST_FLAG in sys.argv:
         _close_splash()

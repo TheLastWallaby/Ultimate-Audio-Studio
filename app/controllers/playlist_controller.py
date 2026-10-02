@@ -2,16 +2,81 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
+import shutil
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from app.config import DEFAULT_PLAYLIST_NAME, atomic_save_json, log_error
+from app.config import DEFAULT_PLAYLIST_NAME, atomic_save_json
+
+logger = logging.getLogger(__name__)
+
+LAST_GOOD_SUFFIX = ".bak"
+
+
+@dataclass(slots=True, frozen=True)
+class PlaylistLoadResult:
+    """What happened when the playlists file was read, so the window can tell the user."""
+
+    unreadable: bool = False  # the file was there but could not be read
+    restored_from_backup: bool = False  # the playlists come from the last copy that loaded correctly
+    damaged_copy: Path | None = None  # where the unreadable file was kept for recovery
+
+    @property
+    def needs_notice(self) -> bool:
+        return self.unreadable or self.restored_from_backup
 
 
 def _same_file(a: str, b: str) -> bool:
     """Compare two song paths the way Windows does (absolute, case-insensitive)."""
     return str(Path(a).absolute()).casefold() == str(Path(b).absolute()).casefold()
+
+
+def last_good_path(playlists_file: Path) -> Path:
+    """Where the copy of the playlists file that last loaded correctly is kept."""
+    return playlists_file.with_name(playlists_file.name + LAST_GOOD_SUFFIX)
+
+
+def _read_playlists(path: Path) -> dict[str, list[str]]:
+    """Playlists stored in ``path``. Raises OSError or ValueError when the file cannot be used."""
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} does not hold a collection of playlists")
+    # Drop malformed entries instead of crashing later on non-list values.
+    return {
+        str(name): [t for t in tracks if isinstance(t, str) and t]
+        for name, tracks in data.items()
+        if isinstance(tracks, list)
+    }
+
+
+def _set_aside(path: Path) -> Path | None:
+    """Move an unreadable playlists file out of the way, so the next save cannot overwrite it."""
+    kept = path.with_name(f"{path.stem}.damaged-{time.strftime('%Y%m%d-%H%M%S')}{path.suffix}")
+    try:
+        path.replace(kept)
+    except OSError as err:
+        logger.error("Could not set the unreadable playlists file %s aside: %s", path, err)
+        return None
+    return kept
+
+
+def _keep_as_last_good(path: Path) -> None:
+    """Copy a playlists file that just loaded correctly, as the fallback for a later damaged one."""
+    backup = last_good_path(path)
+    partial = backup.with_name(f"{backup.name}.{os.getpid()}.partial")
+    try:
+        shutil.copy2(path, partial)
+        partial.replace(backup)
+    except OSError as err:
+        logger.warning("Could not keep a spare copy of the playlists file: %s", err)
+        with contextlib.suppress(OSError):
+            partial.unlink()
 
 
 class PlaylistController:
@@ -28,35 +93,50 @@ class PlaylistController:
         self.playlist_index = 0
         self._last_removed: tuple[str, int, str] | None = None  # (playlist_name, index, track_path)
 
-    def load(self, filepath: str) -> None:
-        """Load playlists from JSON file."""
-        try:
-            if os.path.exists(filepath):
-                with open(filepath, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and data:
-                    # Drop malformed entries instead of crashing later on non-list values.
-                    self.playlists = {
-                        str(name): [t for t in tracks if isinstance(t, str) and t]
-                        for name, tracks in data.items()
-                        if isinstance(tracks, list)
-                    } or {DEFAULT_PLAYLIST_NAME: []}
-                    if DEFAULT_PLAYLIST_NAME not in self.playlists:
-                        self.playlists[DEFAULT_PLAYLIST_NAME] = []
-                    self.active_playlist_name = list(self.playlists.keys())[0]
-                    return
-        except Exception as e:
-            log_error(f"PlaylistController.load: {e}")
-        self.playlists = {DEFAULT_PLAYLIST_NAME: []}
-        self.active_playlist_name = DEFAULT_PLAYLIST_NAME
+    def load(self, filepath: str | Path) -> PlaylistLoadResult:
+        """Load playlists from the JSON file, falling back to the last copy that loaded correctly.
 
-    def save(self, filepath: str) -> None:
-        """Persist playlists to JSON file atomically."""
+        Playlists cannot be made again, so an unreadable file is never left where the next save
+        would overwrite it: it is moved aside under a ``.damaged-<time>`` name. A file that loads
+        correctly is copied as the fallback for next time.
+        """
+        path = Path(filepath)
+        loaded: dict[str, list[str]] | None = None
+        unreadable = False
+        damaged_copy: Path | None = None
+        if path.exists():
+            try:
+                loaded = _read_playlists(path)
+            except (OSError, ValueError) as err:
+                logger.error("The playlists file %s could not be read: %s", path, err)
+                unreadable = True
+                damaged_copy = _set_aside(path)
+            else:
+                _keep_as_last_good(path)
+
+        restored = False
+        backup = last_good_path(path)
+        if loaded is None and backup.exists():
+            try:
+                loaded = _read_playlists(backup)
+                restored = True
+            except (OSError, ValueError) as err:
+                logger.error("The spare playlists file %s could not be read either: %s", backup, err)
+
+        self.playlists = loaded or {DEFAULT_PLAYLIST_NAME: []}
+        if DEFAULT_PLAYLIST_NAME not in self.playlists:
+            self.playlists[DEFAULT_PLAYLIST_NAME] = []
+        self.active_playlist_name = next(iter(self.playlists))
+        return PlaylistLoadResult(unreadable=unreadable, restored_from_backup=restored, damaged_copy=damaged_copy)
+
+    def save(self, filepath: str | Path) -> bool:
+        """Persist playlists to the JSON file atomically; False (after logging) when that failed."""
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
             atomic_save_json(filepath, self.playlists)
-        except Exception as e:
-            log_error(f"PlaylistController.save: {e}")
+        except (OSError, TypeError, ValueError) as err:
+            logger.error("The playlists could not be saved to %s: %s", filepath, err)
+            return False
+        return True
 
     def create_playlist(self, name: str) -> bool:
         """Create new empty playlist."""
