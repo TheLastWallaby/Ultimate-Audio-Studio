@@ -1,0 +1,2 @@
+# Build-only tools for packaging the .exe (installed by build_exe.ps1); not needed to run the app.
+pyinstaller>=6.0

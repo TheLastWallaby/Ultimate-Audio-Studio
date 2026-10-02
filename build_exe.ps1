@@ -53,7 +53,7 @@ if ($fSize -lt 10MB -or $pSize -lt 10MB) {
 }
 Write-Host "Verified genuine FFmpeg ($fSize bytes) and FFprobe ($pSize bytes)."
 
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -r requirements-build.txt
 
 # yt-dlp needs the Deno JavaScript runtime for YouTube; it is bundled from the yt-dlp[deno] extra.
 $denoBin = python -c "import deno; print(deno.find_deno_bin())"
