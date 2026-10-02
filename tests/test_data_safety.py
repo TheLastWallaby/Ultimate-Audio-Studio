@@ -10,11 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.config import DEFAULT_PLAYLIST_NAME
+from app.config import DEFAULT_PLAYLIST_NAME, YT_CACHE_DIR
 from app.controllers.library_controller import ImportResult, LibraryController
 from app.controllers.playlist_controller import PlaylistController, PlaylistLoadResult, last_good_path
 from app.main import UltimateAudioStudio
-from app.services import exporter
+from app.services import downloader, exporter
 from app.services.clipper import clip_audio_worker, has_original_backup, original_backup_path
 
 
@@ -495,3 +495,85 @@ def test_replacing_the_song_in_the_player_releases_and_reloads_it(studio: Ultima
     reload.assert_called_once_with(str(mine), "Song.mp3")
     assert mine.read_bytes() == b"ID3" + bytes(128)
     assert "Recycle Bin" in studio.status.cget("text")
+
+
+# --- Downloading a song whose title is already in the Library --------------------------------------
+
+
+class _FakeYoutubeDL:
+    """Stands in for yt_dlp.YoutubeDL: "downloads" an MP3 named after the video into ``outtmpl``'s folder.
+
+    Like the real MP3 conversion, it writes over a file of the same name in that folder.
+    """
+
+    def __init__(self, opts: dict[str, object], title: str = "Song", payload: bytes = b"downloaded") -> None:
+        self.folder = Path(str(opts["outtmpl"])).parent
+        self.title = title
+        self.payload = payload
+
+    def __enter__(self) -> _FakeYoutubeDL:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def add_post_processor(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def extract_info(self, _url: str, download: bool = True) -> dict[str, object]:
+        (self.folder / f"{self.title}.webp").write_bytes(b"thumbnail")
+        if self.payload:
+            (self.folder / f"{self.title}.mp3").write_bytes(self.payload)
+        return {"title": self.title}
+
+
+def _download(library: Path, **fake: object) -> tuple[list[str], list[str]]:
+    succeeded: list[str] = []
+    errors: list[str] = []
+    with patch.object(downloader.yt_dlp, "YoutubeDL", side_effect=lambda opts: _FakeYoutubeDL(opts, **fake)):
+        downloader.download_audio_worker(
+            "https://youtu.be/x",
+            str(library),
+            threading.Event(),
+            lambda *_a: None,
+            succeeded.append,
+            lambda: None,
+            errors.append,
+        )
+    return succeeded, errors
+
+
+def test_download_never_replaces_a_song_with_the_same_title(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "Song.mp3").write_bytes(b"my trimmed song")
+
+    succeeded, errors = _download(library)
+
+    assert (succeeded, errors) == (["Song (2).mp3"], [])
+    assert (library / "Song.mp3").read_bytes() == b"my trimmed song"
+    assert (library / "Song (2).mp3").read_bytes() == b"downloaded"
+    assert _names(library) == ["Song (2).mp3", "Song.mp3"]
+
+
+def test_download_leaves_no_work_files_behind(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+
+    succeeded, _errors = _download(library)
+
+    assert succeeded == ["Song.mp3"]
+    assert _names(library) == ["Song.mp3"]
+    assert not any((Path(YT_CACHE_DIR) / "downloads").iterdir())
+
+
+def test_failed_download_reports_and_adds_nothing(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "Song.mp3").write_bytes(b"mine")
+
+    succeeded, errors = _download(library, payload=b"")
+
+    assert succeeded == []
+    assert len(errors) == 1
+    assert _names(library) == ["Song.mp3"]
+    assert not any((Path(YT_CACHE_DIR) / "downloads").iterdir())

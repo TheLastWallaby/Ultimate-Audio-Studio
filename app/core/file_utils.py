@@ -44,6 +44,16 @@ def copy_file_atomic(src: str | Path, dest: str | Path) -> None:
         raise
 
 
+def unused_path(dest: str | Path) -> Path:
+    """``dest``, or the first "Name (2).ext"-style name next to it that is not taken yet."""
+    dest = Path(dest)
+    candidate, number = dest, 2
+    while candidate.exists():
+        candidate = dest.with_name(f"{dest.stem} ({number}){dest.suffix}")
+        number += 1
+    return candidate
+
+
 def atomic_save_json(filepath: str | Path, data: Any) -> None:
     """Atomically write JSON data to avoid corruption during crashes or power cuts."""
     p = Path(filepath).resolve()
