@@ -88,7 +88,8 @@ class LibraryMixin(AppBase):
             replace = dialogs.ask_yes_no(
                 self.root,
                 "Songs Already in Your Library",
-                f"{len(dest_exists)} of the {source} song(s) are already in your Library.",
+                f"{len(dest_exists)} of the {source} song(s) are already in your Library.\n\n"
+                "If you replace them, the copies you have now go to the Recycle Bin.",
                 yes="Replace them",
                 no="Keep the ones I have",
                 default_yes=False,
@@ -98,6 +99,11 @@ class LibraryMixin(AppBase):
 
         if not planned:
             return
+
+        # The song in the player is held open, and Windows will not move an open file to the Recycle Bin.
+        if any(_same_song(dest, self.selected_file_path) for _src, dest in planned if Path(dest).exists()):
+            self.stop_audio()
+            self._release_audio_file()
 
         self._importing = True
         self.set_busy(True, f"Adding {len(planned)} song(s) to your Library...")
@@ -307,7 +313,18 @@ class LibraryMixin(AppBase):
         """Report an import truthfully: what was added, what was renamed, and what could not be copied."""
         self._importing = False
         self.set_busy(False)
+        for name in result.replaced:
+            # A replaced song keeps its name, so details and pictures remembered for it are now wrong.
+            path = self._library_row_path(name)
+            cache_mgr.invalidate(path)
+            self.library_ctrl.invalidate_search_index(path)
+            self._art_cache.pop(path, None)
         self.refresh_library()
+        reloaded = next(
+            (n for n in result.replaced if _same_song(self._library_row_path(n), self.selected_file_path)), None
+        )
+        if reloaded:
+            self._load_track_ui(self._library_row_path(reloaded), reloaded)
         if result.copied:
             message = f"Added {len(result.copied)} song(s) to your Library."
             if len(result.renamed) == 1:
@@ -317,6 +334,10 @@ class LibraryMixin(AppBase):
                     f" {len(result.renamed)} had the same name as another song, so they were added with a "
                     f"number, like '{result.renamed[0]}'."
                 )
+            if len(result.replaced) == 1:
+                message += f" The older copy of '{result.replaced[0]}' is in the Recycle Bin."
+            elif result.replaced:
+                message += f" The {len(result.replaced)} older copies they replaced are in the Recycle Bin."
             self.notify_success(message)
         else:
             self.set_status("No songs were added to your Library.", icon="⚠️")
