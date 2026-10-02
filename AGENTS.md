@@ -15,7 +15,7 @@ Ultimate Audio Studio is a Windows desktop app (Tkinter, pygame, FFmpeg, yt-dlp)
   3. *Playlists and export*: several playlists stored as JSON, Previous/Next, and USB or CD export.
 - **Interface rules**:
   - Large fonts and high-contrast controls. Fonts and colors come from `app/ui/theme.py`.
-  - Every dialog goes through `app/ui/dialogs.py` (`show_info`, `show_warning`, `ask_yes_no`, `ask_choice`) or `show_friendly_error` in `app/ui/error_dialog.py`. Do not call `tkinter.messagebox`.
+  - Every dialog goes through `app/ui/dialogs.py` (`show_info`, `show_warning`, `ask_yes_no`, `ask_choice`, and `ask_text` for typing a name or a time) or `show_friendly_error` in `app/ui/error_dialog.py`. Do not call `tkinter.messagebox` or `tkinter.simpledialog`.
   - Label buttons with what they do ("Replace the old songs", "Keep them and add these"), not "Yes"/"No"/"OK".
   - Error messages use plain words, say what happened, and say what to do next. Raw exception text is mapped to friendly text in `app/core/errors.py`.
   - Ask as few questions as possible. Prefer a safe automatic choice with Undo over another dialog.
@@ -213,7 +213,7 @@ See [SECURITY.md](SECURITY.md) for the full policy.
 - Updates need no account, token, or setup. The token setting is optional and not needed for the public repository.
 - A newer release is downloaded in the background and staged with its SHA-256. It is checked for minimum size, a valid `MZ` header, and GitHub's published digest when one exists.
 - Requests use HTTPS only. The `Authorization` header is stripped on any redirect away from `github.com`.
-- Install: rename the running `sys.executable` to `.old`, move the new file into place, start it, and wait for it to signal `UPDATE_OK_EVENT_NAME` once its window is up. If it exits first, restore the previous version and record the tag so it is not retried automatically. Leftover `.old` files are removed at the next start.
+- Install: rename the running `sys.executable` to `.old`, move the new file into place, start it, and wait for it to signal `UPDATE_OK_EVENT_NAME` once its window is up. If it exits first, or has still not signalled when the start timeout ends (it is then stopped), restore the previous version and record the tag so it is not retried automatically. Leftover `.old` files are removed at the next start.
 - The app sends no telemetry. Do not add network calls other than YouTube search and download and the GitHub release check.
 
 ---

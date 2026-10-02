@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import queue
 import threading
 import tkinter as tk
@@ -44,6 +46,8 @@ from app.ui.theme import (
 if TYPE_CHECKING:
     from app.core.audio_engine import AudioEngine
 
+logger = logging.getLogger(__name__)
+
 
 class SearchChoiceDialog:
     """Modal dialog presenting multiple YouTube search results with preview playback, title, artist, and duration."""
@@ -73,6 +77,8 @@ class SearchChoiceDialog:
         self._preview_request_id = 0
         self._is_previewing = False
         self._is_loading_preview = False
+        # True while the shared mixer holds a preview started by this dialog (see _stop_preview).
+        self._owns_mixer = False
         self._preview_active_url: str | None = None
         self._preview_poll_job: str | None = None
         self._preview_duration = 30.0
@@ -426,6 +432,7 @@ class SearchChoiceDialog:
             pass
 
     def _on_preview_ready(self, req_id: int, item: SearchResult, filepath: str) -> None:
+        """The preview file has arrived: play it, unless the user has moved on meanwhile."""
         if self._closed or req_id != self._preview_request_id:
             return
         self._is_loading_preview = False
@@ -436,6 +443,8 @@ class SearchChoiceDialog:
         self._style_play_button("⏹ Stop Preview", COLOR_STOP, COLOR_STOP_HV, state=tk.NORMAL)
         self.btn_preview_stop.config(state=tk.NORMAL)
 
+        # From here on the shared mixer holds this dialog's preview instead of the user's song.
+        self._owns_mixer = True
         try:
             if self.audio_engine:
                 self.audio_engine.load_and_play(filepath, start_sec=0.0)
@@ -444,9 +453,9 @@ class SearchChoiceDialog:
                     pygame.mixer.init()
                 pygame.mixer.music.load(filepath)
                 pygame.mixer.music.play()
-        except Exception as e:
-            log_error(f"SearchChoiceDialog._on_preview_ready: {e}")
-            self._on_preview_failed(req_id, str(e))
+        except (pygame.error, OSError) as err:
+            logger.error("The search preview could not be played: %s", err)
+            self._on_preview_failed(req_id, str(err))
             return
 
         self._start_timeline_poll()
@@ -507,6 +516,11 @@ class SearchChoiceDialog:
             self._preview_poll_job = self.win.after(100, self._poll_timeline)
 
     def _stop_preview(self, reset_status: bool = True) -> None:
+        """Stop the preview this dialog is loading or playing, and reset its controls.
+
+        The mixer is shared with the main player, so it is only stopped while it holds a preview of
+        this dialog: choosing a result or closing the dialog must not cut off the user's music.
+        """
         self._preview_cancel_event.set()
         self._preview_request_id += 1
         self._stop_timeline_poll()
@@ -514,18 +528,16 @@ class SearchChoiceDialog:
         self._is_loading_preview = False
         self._preview_active_url = None
 
-        try:
+        owns_mixer, self._owns_mixer = self._owns_mixer, False
+        if owns_mixer:
             if self.audio_engine:
                 self.audio_engine.stop()
-            else:
-                if pygame.mixer.get_init():
+            elif pygame.mixer.get_init():
+                with contextlib.suppress(pygame.error):
                     pygame.mixer.music.stop()
-                    if hasattr(pygame.mixer.music, "unload"):
-                        pygame.mixer.music.unload()
-        except Exception:
-            pass
+                    pygame.mixer.music.unload()
 
-        try:
+        with contextlib.suppress(tk.TclError):  # the window may already be gone
             if self.win.winfo_exists():
                 self._style_play_button("▶ Play Preview", COLOR_PLAY, COLOR_PLAY_HV, state=tk.NORMAL)
                 self.btn_preview_stop.config(state=tk.DISABLED)
@@ -535,8 +547,6 @@ class SearchChoiceDialog:
                     self.lbl_preview_status.config(
                         text="Select a song and click 'Play Preview' to listen (30-sec sample)", fg=TEXT_MUTED
                     )
-        except Exception:
-            pass
 
     def _do_select(self) -> None:
         # Validate the choice before shutting the dialog down; otherwise an empty click would leave

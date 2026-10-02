@@ -132,6 +132,7 @@ def _no_blocking_dialogs(request: pytest.FixtureRequest) -> Iterator[None]:
     real_show_error = error_dialog.show_error
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch("app.ui.dialogs.ask_choice", side_effect=_cancel))
+        stack.enter_context(patch("app.ui.dialogs.ask_text", return_value=None))  # None is its cancel value
         # ``from app.ui.error_dialog import show_error`` binds the function in the importing module,
         # so every module that holds it is patched, not only the one that defines it.
         for name, module in list(sys.modules.items()):

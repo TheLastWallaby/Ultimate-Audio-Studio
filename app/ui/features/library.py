@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import time
 import tkinter as tk
 from collections.abc import Mapping
 from pathlib import Path
-from tkinter import filedialog, simpledialog
+from tkinter import filedialog
 from typing import Any
 
 from app.config import AUDIO_EXTS, format_time, log_error, sanitize_filename
@@ -21,12 +23,47 @@ from app.ui.components import listbox_selection
 from app.ui.error_dialog import show_error, show_friendly_error
 from app.ui.features.base import AppBase
 
+logger = logging.getLogger(__name__)
+
 # Background of a just-added library row that was not selected (music was playing at the time).
 NEW_SONG_ROW_BG = "#dcfce7"
 
 
+def _same_song(a: str | None, b: str | None) -> bool:
+    """True when both paths name the same file (Windows compares paths without regard to case)."""
+    if not a or not b:
+        return False
+    return str(Path(a).absolute()).casefold() == str(Path(b).absolute()).casefold()
+
+
 class LibraryMixin(AppBase):
     """Step 1 library list: scanning, search, import, rename and delete with undo."""
+
+    # A Library song that was clicked while another one was playing or paused. A click never cuts
+    # the music off; this song is loaded once PLAY or STOP is pressed, or the music ends.
+    _pending_library_song: str | None = None
+
+    def _library_row_path(self, filename: str) -> str:
+        """Path of a Library row, in the exact form the player and the playlists keep it in.
+
+        ``os.path.join`` is deliberate: older code compares these strings with ``==``, and a
+        ``Path`` would spell a folder chosen with the folder dialog ("C:/Music") differently.
+        """
+        return os.path.join(self.library_folder, filename)
+
+    def _cancel_selection_debounce(self) -> None:
+        """Drop a click that has not been acted on yet (a newer click or a double-click replaces it)."""
+        if self._selection_debounce_timer:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._selection_debounce_timer)
+            self._selection_debounce_timer = None
+
+    def _load_pending_selection(self) -> bool:
+        """Load the Library song that was clicked while another was in the player; True when loaded."""
+        path, self._pending_library_song = self._pending_library_song, None
+        if not path or _same_song(path, self.selected_file_path) or not Path(path).is_file():
+            return False
+        return self._load_track_ui(path, Path(path).name)
 
     def _handle_dropped_files(self, paths: list[str]) -> None:
         if getattr(self, "_is_shutting_down", False):
@@ -309,53 +346,61 @@ class LibraryMixin(AppBase):
                 self._timer_watch_library = self.root.after(12000, self._watch_library)
 
     def rename_library_file(self) -> None:
+        """Rename the selected song; its playlist entries and its trim backup follow it."""
         sel = listbox_selection(self.listbox_lib)
         if not sel or sel[0] >= len(self.visible_files):
-            dialogs.show_warning(self.root, "Select a Song", "Please click a song in the library listbox first.")
+            dialogs.show_warning(self.root, "Select a Song", "Please click a song in your Library first.")
             return
         old_name = self.visible_files[sel[0]]
-        old_path = os.path.join(self.library_folder, old_name)
-        stem, ext = os.path.splitext(old_name)
+        old_path = self._library_row_path(old_name)
+        old = Path(old_name)
 
-        new_stem = simpledialog.askstring(
-            "Rename Song", "Enter new name for this song:", initialvalue=stem, parent=self.root
+        answer = dialogs.ask_text(
+            self.root, "Rename Song", "Type a new name for this song:", initial=old.stem, ok="Rename song"
         )
-        if not new_stem or new_stem.strip() == stem:
+        if answer is None or answer.text == old.stem:
             return
-        new_name = sanitize_filename(new_stem) + ext
-        new_path = os.path.join(self.library_folder, new_name)
+        new_name = sanitize_filename(answer.text) + old.suffix
+        new_path = self._library_row_path(new_name)
 
-        if os.path.exists(new_path) and new_path.lower() != old_path.lower():
-            dialogs.show_warning(self.root, "File Exists", f"A file named '{new_name}' already exists in your library.")
+        if Path(new_path).exists() and not _same_song(new_path, old_path):
+            dialogs.show_warning(
+                self.root,
+                "Name Already Used",
+                f"A song named '{new_name}' is already in your Library.\n\nPlease choose a different name.",
+            )
             return
 
-        was_playing_renamed = self.selected_file_path == old_path and (self.is_playing_main or self.is_playing_playlist)
-        if was_playing_renamed:
+        # Only the song in the player is held open by it. Stopping for any other song would cut the
+        # music off (and make a playlist skip ahead) for no reason.
+        is_loaded = _same_song(self.selected_file_path, old_path)
+        if is_loaded:
             self.stop_audio()
-
-        self._release_audio_file()
-        time.sleep(0.05)
+            time.sleep(0.05)  # let Windows release the file before it is renamed
 
         try:
             new_path = self.library_ctrl.rename_file(old_path, new_name, self.playlists)
-            self.save_playlists()
-            self.refresh_playlist_listbox()
-            self.refresh_library(select_name=new_name)
-            if self.selected_file_path == old_path:
-                self._load_track_ui(new_path, new_name)
-            self.set_status(f"Renamed song to: {new_name}")
-        except Exception as e:
-            log_error(f"rename_library_file: {e}")
-            show_friendly_error(self.root, e, "generic")
+        except OSError as err:
+            logger.error("Could not rename %s: %s", old_name, err)
+            show_friendly_error(self.root, err, "generic")
+            return
+        if _same_song(self._pending_library_song, old_path):
+            self._pending_library_song = new_path
+        self.save_playlists()
+        self.refresh_playlist_listbox()
+        self.refresh_library(select_name=new_name)
+        if is_loaded:
+            self._load_track_ui(new_path, new_name)
+        self.set_status(f"Renamed song to: {new_name}")
 
     def delete_library_file(self) -> None:
         """Move every selected song to the Recycle Bin (one confirmation, one Undo)."""
         sel = [i for i in listbox_selection(self.listbox_lib) if i < len(self.visible_files)]
         if not sel:
-            dialogs.show_warning(self.root, "Select a Song", "Please click a song in the library listbox first.")
+            dialogs.show_warning(self.root, "Select a Song", "Please click a song in your Library first.")
             return
         names = [self.visible_files[i] for i in sel]
-        paths = [os.path.join(self.library_folder, name) for name in names]
+        paths = [self._library_row_path(name) for name in names]
 
         if len(names) == 1:
             title = "Delete Song"
@@ -378,7 +423,8 @@ class LibraryMixin(AppBase):
         ):
             return
 
-        if self.selected_file_path in paths:
+        # Only the song in the player is held open by it; music from any other song keeps playing.
+        if any(_same_song(self.selected_file_path, path) for path in paths):
             self.stop_audio(user=True)
             self.selected_file_path = None
             self.lbl_selected.config(text="No song selected")
@@ -387,15 +433,15 @@ class LibraryMixin(AppBase):
             self._current_peaks = []
             self._render_waveform(full_redraw=True)
             self._update_restore_original_button()
-
-        self._release_audio_file()
-        time.sleep(0.05)
+            time.sleep(0.05)  # let Windows release the file before it is moved
+        if any(_same_song(self._pending_library_song, path) for path in paths):
+            self._pending_library_song = None
 
         try:
             staged, failed = self.library_ctrl.stage_delete_many(paths, self.playlists)
-        except Exception as e:
-            log_error(f"delete_library_file: {e}")
-            show_friendly_error(self.root, e, "generic")
+        except OSError as err:
+            logger.error("Could not delete the selected songs: %s", err)
+            show_friendly_error(self.root, err, "generic")
             return
         self._resync_playlist_index()
         self.save_playlists()
@@ -403,7 +449,7 @@ class LibraryMixin(AppBase):
         self.refresh_library()
         if staged:
             what = f"'{staged[0]}'" if len(staged) == 1 else f"{len(staged)} songs"
-            self.show_undo(f"Moved {what} to Recycle Bin.", callback=self._undo_delete_file, timeout_sec=8)
+            self.show_undo(f"Moved {what} to Recycle Bin.", callback=self._undo_delete_file)
         if failed:
             fe = friendly_error(failed[0][1], "generic")
             listed = "\n".join(f"• {name}" for name, _err in failed[:8])
@@ -425,24 +471,34 @@ class LibraryMixin(AppBase):
         except Exception as e:
             log_error(f"_undo_delete_file: {e}")
 
-    def on_library_select(self, event: tk.Event[tk.Misc] | None = None) -> None:
+    def on_library_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        """A Library row was clicked: load it into the player, unless a song is playing or paused.
+
+        Songs are also clicked to add them to a playlist or to delete them, so a click must never
+        cut the music off. While the player is in use the clicked song is only remembered; it is
+        loaded when PLAY or STOP is pressed or the music ends (double-click plays it at once).
+        """
         sel = listbox_selection(self.listbox_lib)
         if not sel or sel[0] >= len(self.visible_files):
             return
         filename = self.visible_files[sel[0]]
-        new_path = os.path.join(self.library_folder, filename)
+        new_path = self._library_row_path(filename)
         if filename in self._fresh_songs:
             self._fresh_songs.discard(filename)
             self.listbox_lib.itemconfig(sel[0], background="")
+        self._cancel_selection_debounce()
         if new_path == self.selected_file_path:
+            self._pending_library_song = None
             return
 
-        if self._selection_debounce_timer:
-            try:
-                self.root.after_cancel(self._selection_debounce_timer)
-            except Exception:
-                pass
-            self._selection_debounce_timer = None
+        if self.is_playing_main or self.is_playing_playlist or self.is_paused:
+            self._pending_library_song = new_path
+            self.set_status(
+                f"Selected: {self._display_name(new_path, filename)}. The current song keeps playing; "
+                "press PLAY to switch to this one."
+            )
+            return
+        self._pending_library_song = None
 
         def _do_select() -> None:
             self.stop_audio()
@@ -452,17 +508,14 @@ class LibraryMixin(AppBase):
         self._selection_debounce_timer = self.root.after(100, _do_select)
 
     def _on_library_double_click(self, _event: tk.Event[tk.Misc] | None = None) -> None:
-        if self._selection_debounce_timer:
-            try:
-                self.root.after_cancel(self._selection_debounce_timer)
-            except Exception:
-                pass
-            self._selection_debounce_timer = None
+        """Play the double-clicked song now, replacing whatever is playing."""
+        self._cancel_selection_debounce()
         sel = listbox_selection(self.listbox_lib)
         if not sel or sel[0] >= len(self.visible_files):
             return
         filename = self.visible_files[sel[0]]
-        new_path = os.path.join(self.library_folder, filename)
+        new_path = self._library_row_path(filename)
+        self._pending_library_song = None
         if self.selected_file_path != new_path:
             self.stop_audio()
             if not self._load_track_ui(new_path, filename):

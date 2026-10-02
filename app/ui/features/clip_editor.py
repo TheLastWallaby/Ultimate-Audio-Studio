@@ -5,9 +5,8 @@ from __future__ import annotations
 import os
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, simpledialog
 
-from app.config import format_time, log_error
+from app.config import format_time, log_error, sanitize_filename
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
 from app.core.time_utils import parse_time
@@ -16,6 +15,18 @@ from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 from app.ui.theme import COLOR_DOWNLOAD, TEXT_DARK
+
+# Value of the "Replace the original song" button in the Save Clip dialog.
+CLIP_REPLACE_ORIGINAL = "replace"
+
+
+def _free_clip_path(wanted: Path) -> Path:
+    """``wanted``, or the first "Name (2).mp3"-style name that is free, so a clip never overwrites a song."""
+    candidate, number = wanted, 2
+    while candidate.exists():
+        candidate = wanted.with_name(f"{wanted.stem} ({number}){wanted.suffix}")
+        number += 1
+    return candidate
 
 
 class ClipEditorMixin(AppBase):
@@ -105,28 +116,27 @@ class ClipEditorMixin(AppBase):
         return parse_time(text)
 
     def edit_start_time(self) -> None:
+        """Ask for an exact clip start time (the ✏ Edit button of the Start box)."""
         if not self.selected_file_path:
             self.set_status("Select a song in the Library first to edit clip start.")
             return
-        curr_str = format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer())
-        inp = simpledialog.askstring(
+        end_text = format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())
+        answer = dialogs.ask_text(
+            self.root,
             "Set Clip Start",
-            f"Enter new Start time for clip (e.g. 01:23, 01:23.5, or 83.5):\nMax allowed: {format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())}",
-            initialvalue=curr_str,
-            parent=self.root,
+            "Type the time where your clip should start, for example 01:23 or 83.5.\n\n"
+            f"It must be before the clip end ({end_text}).",
+            initial=format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer()),
+            ok="Set start time",
         )
-        if inp is None:
+        if answer is None:
             return
-        val = self._parse_time_input(inp)
+        val = self._parse_time_input(answer.text)
         if val is None:
             dialogs.show_warning(self.root, "Invalid Time", "Please enter a valid time (e.g. '01:30' or '90').")
             return
         if val >= self.clip_end_sec:
-            dialogs.show_warning(
-                self.root,
-                "Invalid Range",
-                f"Clip Start must be before Clip End ({format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())}).",
-            )
+            dialogs.show_warning(self.root, "Invalid Range", f"Clip Start must be before Clip End ({end_text}).")
             return
         self.clip_start_sec = max(0.0, val)
         is_frac = not float(self.clip_start_sec).is_integer()
@@ -136,28 +146,27 @@ class ClipEditorMixin(AppBase):
         self.set_status(f"Clip start set to {format_time(self.clip_start_sec, include_fractional=is_frac)}.")
 
     def edit_end_time(self) -> None:
+        """Ask for an exact clip end time (the ✏ Edit button of the End box)."""
         if not self.selected_file_path:
             self.set_status("Select a song in the Library first to edit clip end.")
             return
-        curr_str = format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer())
-        inp = simpledialog.askstring(
+        start_text = format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer())
+        answer = dialogs.ask_text(
+            self.root,
             "Set Clip End",
-            f"Enter new End time for clip (e.g. 02:45, 02:45.5, or 165.5):\nSong total length: {format_time(self.track_duration)}",
-            initialvalue=curr_str,
-            parent=self.root,
+            "Type the time where your clip should end, for example 02:45 or 165.5.\n\n"
+            f"The whole song is {format_time(self.track_duration)} long.",
+            initial=format_time(self.clip_end_sec, include_fractional=not float(self.clip_end_sec).is_integer()),
+            ok="Set end time",
         )
-        if inp is None:
+        if answer is None:
             return
-        val = self._parse_time_input(inp)
+        val = self._parse_time_input(answer.text)
         if val is None:
             dialogs.show_warning(self.root, "Invalid Time", "Please enter a valid time (e.g. '02:45' or '165').")
             return
         if val <= self.clip_start_sec:
-            dialogs.show_warning(
-                self.root,
-                "Invalid Range",
-                f"Clip End must be after Clip Start ({format_time(self.clip_start_sec, include_fractional=not float(self.clip_start_sec).is_integer())}).",
-            )
+            dialogs.show_warning(self.root, "Invalid Range", f"Clip End must be after Clip Start ({start_text}).")
             return
         max_limit = self.track_duration if self.track_duration > 0 else 999999
         self.clip_end_sec = min(max_limit, val)
@@ -267,8 +276,45 @@ class ClipEditorMixin(AppBase):
             self.stop_audio(user=False)
             return False
 
+    def _ask_clip_target(self, source: Path, clip_sec: float) -> tuple[Path, str] | None:
+        """Ask what to call the clip; returns where to save it and a note for the user, or None when cancelled.
+
+        The clip always goes into the Library, and never over another song: a name that is already
+        used gets a number ("Song (2).mp3"), which the note mentions. Replacing the song it was cut
+        from is offered as a button of its own, because that one is backed up and can be restored.
+        """
+        can_replace = source.suffix.lower() == ".mp3"  # the clip is an MP3, so only an MP3 can be replaced by it
+        message = "Type a name for your clip. It is saved as a new song in your Library."
+        extra: list[dialogs.DialogButton] = []
+        if can_replace:
+            message += (
+                f"\n\n'Replace the original song' puts the clip in place of '{source.name}' instead. "
+                "The full song is kept as a backup, and 'Restore Original Song' puts it back."
+            )
+            extra.append(dialogs.DialogButton("Replace the original song", CLIP_REPLACE_ORIGINAL))
+        answer = dialogs.ask_text(
+            self.root,
+            "Save Your Clip",
+            message,
+            initial=f"{source.stem}_clip_{int(clip_sec)}s",
+            ok="Save as a new song",
+            extra=extra,
+            icon="💾",
+        )
+        if answer is None:
+            return None
+        if answer.value == CLIP_REPLACE_ORIGINAL:
+            return source, ""
+        typed = answer.text[:-4] if answer.text.lower().endswith(".mp3") else answer.text
+        wanted = Path(self.library_folder) / f"{sanitize_filename(typed)}.mp3"
+        target = _free_clip_path(wanted)
+        note = "" if target == wanted else f" It was saved as '{target.name}', because '{wanted.name}' already exists."
+        return target, note
+
     def save_clip(self) -> None:
-        if not self.selected_file_path:
+        """Ask for the clip's name, then trim and save it on a worker."""
+        source = self.selected_file_path
+        if not source:
             dialogs.show_warning(self.root, "No Song", "Click a song in the Library first.")
             return
         s_time = self.clip_start_sec
@@ -277,45 +323,19 @@ class ClipEditorMixin(AppBase):
             dialogs.show_warning(self.root, "Invalid Range", "Clip End must be after Clip Start.")
             return
 
-        dur = e_time - s_time
-        base, _ext = os.path.splitext(os.path.basename(self.selected_file_path))
-        def_name = f"{base}_clip_{int(dur)}s.mp3"
-
-        save_name = filedialog.asksaveasfilename(
-            initialdir=self.library_folder,
-            initialfile=def_name,
-            defaultextension=".mp3",
-            filetypes=[("MP3 Audio (*.mp3)", "*.mp3")],
-            title="Save Your Clip",
-            parent=self.root,
-        )
-        if not save_name:
+        chosen = self._ask_clip_target(Path(source), e_time - s_time)
+        if chosen is None:
             return
-
-        if not save_name.lower().endswith(".mp3"):
-            save_name += ".mp3"
-
-        is_self_overwrite = os.path.abspath(save_name).lower() == os.path.abspath(self.selected_file_path).lower()
-        if is_self_overwrite:
-            confirm = dialogs.ask_yes_no(
-                self.root,
-                "Replace the Original Song?",
-                f"You are about to replace the original song file:\n\n'{os.path.basename(save_name)}'\n\n"
-                "A backup of the original is kept automatically, and you can put it back later "
-                "with 'Restore Original Song'.",
-                yes="Replace with my clip",
-                no="Cancel",
-                default_yes=False,
-                icon=dialogs.ICON_WARNING,
-            )
-            if not confirm:
-                return
+        target, note = chosen
+        is_self_overwrite = target == Path(source)
+        # The song keeps the exact path text the player and the playlists know it by.
+        save_name = source if is_self_overwrite else str(target)
 
         self.stop_audio()
         self._release_audio_file()
 
-        soften = bool(self.soften_clip.get()) if hasattr(self, "soften_clip") else False
-        gain_db = float(self.scale_gain.get()) if hasattr(self, "scale_gain") else 0.0
+        soften = bool(self.soften_clip.get())
+        gain_db = float(self.scale_gain.get())
         fade_sec = self._get_fade_sec()
 
         self._saving_clip = True
@@ -323,14 +343,14 @@ class ClipEditorMixin(AppBase):
         self.set_busy(True, "Trimming and saving your clip...")
 
         def _on_succ(name: str, full_path: str, was_self_ovw: bool) -> None:
-            self._safe_after(0, self._save_success, name, full_path, was_self_ovw)
+            self._safe_after(0, self._save_success, name, full_path, was_self_ovw, note)
 
         def _on_err(err: str) -> None:
             self._safe_after(0, self._save_error, err)
 
         task_mgr.submit_task(
             clip_audio_worker,
-            self.selected_file_path,
+            source,
             s_time,
             e_time,
             save_name,
@@ -342,13 +362,13 @@ class ClipEditorMixin(AppBase):
             fade_sec=fade_sec,
         )
 
-    def _save_success(self, name: str, full_path: str, was_self_overwrite: bool) -> None:
+    def _save_success(self, name: str, full_path: str, was_self_overwrite: bool, note: str = "") -> None:
+        """Show the saved clip in the Library and confirm it (``note`` says when it was given another name)."""
         self._saving_clip = False
         self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
         self.set_busy(False)
         cache_mgr.invalidate(full_path)
-        if hasattr(self, "library_ctrl"):
-            self.library_ctrl.invalidate_search_index(full_path)
+        self.library_ctrl.invalidate_search_index(full_path)
         self._art_cache.pop(full_path, None)
         if was_self_overwrite:
             self.refresh_library(select_name=name)
@@ -359,9 +379,9 @@ class ClipEditorMixin(AppBase):
                 icon="💾",
             )
         elif self._reveal_new_song(name):
-            self.notify_success("Clip saved and loaded: press PLAY to hear it.", icon="💾")
+            self.notify_success(f"Clip saved and loaded: press PLAY to hear it.{note}", icon="💾")
         else:
-            self.notify_success("Clip saved! It is marked in green in your Library on the left.", icon="💾")
+            self.notify_success(f"Clip saved! It is marked in green in your Library on the left.{note}", icon="💾")
 
     def _save_error(self, err: str) -> None:
         self._saving_clip = False

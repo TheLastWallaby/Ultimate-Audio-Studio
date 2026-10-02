@@ -14,6 +14,7 @@ from pydub import AudioSegment
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
 from app.core.file_utils import copy_file_atomic
 from app.core.file_utils import replace_with_retry as _replace_with_retry
+from app.core.process_utils import ffmpeg_timed_out
 from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, fade_duration, mp3_output_args
 
 try:
@@ -34,6 +35,10 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 ORIGINAL_BACKUP_SUFFIX = ".original.bak"
+_CLIP_TIMEOUT_MIN_SEC = 120.0
+_CLIP_TIMEOUT_MAX_SEC = 1800.0
+# Largest song the in-memory fallback is tried on (pydub holds the decoded audio in RAM).
+_FALLBACK_MAX_BYTES = 50 * 1024 * 1024
 
 
 def original_backup_path(song_path: str) -> str:
@@ -132,6 +137,16 @@ def _has_content(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
+def _clip_timeout_sec(clip_end_sec: float) -> int:
+    """Seconds FFmpeg may take to cut a clip that ends ``clip_end_sec`` into the song.
+
+    The MP3 path decodes the song from its start up to the end of the clip. Even a slow PC does that
+    several times faster than the music plays, so "as long as it would take to listen to it, plus a
+    minute" never stops a healthy run, however long the clip is.
+    """
+    return int(min(_CLIP_TIMEOUT_MAX_SEC, max(_CLIP_TIMEOUT_MIN_SEC, 60.0 + clip_end_sec)))
+
+
 def clip_audio_worker(
     filepath: str | Path,
     s_time: float,
@@ -160,16 +175,28 @@ def clip_audio_worker(
     try:
         dur = max(0.01, e_time - s_time)
         audio_filter = clip_filter_chain(dur, gain_db, soften, fade_sec)
+        timeout = _clip_timeout_sec(e_time)
 
-        result = run_ffmpeg(_clip_args(source, s_time, dur, audio_filter, wav, "copy") + [str(tmp_save)])
-        if result.returncode != 0 and not wav:
+        result = run_ffmpeg(
+            _clip_args(source, s_time, dur, audio_filter, wav, "copy") + [str(tmp_save)], timeout=timeout
+        )
+        if result.returncode != 0 and not wav and not ffmpeg_timed_out(result):
             # Retry transcoding video stream to mjpeg in case source art was PNG
             with contextlib.suppress(OSError):
                 tmp_save.unlink()
-            result = run_ffmpeg(_clip_args(source, s_time, dur, audio_filter, wav, "mjpeg") + [str(tmp_save)])
+            result = run_ffmpeg(
+                _clip_args(source, s_time, dur, audio_filter, wav, "mjpeg") + [str(tmp_save)], timeout=timeout
+            )
         if result.returncode != 0 or not _has_content(tmp_save):
             with contextlib.suppress(OSError):
                 tmp_save.unlink()
+            # The fallback decodes the whole song into memory, so it is kept for what it can help
+            # with: a normal-sized song that FFmpeg rejected. A run that timed out would only take
+            # even longer this way, and a long recording would not fit in memory.
+            if ffmpeg_timed_out(result):
+                raise RuntimeError(str(result.stderr))
+            if Path(source).stat().st_size > _FALLBACK_MAX_BYTES:
+                raise RuntimeError(f"FFmpeg could not clip {Path(source).name}: {str(result.stderr)[-300:]}")
             audio = AudioSegment.from_file(source)
             clipped = audio[s_time * 1000 : e_time * 1000]
             if abs(gain_db) > 0.05:

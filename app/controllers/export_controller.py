@@ -93,9 +93,12 @@ class ExportController:
         on_cancelled: Callable[[int, int], None] | None = None,
         clear_existing: bool = False,
     ) -> None:
-        """Launch background USB export worker into the playlist's folder on the drive."""
+        """Launch background USB export worker into the playlist's folder on the drive.
+
+        Nothing on the drive is touched here: the worker creates the folder, so a drive that cannot
+        be written is reported through ``on_error`` like any other export failure.
+        """
         pl_dest = self.usb_playlist_folder(dest_folder, playlist_name)
-        os.makedirs(pl_dest, exist_ok=True)
         task_mgr.submit_task(
             usb_export_worker,
             pl_dest,

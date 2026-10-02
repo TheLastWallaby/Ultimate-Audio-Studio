@@ -3,7 +3,8 @@
 Native Windows message boxes ignore the app's Text Size setting (they always use the ~9pt system
 font) and can only offer Yes/No/Cancel, which forces people to map a question onto those words.
 These dialogs use the app's named fonts, so they grow with Text Size, and every button says what
-it does ("Download all 23 songs", "Just this song").
+it does ("Download all 23 songs", "Just this song"). ``ask_text`` does the same for the small
+"type a name" prompts, which ``tkinter.simpledialog`` shows in the system font with OK/Cancel.
 
 Call sites use ``dialogs.ask_yes_no(...)`` (module attribute access) so tests can patch
 ``app.ui.dialogs.<function>``.
@@ -15,13 +16,16 @@ import contextlib
 import functools
 import tkinter as tk
 import tkinter.font as tkfont
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from app.ui.components import create_button
 from app.ui.theme import (
     BG_CARD,
+    BG_INPUT,
+    BORDER_FOCUS,
+    BORDER_MAIN,
     COLOR_ACCENT,
     COLOR_ACCENT_HV,
     COLOR_BTN_NEUTRAL,
@@ -34,7 +38,7 @@ from app.ui.theme import (
     TEXT_DARK,
 )
 
-__all__ = ["DialogButton", "ask_choice", "ask_yes_no", "show_info", "show_warning"]
+__all__ = ["TEXT_OK", "DialogButton", "TextAnswer", "ask_choice", "ask_text", "ask_yes_no", "show_info", "show_warning"]
 
 ButtonKind = Literal["primary", "neutral", "danger"]
 
@@ -60,6 +64,18 @@ class DialogButton:
     kind: ButtonKind = "neutral"
 
 
+# ``TextAnswer.value`` when the main button of ``ask_text`` was clicked.
+TEXT_OK = "ok"
+
+
+@dataclass(slots=True, frozen=True)
+class TextAnswer:
+    """What ``ask_text`` returned: the typed ``text`` (trimmed) and the ``value`` of the clicked button."""
+
+    text: str
+    value: str = TEXT_OK
+
+
 def ask_choice(
     parent: tk.Misc,
     title: str,
@@ -76,16 +92,7 @@ def ask_choice(
     (the first button when not given). Two buttons sit side by side; three or more are stacked
     full-width so every label stays readable at large text sizes.
     """
-    top = parent.winfo_toplevel()
-    win = tk.Toplevel(top)
-    win.title(title)
-    win.configure(bg=BG_CARD)
-    win.resizable(False, False)
-    # A dialog made transient to a hidden window (e.g. at start-up) would be hidden too.
-    if top.winfo_viewable():
-        with contextlib.suppress(tk.TclError):
-            win.transient(top)
-
+    win, top, body = _open_dialog(parent, title, message, icon)
     result: list[str | None] = [cancel_value]
     done = [False]
 
@@ -99,53 +106,15 @@ def ask_choice(
             win.grab_release()
         win.destroy()
 
-    body = tk.Frame(win, bg=BG_CARD, padx=22, pady=18)
-    body.pack(fill=tk.BOTH, expand=True)
-    tk.Label(body, text=f"{icon}  {title}", font=FONT_APP_TITLE, fg=TEXT_DARK, bg=BG_CARD, anchor="w").pack(
-        fill=tk.X, pady=(0, 10)
-    )
-    wrap = tkfont.nametofont(FONT_BODY, root=win).measure("0") * _WRAP_CHARS
-    tk.Label(body, text=message, font=FONT_BODY, fg=TEXT_DARK, bg=BG_CARD, justify="left", wraplength=wrap).pack(
-        anchor="w", pady=(0, 16)
-    )
-
-    row = tk.Frame(body, bg=BG_CARD)
-    row.pack(fill=tk.X)
-    stacked = len(buttons) > 2
     default_value = default if default is not None else (buttons[0].value if buttons else cancel_value)
-    focus_button: tk.Button | None = None
-    # Side by side, the first button is packed rightmost so the main action sits bottom-right.
-    for spec in buttons:
-        bg, fg, hover = _BUTTON_COLORS[spec.kind]
-        btn = create_button(
-            row,
-            spec.label,
-            functools.partial(_finish, spec.value),
-            bg=bg,
-            fg=fg,
-            hover_bg=hover,
-            font=FONT_BTN_MAIN,
-            padx=18,
-            pady=8,
-        )
-        if stacked:
-            btn.pack(fill=tk.X, pady=(0, 6))
-        else:
-            btn.pack(side=tk.RIGHT, padx=(8, 0))
-        if spec.value == default_value:
-            focus_button = btn
+    placed = _place_buttons(body, [(spec, functools.partial(_finish, spec.value)) for spec in buttons])
+    focus_button = next((btn for spec, btn in zip(buttons, placed, strict=True) if spec.value == default_value), None)
 
     win.protocol("WM_DELETE_WINDOW", lambda: _finish(cancel_value))
     win.bind("<Escape>", lambda _e: _finish(cancel_value))
     win.bind("<Return>", lambda _e: _finish(default_value))
 
-    _center_over(win, top)
-    if focus_button is not None:
-        focus_button.focus_set()
-    with contextlib.suppress(tk.TclError):
-        win.grab_set()
-    win.lift()
-    win.wait_window()
+    _run_modal(win, top, focus_button)
     return result[0]
 
 
@@ -181,6 +150,134 @@ def show_info(parent: tk.Misc, title: str, message: str, *, button: str = "OK", 
 def show_warning(parent: tk.Misc, title: str, message: str, *, button: str = "OK") -> None:
     """Warning message with a single button."""
     show_info(parent, title, message, button=button, icon=ICON_WARNING)
+
+
+def ask_text(
+    parent: tk.Misc,
+    title: str,
+    message: str,
+    *,
+    ok: str,
+    initial: str = "",
+    cancel: str = "Cancel",
+    extra: Sequence[DialogButton] = (),
+    icon: str = ICON_QUESTION,
+) -> TextAnswer | None:
+    """Ask for a short text such as a name or a time; None when the dialog was cancelled.
+
+    ``ok`` is the main button and needs some text: clicked with an empty box, it asks for the text
+    and the dialog stays open. ``extra`` buttons are other ways to answer that do not use the text
+    (for example "Replace the original song"); the answer's ``value`` says which button was clicked.
+    Enter clicks ``ok``; Escape or closing the window cancels.
+    """
+    win, top, body = _open_dialog(parent, title, message, icon)
+    result: list[TextAnswer | None] = [None]
+    done = [False]
+
+    entry = tk.Entry(
+        body,
+        font=FONT_BODY,
+        bg=BG_INPUT,
+        fg=TEXT_DARK,
+        insertbackground=TEXT_DARK,
+        relief=tk.FLAT,
+        highlightthickness=2,
+        highlightbackground=BORDER_MAIN,
+        highlightcolor=BORDER_FOCUS,
+    )
+    entry.insert(0, initial)
+    entry.select_range(0, tk.END)  # typing replaces the suggestion, so nothing has to be deleted first
+    entry.pack(fill=tk.X, ipady=4)
+    hint = tk.Label(body, text="", font=FONT_BODY, fg=COLOR_STOP, bg=BG_CARD, anchor="w")
+    hint.pack(fill=tk.X, pady=(2, 10))
+
+    def _finish(answer: TextAnswer | None) -> None:
+        # Enter on a focused button also reaches the window's <Return> binding: the first call wins.
+        if done[0]:
+            return
+        done[0] = True
+        result[0] = answer
+        with contextlib.suppress(tk.TclError):
+            win.grab_release()
+        win.destroy()
+
+    def _submit(value: str) -> None:
+        if done[0]:
+            return
+        text = entry.get().strip()
+        if value == TEXT_OK and not text:
+            hint.config(text="Please type something in the box first.")
+            entry.focus_set()
+            return
+        _finish(TextAnswer(text, value))
+
+    specs = [DialogButton(ok, TEXT_OK, "primary"), *extra]
+    actions = [(spec, functools.partial(_submit, spec.value)) for spec in specs]
+    actions.append((DialogButton(cancel, ""), functools.partial(_finish, None)))
+    _place_buttons(body, actions)
+
+    win.protocol("WM_DELETE_WINDOW", lambda: _finish(None))
+    win.bind("<Escape>", lambda _e: _finish(None))
+    win.bind("<Return>", lambda _e: _submit(TEXT_OK))
+
+    _run_modal(win, top, entry)
+    return result[0]
+
+
+def _open_dialog(parent: tk.Misc, title: str, message: str, icon: str) -> tuple[tk.Toplevel, tk.Misc, tk.Frame]:
+    """Create a dialog window with its heading and message; returns (window, app window, content frame)."""
+    top = parent.winfo_toplevel()
+    win = tk.Toplevel(top)
+    win.title(title)
+    win.configure(bg=BG_CARD)
+    win.resizable(False, False)
+    # A dialog made transient to a hidden window (e.g. at start-up) would be hidden too.
+    if top.winfo_viewable():
+        with contextlib.suppress(tk.TclError):
+            win.transient(top)
+
+    body = tk.Frame(win, bg=BG_CARD, padx=22, pady=18)
+    body.pack(fill=tk.BOTH, expand=True)
+    tk.Label(body, text=f"{icon}  {title}", font=FONT_APP_TITLE, fg=TEXT_DARK, bg=BG_CARD, anchor="w").pack(
+        fill=tk.X, pady=(0, 10)
+    )
+    wrap = tkfont.nametofont(FONT_BODY, root=win).measure("0") * _WRAP_CHARS
+    tk.Label(body, text=message, font=FONT_BODY, fg=TEXT_DARK, bg=BG_CARD, justify="left", wraplength=wrap).pack(
+        anchor="w", pady=(0, 16)
+    )
+    return win, top, body
+
+
+def _place_buttons(body: tk.Frame, actions: Sequence[tuple[DialogButton, Callable[[], None]]]) -> list[tk.Button]:
+    """Add the buttons under the dialog's content, in the order given; returns them in that order.
+
+    Two buttons sit side by side, the first one rightmost so the main action is bottom-right. Three
+    or more are stacked full-width so every label stays readable at large text sizes.
+    """
+    row = tk.Frame(body, bg=BG_CARD)
+    row.pack(fill=tk.X)
+    stacked = len(actions) > 2
+    placed = []
+    for spec, command in actions:
+        bg, fg, hover = _BUTTON_COLORS[spec.kind]
+        btn = create_button(row, spec.label, command, bg=bg, fg=fg, hover_bg=hover, font=FONT_BTN_MAIN, padx=18, pady=8)
+        if stacked:
+            btn.pack(fill=tk.X, pady=(0, 6))
+        else:
+            btn.pack(side=tk.RIGHT, padx=(8, 0))
+        placed.append(btn)
+    return placed
+
+
+def _run_modal(win: tk.Toplevel, top: tk.Misc, focus: tk.Misc | None) -> None:
+    """Show the dialog over the app window and wait until it is closed."""
+    _center_over(win, top)
+    if focus is not None:
+        focus.focus_set()
+    with contextlib.suppress(tk.TclError):
+        win.grab_set()
+    win.lift()
+    win.wait_window()
 
 
 def _center_over(win: tk.Toplevel, top: tk.Misc) -> None:

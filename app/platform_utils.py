@@ -11,6 +11,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from app.core.config import get_settings
@@ -278,6 +279,48 @@ def activate_existing_window(title_prefix: str) -> bool:
     except Exception as e:
         logger.debug("activate_existing_window failed: %s", e)
         return False
+
+
+def is_on_a_monitor(left: int, top: int, right: int, bottom: int) -> bool:
+    """True when the rectangle (screen pixels) overlaps a monitor that is connected right now.
+
+    A position saved while a second screen or a TV was attached lies outside every monitor once
+    that screen is gone. Platforms without this check answer True (the position is then trusted).
+    """
+    if os.name != "nt":
+        return True
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromRect.restype = wintypes.HANDLE
+    user32.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+    rect = wintypes.RECT(left, top, right, bottom)
+    monitor_default_to_null = 0
+    return bool(user32.MonitorFromRect(ctypes.byref(rect), monitor_default_to_null))
+
+
+def kill_process_tree(proc: subprocess.Popen[bytes], timeout_sec: float = 15.0) -> None:
+    """Stop a process and every process it started, and wait until it has gone.
+
+    The packaged (one-file) app runs as two processes: the one that was started unpacks the app and
+    starts the second. Killing only the first would leave the second running with the .exe locked.
+    """
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+        try:
+            subprocess.run(
+                [str(taskkill), "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=timeout_sec,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as err:
+            logger.warning("taskkill of process %s failed: %s", proc.pid, err)
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=timeout_sec)
 
 
 _ES_CONTINUOUS = 0x80000000

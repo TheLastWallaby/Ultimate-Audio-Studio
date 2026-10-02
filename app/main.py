@@ -51,6 +51,7 @@ from app.platform_utils import (
     activate_existing_window,
     already_running,
     enable_windows_dpi,
+    is_on_a_monitor,
     release_instance_mutex,
     set_keep_awake,
     signal_named_event,
@@ -67,7 +68,7 @@ from app.services.updater import (
 from app.ui import dialogs
 from app.ui.components import ScrollableFrame, ToolTip, create_button
 from app.ui.error_dialog import show_error
-from app.ui.features.base import UiCallback
+from app.ui.features.base import UNDO_SECONDS, UiCallback
 from app.ui.features.clip_editor import ClipEditorMixin
 from app.ui.features.download import DownloadMixin
 from app.ui.features.export import ExportMixin
@@ -108,6 +109,33 @@ STATUS_BAR_BG = "#0f172a"
 # The window title starts with this; a second start finds the open window by it.
 WINDOW_TITLE_PREFIX = "Ultimate Audio Studio v"
 STATUS_FLASH_MS = 5000
+
+# A saved window size below this is not restored (the three columns would not fit).
+MIN_RESTORED_WIDTH, MIN_RESTORED_HEIGHT = 1020, 600
+# The part of the title bar that must be on a screen for the window to be seen and dragged:
+# this far in from both sides, and this tall.
+TITLE_BAR_INSET, TITLE_BAR_HEIGHT = 80, 40
+_GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)(?:\+(-?\d+)\+(-?\d+))?")
+
+
+def restorable_geometry(geometry: str | None) -> str | None:
+    """The saved window geometry if the window would be usable there, else None (use the default).
+
+    A window last closed on a second monitor or a TV that is no longer connected would otherwise
+    open off-screen, where it can neither be seen nor dragged back: the app would seem not to start.
+    """
+    match = _GEOMETRY_RE.match(str(geometry or ""))
+    if match is None:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    if width < MIN_RESTORED_WIDTH or height < MIN_RESTORED_HEIGHT:
+        return None
+    if match.group(3) is None:
+        return f"{width}x{height}"  # no position saved: Windows places the window
+    left, top = int(match.group(3)), int(match.group(4))
+    if not is_on_a_monitor(left + TITLE_BAR_INSET, top, left + width - TITLE_BAR_INSET, top + TITLE_BAR_HEIGHT):
+        return None
+    return str(geometry)
 
 
 class UltimateAudioStudio(
@@ -345,37 +373,19 @@ class UltimateAudioStudio(
         self.root.report_callback_exception = hook
 
     def _load_settings(self) -> None:
-        try:
-            s = settings_mgr.get_settings()
-            if s.library_folder and os.path.isdir(s.library_folder):
-                self.library_folder = s.library_folder
-            self._saved_volume = s.volume
-            self._saved_repeat = s.repeat_playlist
-            self._saved_soften = s.soften_clip
-            self._saved_fade_choice = s.fade_choice
-            self._saved_even = s.even_volume
-            self._saved_auto_level_playback = s.auto_level_playback
-            self.text_size = s.text_size if s.text_size in TEXT_SIZES else DEFAULT_TEXT_SIZE
-            self._saved_active_playlist = s.active_playlist
-            geo = s.geometry
-            if geo:
-                m = re.match(r"^(\d+)x(\d+)", str(geo))
-                if m and int(m.group(1)) >= 1020 and int(m.group(2)) >= 600:
-                    self._saved_geometry = geo
-                else:
-                    self._saved_geometry = None
-            else:
-                self._saved_geometry = None
-        except Exception:
-            self._saved_volume = 80
-            self._saved_repeat = False
-            self._saved_soften = True
-            self._saved_fade_choice = "1.5s (Standard)"
-            self._saved_even = True
-            self._saved_auto_level_playback = False
-            self._saved_geometry = None
-            self.text_size = DEFAULT_TEXT_SIZE
-            self._saved_active_playlist = ""
+        """Copy the saved preferences into the attributes the window is built from."""
+        s = settings_mgr.get_settings()  # never raises: an unreadable file gives the defaults
+        if s.library_folder and Path(s.library_folder).is_dir():
+            self.library_folder = s.library_folder
+        self._saved_volume = s.volume
+        self._saved_repeat = s.repeat_playlist
+        self._saved_soften = s.soften_clip
+        self._saved_fade_choice = s.fade_choice
+        self._saved_even = s.even_volume
+        self._saved_auto_level_playback = s.auto_level_playback
+        self.text_size = s.text_size if s.text_size in TEXT_SIZES else DEFAULT_TEXT_SIZE
+        self._saved_active_playlist = s.active_playlist
+        self._saved_geometry = restorable_geometry(s.geometry)
 
     def _schedule_settings_save(self, *_args: object) -> None:
         """Persist settings shortly after any change (debounced), so a crash loses nothing."""
@@ -721,18 +731,15 @@ class UltimateAudioStudio(
             command=self._on_undo_click,
         )
 
-    def show_undo(self, message: str, callback: Callable[[], None], timeout_sec: float = 8) -> None:
-        """Display an Undo button in the status bar for accidental deletions/removals."""
+    def show_undo(self, message: str, callback: Callable[[], None], timeout_sec: float = UNDO_SECONDS) -> None:
+        """Offer Undo in the status bar for ``timeout_sec`` seconds after a deletion or removal."""
         self._undo_callback = callback
         if self._undo_timer:
-            try:
+            with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(self._undo_timer)
-            except Exception:
-                pass
             self._undo_timer = None
 
-        if hasattr(self, "btn_undo"):
-            self.btn_undo.pack(side=tk.RIGHT, padx=(8, 4))
+        self.btn_undo.pack(side=tk.RIGHT, padx=(8, 4))
         self.set_status(message, icon="🗑️")
 
         def _expire() -> None:
@@ -931,7 +938,8 @@ def _install_pending_update_at_startup() -> str | None:
     """Install a release downloaded during an earlier session, before any window opens.
 
     On success this process exits (the new version takes over). Returns a message for the user when
-    the new version failed to start and the current one was restored, else None.
+    the new version could not be installed or failed to start (this version then keeps running),
+    else None. Either way that release is not tried again at the next start.
     """
     if not getattr(sys, "frozen", False):
         return None
@@ -943,7 +951,7 @@ def _install_pending_update_at_startup() -> str | None:
         return None
     result = install_update(pending.exe_path, pending.tag)
     already_running()  # take the single-instance lock back (it was released for the new version)
-    return result.message if result.rolled_back else None
+    return result.message
 
 
 def _exit_process() -> None:

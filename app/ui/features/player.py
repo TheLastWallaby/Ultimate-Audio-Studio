@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import logging
 import os
 import subprocess
 import threading
@@ -23,6 +25,17 @@ from app.ui.components import draw_placeholder_cover
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 from app.ui.theme import BORDER_MAIN, COLOR_ACCENT, COLOR_PAUSE, COLOR_PLAY
+
+logger = logging.getLogger(__name__)
+
+MONITOR_INTERVAL_MS = 40
+# After a failed tick the monitor slows down, so a fault that keeps happening cannot flood the log.
+MONITOR_RETRY_MS = 1000
+# The mixer says when a song has ended. The clock is only a fallback for a mixer that never does,
+# and only for a song whose length is known: an unknown length is 0, which the clock has always passed.
+END_OF_SONG_GRACE_SEC = 2.0
+# PLAY this close to the end of a song (it finished, or the slider was dragged there) starts it again.
+REPLAY_FROM_START_SEC = 0.5
 
 
 class PlayerMixin(AppBase):
@@ -469,12 +482,15 @@ class PlayerMixin(AppBase):
                 self._draw_vu_meter(0)
 
     def play_main(self) -> None:
+        """PLAY: switch to a song clicked meanwhile, resume a paused one, or play from the slider."""
         if self._selection_debounce_timer:
-            try:
+            with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(self._selection_debounce_timer)
-            except Exception:
-                pass
             self._selection_debounce_timer = None
+        if self._pending_library_song:
+            # A Library song was clicked while this one played: PLAY means "play what I clicked".
+            self.stop_audio()
+            self._load_pending_selection()
         if not self.selected_file_path:
             dialogs.show_warning(self.root, "No Song", "Click a song in the Library first.")
             return
@@ -484,19 +500,30 @@ class PlayerMixin(AppBase):
         self.stop_audio()
         path = self.selected_file_path
         start_pos = float(self.scale_progress.get())
+        if self.track_duration > 0 and start_pos >= self.track_duration - REPLAY_FROM_START_SEC:
+            start_pos = 0.0  # starting at the very end would play nothing
 
         def _start() -> None:
             if self.selected_file_path != path:
                 return
             try:
                 self.playback_ctrl.play_track(path, start_pos, is_playlist=False)
-                self._set_card_playing_state("playing")
-                self.set_status(f"Playing: {os.path.basename(path)}", icon="▶")
-            except Exception as e:
-                log_error(f"play_main: {e}")
-                show_friendly_error(self.root, e, "playback")
+            except (pygame.error, OSError) as err:
+                logger.error("Could not play %s: %s", Path(path).name, err)
+                show_friendly_error(self.root, err, "playback")
+                return
+            self._set_card_playing_state("playing")
+            self.set_status(f"Playing: {Path(path).name}", icon="▶")
 
         self._when_playable(path, _start)
+
+    def stop_pressed(self) -> None:
+        """STOP button: stop, go back to the start, and load a Library song that was clicked meanwhile."""
+        self.stop_audio(user=True)
+        if self._load_pending_selection() and self.selected_file_path:
+            self.set_status(
+                f"Stopped. '{Path(self.selected_file_path).name}' is ready: press PLAY to listen.", icon="⏹"
+            )
 
     def pause_audio(self) -> None:
         if not self.selected_file_path:
@@ -541,49 +568,69 @@ class PlayerMixin(AppBase):
             self.refresh_playlist_listbox()
         self._render_waveform()
 
-    def _song_finished(self) -> None:
-        if self.is_paused:
-            return
-        if self.previewing_clip and hasattr(self, "loop_clip") and self.loop_clip.get():
+    def _finish_clip_preview(self) -> None:
+        """A Test Clip preview reached its end: loop it when Loop is ticked, otherwise stop."""
+        if self.loop_clip.get():
             self._restart_clip_loop()
             return
-        if self.is_playing_playlist:
+        self.stop_audio(user=False)
+        self.set_status("Finished previewing clip.")
+
+    def _song_finished(self) -> None:
+        """The audio ran out: loop the clip, play the next playlist song, or go back to the start."""
+        if self.is_paused:
+            return
+        if self.previewing_clip:
+            self._finish_clip_preview()
+        elif self.is_playing_playlist:
             self.play_next_in_playlist()
         elif self.is_playing_main:
-            self.is_playing_main = False
-            self.play_clock_origin = None
-            self._set_card_playing_state("stopped")
-            self.set_status("Playback finished.")
+            # Like the STOP button, this returns the slider to the start: PLAY begins at the slider,
+            # so leaving it at the end made the next PLAY do nothing.
+            self.stop_audio(user=True)
+            if self._load_pending_selection() and self.selected_file_path:
+                ready = Path(self.selected_file_path).name
+                self.set_status(f"Playback finished. '{ready}' is ready: press PLAY to listen.")
+            else:
+                self.set_status("Playback finished. Press PLAY to hear it again.")
+
+    def _clock_passed_end(self) -> bool:
+        """True when the clock is well past the end of a song whose length is known (see END_OF_SONG_GRACE_SEC)."""
+        if self.track_duration <= 0:
+            return False
+        return self.audio_engine.current_play_seconds() >= self.track_duration + END_OF_SONG_GRACE_SEC
+
+    def _monitor_tick(self) -> None:
+        """Move the timeline and the level meter, and notice the end of the song or clip preview."""
+        if not (self.is_playing_main or self.is_playing_playlist) or self.is_paused:
+            return
+        curr_pos = self._current_play_seconds()
+        if not self._progress_dragging:
+            self._updating_ui = True
+            self.scale_progress.set(curr_pos)
+            self.lbl_prog_time.config(text=self._prog_label(curr_pos))
+            self._updating_ui = False
             self._render_waveform()
+        self._draw_vu_meter(self.playback_ctrl.calculate_vu_level(curr_pos, self.track_duration, self._current_peaks))
+
+        if self.previewing_clip and curr_pos >= self.clip_end_time - 0.05:
+            self._finish_clip_preview()
+        elif time.monotonic() < self.play_guard_until:
+            return  # just loaded or moved: the mixer does not report busy yet
+        elif not self.audio_engine.is_busy() or self._clock_passed_end():
+            self._song_finished()
 
     def monitor_audio(self) -> None:
-        if not getattr(self, "_is_shutting_down", False):
-            if (self.is_playing_main or self.is_playing_playlist) and not self.is_paused:
-                curr_pos = self._current_play_seconds()
-                if not self._progress_dragging:
-                    self._updating_ui = True
-                    self.scale_progress.set(curr_pos)
-                    self.lbl_prog_time.config(text=self._prog_label(curr_pos))
-                    self._updating_ui = False
-                    self._render_waveform()
-
-                if hasattr(self, "playback_ctrl"):
-                    vu_lvl = self.playback_ctrl.calculate_vu_level(curr_pos, self.track_duration, self._current_peaks)
-                    self._draw_vu_meter(vu_lvl)
-
-                if self.previewing_clip and curr_pos >= (self.clip_end_time - 0.05):
-                    if hasattr(self, "loop_clip") and self.loop_clip.get():
-                        self._restart_clip_loop()
-                    else:
-                        self.stop_audio(user=False)
-                        self.set_status("Finished previewing clip.")
-                        self._render_waveform()
-                else:
-                    # The play guard covers the moment after load/seek when the mixer is not busy yet.
-                    if time.monotonic() >= self.play_guard_until and (
-                        not self.audio_engine.is_busy() or curr_pos >= (self.track_duration - 0.05)
-                    ):
-                        self._song_finished()
-
-            if hasattr(self, "root") and self.root and self.root.winfo_exists():
-                self._monitor_timer = self.root.after(40, self.monitor_audio)
+        """Run the playback monitor every 40 ms for as long as the window is open."""
+        if self._is_shutting_down:
+            return
+        delay = MONITOR_INTERVAL_MS
+        try:
+            self._monitor_tick()
+        except Exception:  # last-resort guard: one failed tick must not freeze the timeline for good
+            if not self._is_shutting_down:
+                logger.exception("The playback monitor failed; it will try again shortly")
+            delay = MONITOR_RETRY_MS
+        if not self._is_shutting_down:
+            with contextlib.suppress(tk.TclError):
+                self._monitor_timer = self.root.after(delay, self.monitor_audio)

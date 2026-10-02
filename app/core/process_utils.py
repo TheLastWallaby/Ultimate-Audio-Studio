@@ -94,7 +94,16 @@ class CancelToken(Protocol):
 
 
 CANCELLED_STDERR = "FFmpeg was stopped because the task was cancelled."
+_TIMED_OUT_STDERR = "FFmpeg execution timed out"
 _CANCEL_POLL_SEC = 0.25
+
+
+def ffmpeg_timed_out(result: subprocess.CompletedProcess[str] | ProcessResult) -> bool:
+    """True when ``run_ffmpeg`` stopped FFmpeg because it reached its timeout.
+
+    Running the same job again would only time out again, so callers use this to skip their retries.
+    """
+    return result.returncode == -1 and str(result.stderr).startswith(_TIMED_OUT_STDERR)
 
 
 def run_ffmpeg(
@@ -128,20 +137,11 @@ def run_ffmpeg(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        msg = f"run_ffmpeg timed out after {timeout}s: {' '.join(str(a) for a in args[:6])}"
-        logger.error(msg)
-        return ProcessResult(
-            returncode=-1,
-            stdout="",
-            stderr=f"FFmpeg execution timed out after {timeout} seconds.",
-        )
-    except Exception as e:
-        logger.error("run_ffmpeg exception: %s", e)
-        return ProcessResult(
-            returncode=-1,
-            stdout="",
-            stderr=str(e),
-        )
+        logger.error("run_ffmpeg timed out after %ss: %s", timeout, " ".join(str(a) for a in args[:6]))
+        return ProcessResult(returncode=-1, stdout="", stderr=f"{_TIMED_OUT_STDERR} after {timeout} seconds.")
+    except (OSError, ValueError) as err:  # FFmpeg could not be started
+        logger.error("run_ffmpeg could not start FFmpeg: %s", err)
+        return ProcessResult(returncode=-1, stdout="", stderr=str(err))
 
 
 def _run_cancellable(cmd: list[str], timeout: int, cancel_event: CancelToken) -> ProcessResult:
@@ -156,9 +156,9 @@ def _run_cancellable(cmd: list[str], timeout: int, cancel_event: CancelToken) ->
             errors="replace",
             creationflags=CREATE_NO_WINDOW,
         )
-    except Exception as e:
-        logger.error("run_ffmpeg exception: %s", e)
-        return ProcessResult(returncode=-1, stdout="", stderr=str(e))
+    except (OSError, ValueError) as start_err:  # FFmpeg could not be started
+        logger.error("run_ffmpeg could not start FFmpeg: %s", start_err)
+        return ProcessResult(returncode=-1, stdout="", stderr=str(start_err))
     with proc:
         deadline = time.monotonic() + timeout
         while True:
@@ -174,6 +174,4 @@ def _run_cancellable(cmd: list[str], timeout: int, cancel_event: CancelToken) ->
                 if cancelled:
                     return ProcessResult(returncode=-1, stdout="", stderr=CANCELLED_STDERR)
                 logger.error("run_ffmpeg timed out after %ss: %s", timeout, " ".join(cmd[1:7]))
-                return ProcessResult(
-                    returncode=-1, stdout="", stderr=f"FFmpeg execution timed out after {timeout} seconds."
-                )
+                return ProcessResult(returncode=-1, stdout="", stderr=f"{_TIMED_OUT_STDERR} after {timeout} seconds.")
