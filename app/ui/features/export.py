@@ -209,13 +209,15 @@ class ExportMixin(AppBase):
 
     def _export_to_cd(self, files: list[str], normalize: bool) -> None:
         cd_folder = self.export_ctrl.get_cd_burn_folder()
-        existing_cd_files = self.export_ctrl.get_cd_existing_files(cd_folder)
-        if existing_cd_files:
+        # Only tracks this app made count (and are ever removed); other files in the folder are the user's.
+        previous = self.export_ctrl.previous_export_files(cd_folder)
+        clear_existing = False
+        if previous:
             answer = dialogs.ask_choice(
                 self.root,
                 "Previous CD Files Found",
-                f"The CD folder ('My_CD_Burn_Folder' on your Desktop) still has {len(existing_cd_files)} "
-                "file(s) from an earlier export.",
+                f"The CD folder ('My_CD_Burn_Folder' on your Desktop) still has {len(previous)} "
+                "track(s) from an earlier export.",
                 [
                     dialogs.DialogButton("Remove them and start fresh", "clear", "primary"),
                     dialogs.DialogButton("Keep them and add these", "keep"),
@@ -225,8 +227,8 @@ class ExportMixin(AppBase):
             )
             if answer == "cancel":
                 return
-            if answer == "clear":
-                self.export_ctrl.clear_cd_folder(cd_folder)
+            # Nothing is removed here: the export job does it, once every question has been answered.
+            clear_existing = answer == "clear"
 
         # 80-minute CD capacity validation
         total_sec = self.export_ctrl.get_playlist_duration(files, self._cached_duration_only)
@@ -252,6 +254,7 @@ class ExportMixin(AppBase):
             on_error=lambda err: self._safe_after(0, self._export_error, err),
             is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
             on_cancelled=lambda done, tot: self._safe_after(0, self._export_cancelled, done, tot, "CD"),
+            clear_existing=clear_existing,
         )
 
     def _begin_export(self, button_text: str, status: str) -> None:

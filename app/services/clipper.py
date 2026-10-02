@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from pydub import AudioSegment
 
@@ -27,6 +29,8 @@ __all__ = [
     "original_backup_path",
     "restore_original",
 ]
+
+logger = logging.getLogger(__name__)
 
 ORIGINAL_BACKUP_SUFFIX = ".original.bak"
 
@@ -50,6 +54,29 @@ def _replace_with_retry(src: str, dest: str) -> None:
         except PermissionError:
             time.sleep(0.08 * (attempt + 1))
     os.replace(src, dest)
+
+
+def _ensure_original_backup(song: Path) -> Path:
+    """Keep a complete copy of the untrimmed song before a clip replaces it; returns the backup.
+
+    The first original is kept across re-trims. The copy is written under a temporary name and only
+    then renamed, so an interrupted copy is never mistaken for a backup. Raises OSError when no
+    complete backup exists afterwards; the caller must then leave the song untouched.
+    """
+    backup = Path(original_backup_path(str(song)))
+    if backup.is_file() and backup.stat().st_size > 0:
+        return backup
+    partial = backup.with_name(f"{backup.name}.{os.getpid()}.partial")
+    try:
+        shutil.copy2(song, partial)
+        if partial.stat().st_size != song.stat().st_size:
+            raise OSError(f"the backup copy of {song.name} is incomplete")
+        _replace_with_retry(str(partial), str(backup))
+    except OSError as err:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise OSError(f"The original song could not be backed up, so it was left unchanged ({err})") from err
+    return backup
 
 
 def restore_original(song_path: str) -> None:
@@ -117,11 +144,15 @@ def _clip_args(filepath: str, s_time: float, dur: float, audio_filter: str, wav:
     return args + mp3_output_args("copy" if cover == "copy" else "mjpeg")
 
 
+def _has_content(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
 def clip_audio_worker(
-    filepath: str,
+    filepath: str | Path,
     s_time: float,
     e_time: float,
-    save_name: str,
+    save_name: str | Path,
     soften: bool = False,
     gain_db: float = 0.0,
     is_self_overwrite: bool = False,
@@ -129,27 +160,33 @@ def clip_audio_worker(
     on_error: Callable[[str], None] | None = None,
     fade_sec: float = 1.5,
 ) -> None:
-    """Export sample-accurate clipped audio file with backup protection and Windows lock retries."""
-    save_dir = os.path.dirname(os.path.abspath(save_name))
-    os.makedirs(save_dir, exist_ok=True)
-    wav = save_name.lower().endswith(".wav")
+    """Export sample-accurate clipped audio file with backup protection and Windows lock retries.
+
+    When the clip replaces the song it was cut from, the song is only replaced once a complete
+    backup of the original exists; otherwise the save fails and the song is left as it was.
+    """
+    source = str(filepath)
+    target = Path(save_name)
+    save_dir = target.absolute().parent
+    save_dir.mkdir(parents=True, exist_ok=True)
+    wav = target.suffix.lower() == ".wav"
     tmp_ext = ".wav" if wav else ".mp3"
-    tmp_save = os.path.join(save_dir, f".clip_tmp_{os.getpid()}_{int(time.time() * 1000)}{tmp_ext}")
+    tmp_save = save_dir / f".clip_tmp_{os.getpid()}_{int(time.time() * 1000)}{tmp_ext}"
 
     try:
         dur = max(0.01, e_time - s_time)
         audio_filter = clip_filter_chain(dur, gain_db, soften, fade_sec)
 
-        result = run_ffmpeg(_clip_args(filepath, s_time, dur, audio_filter, wav, "copy") + [tmp_save])
+        result = run_ffmpeg(_clip_args(source, s_time, dur, audio_filter, wav, "copy") + [str(tmp_save)])
         if result.returncode != 0 and not wav:
             # Retry transcoding video stream to mjpeg in case source art was PNG
             with contextlib.suppress(OSError):
-                os.remove(tmp_save)
-            result = run_ffmpeg(_clip_args(filepath, s_time, dur, audio_filter, wav, "mjpeg") + [tmp_save])
-        if result.returncode != 0 or not os.path.exists(tmp_save) or os.path.getsize(tmp_save) == 0:
+                tmp_save.unlink()
+            result = run_ffmpeg(_clip_args(source, s_time, dur, audio_filter, wav, "mjpeg") + [str(tmp_save)])
+        if result.returncode != 0 or not _has_content(tmp_save):
             with contextlib.suppress(OSError):
-                os.remove(tmp_save)
-            audio = AudioSegment.from_file(filepath)
+                tmp_save.unlink()
+            audio = AudioSegment.from_file(source)
             clipped = audio[s_time * 1000 : e_time * 1000]
             if abs(gain_db) > 0.05:
                 clipped = clipped + gain_db
@@ -158,32 +195,26 @@ def clip_audio_worker(
                 fade_ms = int(fade_dur * 1000)
                 clipped = clipped.fade_in(fade_ms).fade_out(fade_ms)
             if wav:
-                clipped.export(tmp_save, format="wav")
+                clipped.export(str(tmp_save), format="wav")
             else:
-                clipped.export(tmp_save, format="mp3", parameters=["-q:a", MP3_VBR_QUALITY])
+                clipped.export(str(tmp_save), format="mp3", parameters=["-q:a", MP3_VBR_QUALITY])
 
-        if not os.path.exists(tmp_save) or os.path.getsize(tmp_save) == 0:
+        if not _has_content(tmp_save):
             raise RuntimeError("Audio clipping produced an empty file.")
 
         if is_self_overwrite:
             time.sleep(0.05)
-            # Safeguard original file with automatic backup (the first original is kept across re-trims)
-            try:
-                bak_path = original_backup_path(save_name)
-                if not os.path.exists(bak_path):
-                    shutil.copy2(save_name, bak_path)
-            except Exception as bak_err:
-                log_error(f"backup original failed: {bak_err}")
+            # The original is the one thing that cannot be made again: no complete backup, no replace.
+            _ensure_original_backup(target)
 
         # Resilient file replace against Windows file indexing / antivirus locks
-        _replace_with_retry(tmp_save, save_name)
+        _replace_with_retry(str(tmp_save), str(target))
 
         if on_success:
-            on_success(os.path.basename(save_name), save_name, is_self_overwrite)
-    except Exception as e:
+            on_success(target.name, str(save_name), is_self_overwrite)
+    except Exception as e:  # last-resort guard: a worker must always report back to the window
         with contextlib.suppress(OSError):
-            if os.path.exists(tmp_save):
-                os.remove(tmp_save)
-        log_error(f"clip_audio_worker: {e}")
+            tmp_save.unlink()
+        logger.error("clip_audio_worker: %s", e)
         if on_error:
             on_error(str(e))

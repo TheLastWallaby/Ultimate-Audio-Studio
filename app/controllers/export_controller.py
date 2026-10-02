@@ -40,25 +40,6 @@ class ExportController:
         os.makedirs(cd_folder, exist_ok=True)
         return cd_folder
 
-    def get_cd_existing_files(self, cd_folder: str) -> list[str]:
-        """Return non-hidden files currently in CD burn folder."""
-        if not os.path.exists(cd_folder):
-            return []
-        try:
-            return [f for f in os.listdir(cd_folder) if not f.startswith(".")]
-        except Exception:
-            return []
-
-    def clear_cd_folder(self, cd_folder: str) -> None:
-        """Delete files from previous CD export."""
-        for f in self.get_cd_existing_files(cd_folder):
-            try:
-                f_path = os.path.join(cd_folder, f)
-                if os.path.isfile(f_path):
-                    os.remove(f_path)
-            except Exception:
-                pass
-
     @staticmethod
     def usb_playlist_folder(drive_root: str, playlist_name: str) -> str:
         """Folder on the drive that holds this playlist's songs."""
@@ -143,8 +124,9 @@ class ExportController:
         on_error: Callable[[str], None],
         is_shutting_down_fn: Callable[[], bool],
         on_cancelled: Callable[[int, int], None] | None = None,
+        clear_existing: bool = False,
     ) -> None:
-        """Launch background CD WAV export worker."""
+        """Launch background CD WAV export worker; ``clear_existing`` removes an earlier export's tracks first."""
         task_mgr.submit_task(
             cd_export_worker,
             cd_folder,
@@ -157,6 +139,7 @@ class ExportController:
             is_shutting_down_fn,
             cancel_event=self._new_job(),
             on_cancelled=on_cancelled,
+            clear_existing=clear_existing,
         )
 
     def eject_usb_drive(self, drive_root: str) -> tuple[bool, str]:
