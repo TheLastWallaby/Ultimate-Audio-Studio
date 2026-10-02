@@ -115,6 +115,16 @@ class AudioEngine:
             log_error(f"AudioEngine.get_playable_audio_path: {e}")
         return filepath
 
+    def prepare_for_playback(self, filepath: str) -> bool:
+        """Make ``filepath`` playable, converting it if needed; False when the conversion failed.
+
+        Slow (it can run FFmpeg for many seconds), so call it from a worker thread. Only start
+        playback when it returns True: ``load_and_play`` on a file that is still unconverted runs
+        the same failing conversion again, on the calling thread.
+        """
+        self.get_playable_audio_path(filepath)
+        return not self.needs_conversion(filepath)
+
     def _remember_playable(self, filepath: str, cached_wav: str) -> None:
         """Record a converted WAV in the bounded LRU cache, deleting evicted files."""
         evicted = []

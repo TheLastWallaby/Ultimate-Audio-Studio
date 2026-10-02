@@ -194,9 +194,9 @@ class TestUsbExport(unittest.TestCase):
             Path(dest, "my notes.txt").write_text("keep me", encoding="utf-8")
             Path(dest, "Holiday Photo.jpg").write_bytes(b"x")
             songs = self._make_songs(src, 1)
-            done: list[tuple[int, int, list[str]]] = []
-            exporter.usb_export_worker(dest, "Trip", songs, on_success=lambda *a: done.append(a), clear_existing=True)
-            self.assertEqual(done[0][:2], (1, 1))
+            done: list[exporter.ExportReport] = []
+            exporter.usb_export_worker(dest, "Trip", songs, on_success=done.append, clear_existing=True)
+            self.assertEqual((done[0].exported, done[0].total), (1, 1))
             self.assertEqual(
                 sorted(os.listdir(dest)),
                 sorted(["01 - song0.mp3", "00_Trip.m3u", "00_Trip.m3u8", "my notes.txt", "Holiday Photo.jpg"]),

@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydub import AudioSegment
@@ -39,6 +40,19 @@ _EXPORTED_PLAYLIST_RE = re.compile(r"^00_.+\.m3u8?$", re.IGNORECASE)
 ProgressFn = Callable[[float], None]
 StatusFn = Callable[[str], None]
 StopFn = Callable[[], bool]
+
+
+@dataclass(slots=True, frozen=True)
+class ExportReport:
+    """What an export did, so the window can report it truthfully."""
+
+    total: int  # songs in the playlist
+    exported: int  # songs now in the export folder
+    skipped: tuple[str, ...] = ()  # not exported (or an old file not removed), each with its reason
+    not_leveled: tuple[str, ...] = ()  # exported, but without the volume levelling that was asked for
+
+
+ReportFn = Callable[[ExportReport], None]
 
 
 def track_number_width(total: int) -> int:
@@ -191,7 +205,7 @@ def usb_export_worker(
     normalize: bool = False,
     on_progress: ProgressFn | None = None,
     on_status: StatusFn | None = None,
-    on_success: Callable[[int, int, list[str]], None] | None = None,
+    on_success: ReportFn | None = None,
     on_error: Callable[[str], None] | None = None,
     is_shutting_down_fn: StopFn | None = None,
     duration_fn: Callable[[str], float] | None = None,
@@ -204,13 +218,15 @@ def usb_export_worker(
     ``clear_existing`` first removes the files of an earlier export, so songs that were removed or
     reordered since do not linger on the drive; an export stopped before it began removes nothing.
     When ``cancel_event`` is set, the current FFmpeg run is stopped, its half-written file removed,
-    and ``on_cancelled(done, total)`` is called.
+    and ``on_cancelled(done, total)`` is called. A song whose volume could not be levelled is still
+    exported, at its original volume, and listed in the report's ``not_leveled``.
     """
     total = len(files_to_export)
     width = track_number_width(total)
     dest_dir = Path(dest_folder)
     success_count = 0
     skipped: list[str] = []
+    not_leveled: list[str] = []
     exported_tracks: list[tuple[str, str, float]] = []
 
     def _cancelled() -> bool:
@@ -266,16 +282,13 @@ def usb_export_worker(
                             dest_file.unlink()
                         break
                     if not encoded:
+                        # FFmpeg failed: still deliver the song, but never call that a levelled export.
                         if is_mp3:
                             shutil.copy2(source, dest_file)
                         else:
-                            audio = AudioSegment.from_file(filepath)
-                            if track_normalize:
-                                with contextlib.suppress(Exception):
-                                    from pydub.effects import normalize as pydub_norm
-
-                                    audio = pydub_norm(audio)
-                            audio.export(str(dest_file), format="mp3")
+                            AudioSegment.from_file(filepath).export(str(dest_file), format="mp3")
+                        if track_normalize:
+                            not_leveled.append(source.name)
                 else:
                     dest_file = dest_dir / f"{idx:0{width}d} - {clean_base}"
                     if on_status:
@@ -303,7 +316,7 @@ def usb_export_worker(
         if on_progress:
             on_progress(100.0)
         if on_success:
-            on_success(success_count, total, skipped)
+            on_success(ExportReport(total, success_count, tuple(skipped), tuple(not_leveled)))
     except Exception as e:  # last-resort guard: a worker must always report back to the window
         logger.error("usb_export_worker: %s", e)
         if on_error:
@@ -323,7 +336,7 @@ def cd_export_worker(
     normalize: bool = False,
     on_progress: ProgressFn | None = None,
     on_status: StatusFn | None = None,
-    on_success: Callable[[str, int, int, list[str]], None] | None = None,
+    on_success: ReportFn | None = None,
     on_error: Callable[[str], None] | None = None,
     is_shutting_down_fn: StopFn | None = None,
     cancel_event: CancelToken | None = None,
@@ -333,13 +346,15 @@ def cd_export_worker(
     """Export tracks to Desktop burn folder as standard Red Book 44.1kHz 16-bit stereo PCM WAV files.
 
     ``clear_existing`` first removes the tracks of an earlier export (and nothing else in the
-    folder); an export stopped before it began removes nothing.
+    folder); an export stopped before it began removes nothing. A song whose volume could not be
+    levelled is still exported, at its original volume, and listed in the report's ``not_leveled``.
     """
     total = len(files_to_export)
     width = track_number_width(total)
     cd_dir = Path(cd_folder)
     success_count = 0
     skipped: list[str] = []
+    not_leveled: list[str] = []
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -383,14 +398,12 @@ def cd_export_worker(
                         wav_path.unlink()
                     break
                 if result.returncode != 0 or not wav_path.is_file() or wav_path.stat().st_size == 0:
+                    # FFmpeg failed: still deliver the track, but never call that a levelled export.
                     audio = AudioSegment.from_file(filepath)
-                    if normalize:
-                        with contextlib.suppress(Exception):
-                            from pydub.effects import normalize as pydub_norm
-
-                            audio = pydub_norm(audio)
                     audio = audio.set_frame_rate(44100).set_channels(2).set_sample_width(2)
                     audio.export(str(wav_path), format="wav")
+                    if normalize:
+                        not_leveled.append(source.name)
                 success_count += 1
             except Exception as track_err:  # one bad song must not end the whole export
                 logger.error("cd export track %s: %s", filepath, track_err)
@@ -403,7 +416,7 @@ def cd_export_worker(
         if on_progress:
             on_progress(100.0)
         if on_success:
-            on_success(cd_folder, success_count, total, skipped)
+            on_success(ExportReport(total, success_count, tuple(skipped), tuple(not_leveled)))
     except Exception as e:  # last-resort guard: a worker must always report back to the window
         logger.error("cd_export_worker: %s", e)
         if on_error:

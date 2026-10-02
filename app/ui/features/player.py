@@ -9,6 +9,7 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
+from pathlib import Path
 
 import pygame
 
@@ -285,7 +286,8 @@ class PlayerMixin(AppBase):
         """Run start_fn once path can be played, converting (e.g. M4A -> WAV) on a worker if needed.
 
         The conversion can take many seconds, so it never runs on the Tkinter thread. If the user
-        stops or picks another song meanwhile, the stale start is dropped.
+        stops or picks another song meanwhile, the stale start is dropped. When the conversion
+        fails, the user is told and start_fn is not run.
         """
         if not self.audio_engine.needs_conversion(path):
             self._pending_play_token = None
@@ -296,13 +298,20 @@ class PlayerMixin(AppBase):
         self.set_busy(True, busy_text)
 
         def _worker() -> None:
-            self.audio_engine.get_playable_audio_path(path)
-            self._safe_after(0, _ready)
+            prepared = self.audio_engine.prepare_for_playback(path)
+            self._safe_after(0, _ready, prepared)
 
-        def _ready() -> None:
+        def _ready(prepared: bool) -> None:
             if self._pending_play_token is not token:
                 return
             self._pending_play_token = None
+            if not prepared:
+                # Starting now would repeat the failed conversion on this thread and freeze the window.
+                self.set_busy(False, "This song could not be played.")
+                show_friendly_error(
+                    self.root, f"FFmpeg could not convert '{Path(path).name}' for playback.", "playback"
+                )
+                return
             self.set_busy(False)
             start_fn()
 

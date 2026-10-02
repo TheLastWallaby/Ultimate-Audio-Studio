@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import logging
 import os
 import shutil
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.config import AUDIO_EXTS, log_error
+from app.core.file_utils import copy_file_atomic
 from app.core.task_manager import task_mgr
 from app.services.clipper import original_backup_path
 
@@ -19,9 +23,35 @@ try:
 except ImportError:
     _send2trash = None
 
+logger = logging.getLogger(__name__)
+
 MetadataFn = Callable[[str], Mapping[str, Any]]
 
 UNDO_DIR_NAME = ".undo_trash"
+
+
+@dataclass(slots=True, frozen=True)
+class ImportResult:
+    """What an import did, by file name, so the window can report it truthfully."""
+
+    copied: tuple[str, ...] = ()  # songs now in the Library (under these names)
+    renamed: tuple[str, ...] = ()  # the copied songs that were given a new name to avoid a clash
+    failed: tuple[str, ...] = ()  # songs that could not be copied
+
+
+def _path_key(path: Path) -> str:
+    """A path as Windows compares it (absolute, case-insensitive)."""
+    return str(path.absolute()).casefold()
+
+
+def _free_name(dest: Path, taken_names: set[str]) -> Path:
+    """``dest`` renamed to the first "Name (2).ext"-style name that neither exists nor is planned."""
+    number = 2
+    while True:
+        candidate = dest.with_name(f"{dest.stem} ({number}){dest.suffix}")
+        if candidate.name.casefold() not in taken_names and not candidate.exists():
+            return candidate
+        number += 1
 
 
 def _hide_path(path: str) -> None:
@@ -88,29 +118,42 @@ class LibraryController:
         return files, visible
 
     @staticmethod
-    def build_import_plan(paths: Sequence[str], library_folder: str) -> tuple[list[tuple[str, str]], list[str]]:
-        """Build planned copies for dropped or selected files/folders."""
-        audio_files = []
-        for p in paths:
-            if os.path.isfile(p) and p.lower().endswith(AUDIO_EXTS):
-                audio_files.append(p)
-            elif os.path.isdir(p):
-                for root_dir, _, files in os.walk(p):
-                    for f in files:
-                        if f.lower().endswith(AUDIO_EXTS):
-                            audio_files.append(os.path.join(root_dir, f))
-        if not audio_files:
-            return [], []
+    def build_import_plan(
+        paths: Sequence[str | Path], library_folder: str | Path
+    ) -> tuple[list[tuple[str, str]], list[str]]:
+        """Plan the copies for dropped or selected files/folders.
 
-        planned = []
-        dest_exists = []
-        for src in audio_files:
-            dest = os.path.join(library_folder, os.path.basename(src))
-            if os.path.abspath(src).lower() == os.path.abspath(dest).lower():
+        Returns the ``(source, destination)`` pairs and the names that are already in the Library.
+        Two different files with the same name are both imported: the later one gets a free
+        "Name (2).mp3"-style name instead of overwriting the first.
+        """
+        library = Path(library_folder)
+        sources: list[Path] = []
+        for raw in paths:
+            path = Path(raw)
+            if path.is_file() and path.suffix.lower() in AUDIO_EXTS:
+                sources.append(path)
+            elif path.is_dir():
+                sources.extend(f for f in sorted(path.rglob("*")) if f.is_file() and f.suffix.lower() in AUDIO_EXTS)
+
+        planned: list[tuple[str, str]] = []
+        dest_exists: list[str] = []
+        seen_sources: set[str] = set()
+        taken_names: set[str] = set()
+        for src in sources:
+            src_key = _path_key(src)
+            if src_key in seen_sources:  # the same file dropped twice (a folder and a file inside it)
                 continue
-            planned.append((src, dest))
-            if os.path.exists(dest):
-                dest_exists.append(os.path.basename(dest))
+            seen_sources.add(src_key)
+            dest = library / src.name
+            if _path_key(dest) == src_key:  # already in the Library folder
+                continue
+            if dest.name.casefold() in taken_names:
+                dest = _free_name(dest, taken_names)
+            taken_names.add(dest.name.casefold())
+            planned.append((str(src), str(dest)))
+            if dest.exists():
+                dest_exists.append(dest.name)
         return planned, dest_exists
 
     def update_search_index(self, folder: str, files: Sequence[str], get_metadata_fn: MetadataFn | None = None) -> None:
@@ -304,21 +347,32 @@ class LibraryController:
         self,
         planned_copies: Sequence[tuple[str, str]],
         is_shutting_down_fn: Callable[[], bool] | None,
-        on_done: Callable[[int], None] | None,
+        on_done: Callable[[ImportResult], None] | None,
     ) -> None:
-        """Copy external files into library folder in background thread."""
+        """Copy external files into the Library folder on a worker thread and report what happened.
+
+        Each file is copied under a temporary name and renamed when complete, so a source that
+        vanishes halfway never leaves a cut-off song (or damages one that was being replaced).
+        """
 
         def _worker() -> None:
-            copied = 0
+            copied: list[str] = []
+            renamed: list[str] = []
+            failed: list[str] = []
             for src, dest in planned_copies:
                 if is_shutting_down_fn and is_shutting_down_fn():
                     break
+                src_name, dest_name = Path(src).name, Path(dest).name
                 try:
-                    shutil.copy2(src, dest)
-                    copied += 1
-                except Exception as e:
-                    log_error(f"import_external_files: {e}")
+                    copy_file_atomic(src, dest)
+                except OSError as err:
+                    logger.error("Import of %s failed: %s", src, err)
+                    failed.append(src_name)
+                    continue
+                copied.append(dest_name)
+                if dest_name != src_name:
+                    renamed.append(dest_name)
             if on_done:
-                on_done(copied)
+                on_done(ImportResult(tuple(copied), tuple(renamed), tuple(failed)))
 
         task_mgr.submit_task(_worker)

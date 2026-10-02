@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +12,8 @@ from pathlib import Path
 from pydub import AudioSegment
 
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
+from app.core.file_utils import copy_file_atomic
+from app.core.file_utils import replace_with_retry as _replace_with_retry
 from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, fade_duration, mp3_output_args
 
 try:
@@ -45,36 +46,19 @@ def has_original_backup(song_path: str | None) -> bool:
     return bool(song_path) and os.path.isfile(original_backup_path(str(song_path)))
 
 
-def _replace_with_retry(src: str, dest: str) -> None:
-    """``os.replace`` that retries while Windows search indexing or antivirus briefly holds a file."""
-    for attempt in range(5):
-        try:
-            os.replace(src, dest)
-            return
-        except PermissionError:
-            time.sleep(0.08 * (attempt + 1))
-    os.replace(src, dest)
-
-
 def _ensure_original_backup(song: Path) -> Path:
     """Keep a complete copy of the untrimmed song before a clip replaces it; returns the backup.
 
-    The first original is kept across re-trims. The copy is written under a temporary name and only
-    then renamed, so an interrupted copy is never mistaken for a backup. Raises OSError when no
-    complete backup exists afterwards; the caller must then leave the song untouched.
+    The first original is kept across re-trims, and an interrupted copy is never mistaken for a
+    backup (``copy_file_atomic``). Raises OSError when no complete backup exists afterwards; the
+    caller must then leave the song untouched.
     """
     backup = Path(original_backup_path(str(song)))
     if backup.is_file() and backup.stat().st_size > 0:
         return backup
-    partial = backup.with_name(f"{backup.name}.{os.getpid()}.partial")
     try:
-        shutil.copy2(song, partial)
-        if partial.stat().st_size != song.stat().st_size:
-            raise OSError(f"the backup copy of {song.name} is incomplete")
-        _replace_with_retry(str(partial), str(backup))
+        copy_file_atomic(song, backup)
     except OSError as err:
-        with contextlib.suppress(OSError):
-            partial.unlink()
         raise OSError(f"The original song could not be backed up, so it was left unchanged ({err})") from err
     return backup
 

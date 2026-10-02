@@ -6,10 +6,12 @@ import os
 import time
 import tkinter as tk
 from collections.abc import Mapping
+from pathlib import Path
 from tkinter import filedialog, simpledialog
 from typing import Any
 
 from app.config import AUDIO_EXTS, format_time, log_error, sanitize_filename
+from app.controllers.library_controller import ImportResult
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.metadata import read_track_metadata
@@ -55,7 +57,7 @@ class LibraryMixin(AppBase):
                 default_yes=False,
             )
             if not replace:
-                planned = [(s, d) for (s, d) in planned if not os.path.exists(d)]
+                planned = [(s, d) for (s, d) in planned if not Path(d).exists()]
 
         if not planned:
             return
@@ -65,7 +67,7 @@ class LibraryMixin(AppBase):
         self.library_ctrl.import_external_files(
             planned,
             is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
-            on_done=lambda cnt: self._safe_after(0, self._on_copy_external_done, cnt),
+            on_done=lambda result: self._safe_after(0, self._on_copy_external_done, result),
         )
 
     def refresh_library(self, select_name: str | None = None, preserve_view: bool = False) -> None:
@@ -264,11 +266,35 @@ class LibraryMixin(AppBase):
         # Same plan/confirmation as drag-and-drop, so existing songs are never silently overwritten.
         self._import_paths(list(files), source="selected")
 
-    def _on_copy_external_done(self, copied: int) -> None:
+    def _on_copy_external_done(self, result: ImportResult) -> None:
+        """Report an import truthfully: what was added, what was renamed, and what could not be copied."""
         self._importing = False
         self.set_busy(False)
         self.refresh_library()
-        self.notify_success(f"Added {copied} song(s) to your Library.")
+        if result.copied:
+            message = f"Added {len(result.copied)} song(s) to your Library."
+            if len(result.renamed) == 1:
+                message += f" One had the same name as another song, so it was added as '{result.renamed[0]}'."
+            elif result.renamed:
+                message += (
+                    f" {len(result.renamed)} had the same name as another song, so they were added with a "
+                    f"number, like '{result.renamed[0]}'."
+                )
+            self.notify_success(message)
+        else:
+            self.set_status("No songs were added to your Library.", icon="⚠️")
+        if result.failed:
+            listed = "\n".join(f"• {name}" for name in result.failed[:6])
+            if len(result.failed) > 6:
+                listed += f"\n... and {len(result.failed) - 6} more."
+            dialogs.show_warning(
+                self.root,
+                "Some Songs Could Not Be Added",
+                f"{len(result.failed)} song(s) could not be copied into your Library:\n\n{listed}\n\n"
+                "• If they are on a CD, USB drive or phone, check that it is still connected.\n"
+                "• Check that this computer has free disk space.\n"
+                "• Then add them again.",
+            )
 
     def _watch_library(self) -> None:
         if not getattr(self, "_is_shutting_down", False):
