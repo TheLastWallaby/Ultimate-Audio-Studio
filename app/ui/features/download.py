@@ -204,6 +204,7 @@ class DownloadMixin(AppBase):
     def _playlist_download_success(
         self, downloaded_files: list[str], total: int, failures: list[tuple[str, str]] | None = None
     ) -> None:
+        """Report a finished playlist download truthfully: what was saved and what could not be."""
         self.entry_url.delete(0, tk.END)
         self._reset_download_ui()
         self.set_busy(False)
@@ -213,6 +214,7 @@ class DownloadMixin(AppBase):
             self.notify_success(f"Playlist download complete: all {count} songs are now in your Library.")
             return
         self.set_status(f"Playlist download finished: {count} of {total} songs saved to Library.", icon="⚠️")
+        self._look_for_update_after_failure([err for _title, err in failures])
         shown = failures[:8]
         lines = [f"• {title[:60]} — {friendly_error(err, 'download').title}" for title, err in shown]
         if len(failures) > len(shown):
@@ -300,7 +302,20 @@ class DownloadMixin(AppBase):
         self.set_busy(False, "Download stopped.")
 
     def _download_error(self, error: str) -> None:
+        """Explain a failed download, and look for a fix when a newer version is the likely cure."""
         self.download_ctrl.cleanup_partial(self.library_folder)
         self._reset_download_ui()
         self.set_busy(False, "Download failed.")
+        self._look_for_update_after_failure([error])
         show_friendly_error(self.root, error, "download")
+
+    def _look_for_update_after_failure(self, errors: list[str]) -> None:
+        """Check for a new version in the background when a download failed in a way an update fixes.
+
+        YouTube changes several times a year and each change needs a new release. Finding it now
+        means the fix is downloaded while the user reads the message, and installed at the next start.
+        """
+        if self._available_update is not None:  # already found: its badge is showing
+            return
+        if any(friendly_error(err, "download").suggests_update for err in errors):
+            self._check_for_updates_on_launch()

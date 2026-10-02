@@ -138,7 +138,7 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     btn_stop = create_button(
         f_play_row,
         "⏹ STOP",
-        lambda: app.stop_audio(user=True),
+        app.stop_pressed,
         bg=COLOR_STOP,
         fg="#ffffff",
         hover_bg=COLOR_STOP_HV,

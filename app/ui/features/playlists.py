@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import simpledialog
+from pathlib import Path
 
 from app.config import PLAYLISTS_PATH, format_time, log_error, sanitize_filename
 from app.controllers.playlist_controller import PlaylistLoadResult
@@ -129,10 +129,11 @@ class PlaylistMixin(AppBase):
             self.set_status(f"Switched to playlist: {name}")
 
     def create_playlist(self) -> None:
-        name = simpledialog.askstring("New Playlist", "Enter a name for the new playlist:", parent=self.root)
-        if not name:
+        """Ask for a name and start a new, empty playlist."""
+        answer = dialogs.ask_text(self.root, "New Playlist", "Type a name for the new playlist:", ok="Create playlist")
+        if answer is None:
             return
-        name = sanitize_filename(name).strip()
+        name = sanitize_filename(answer.text).strip()
         if not name:
             dialogs.show_warning(self.root, "Invalid Name", "Please enter a valid playlist name.")
             return
@@ -146,13 +147,18 @@ class PlaylistMixin(AppBase):
         self.set_status(f"Created new playlist: {name}")
 
     def rename_playlist(self) -> None:
+        """Ask for a new name for the playlist that is showing."""
         current = self.active_playlist_name
-        name = simpledialog.askstring(
-            "Rename Playlist", f"Rename '{current}' to:", initialvalue=current, parent=self.root
+        answer = dialogs.ask_text(
+            self.root,
+            "Rename Playlist",
+            f"Type a new name for the playlist '{current}':",
+            initial=current,
+            ok="Rename playlist",
         )
-        if not name or name == current:
+        if answer is None or answer.text == current:
             return
-        name = sanitize_filename(name).strip()
+        name = sanitize_filename(answer.text).strip()
         if not name:
             dialogs.show_warning(self.root, "Invalid Name", "Please enter a valid playlist name.")
             return
@@ -224,6 +230,7 @@ class PlaylistMixin(AppBase):
             self.set_status(f"Added {len(added)} songs to '{playlist}'{note}.")
 
     def pl_remove(self) -> None:
+        """Take the selected song out of the playlist (the song itself stays in the Library), with Undo."""
         sel = listbox_selection(self.listbox_pl)
         if not sel or sel[0] >= len(self.playlist_files):
             return
@@ -239,8 +246,7 @@ class PlaylistMixin(AppBase):
             if tracks:
                 new_sel = min(idx, len(tracks) - 1)
                 self.listbox_pl.selection_set(new_sel)
-            fname = os.path.basename(removed)
-            self.show_undo(f"Removed '{fname}' from playlist.", callback=self._undo_remove_track, timeout_sec=8)
+            self.show_undo(f"Removed '{Path(removed).name}' from playlist.", callback=self._undo_remove_track)
 
     def _undo_remove_track(self) -> None:
         try:
@@ -338,10 +344,11 @@ class PlaylistMixin(AppBase):
             self._play_current_pl_track()
 
     def play_next_in_playlist(self) -> None:
+        """Play the next playlist song; after the last one, stop and go back to the start."""
         if not self.playlist_files:
             return
         next_idx = self.playlist_ctrl.get_next_index(
-            self.active_playlist_name, self.playlist_index, repeat=self.repeat_playlist.get()
+            self.active_playlist_name, self.playlist_index, repeat=bool(self.repeat_playlist.get())
         )
         if next_idx is not None:
             self.playlist_index = next_idx
@@ -349,6 +356,7 @@ class PlaylistMixin(AppBase):
         else:
             self.stop_audio(user=True)
             self.set_status("Finished playlist.")
+            self._load_pending_selection()
 
     def _play_current_pl_track(self) -> None:
         if not self.playlist_files or not (0 <= self.playlist_index < len(self.playlist_files)):

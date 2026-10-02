@@ -237,6 +237,10 @@ def usb_export_worker(
 
     try:
         # Checked first: a job stopped while it was still queued must leave the drive as it was.
+        if not _stopping():
+            # The folder is made here and not by the window, so that a locked or unplugged drive ends
+            # as a reported error instead of an exception that leaves the window stuck on "Exporting...".
+            dest_dir.mkdir(parents=True, exist_ok=True)
         if clear_existing and not _stopping():
             if on_status:
                 on_status("Removing the songs from the previous export...")

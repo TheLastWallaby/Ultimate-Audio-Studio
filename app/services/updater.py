@@ -6,8 +6,9 @@ Install flow (Windows, packaged .exe only):
   2. It is installed at the next start (or immediately via "Restart and update now"): the running
      .exe is renamed to ``.old``, the new one moved into place and launched.
   3. The old process waits until the new one signals that its window is up. If the new process
-     exits without signalling, the previous version is put back and started again, and that
-     release is not installed automatically again.
+     exits without signalling, or is still without a window after the start timeout (it is then
+     stopped), the previous version is put back and keeps running, and that release is not
+     installed automatically again.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -44,6 +46,7 @@ from app.models import ReleaseInfo
 from app.platform_utils import (
     close_handle,
     create_named_event,
+    kill_process_tree,
     launch_update_process,
     release_instance_mutex,
     wait_for_event_or_exit,
@@ -64,10 +67,14 @@ __all__ = [
     "stage_update",
 ]
 
+logger = logging.getLogger(__name__)
+
 # Set by a newly installed version once its window is up (see app.main.main).
 UPDATE_OK_EVENT_NAME = "Local\\UltimateAudioStudioUpdateStarted"
-# A slow PC unpacking the one-file .exe can take a while; past this the new version is assumed fine.
-_START_TIMEOUT_SEC = 120.0
+# A slow PC unpacking the one-file .exe (and its antivirus scanning it) can take a while. A new
+# version that has not opened its window by then is treated as stuck: it is stopped and the previous
+# version is put back, so the limit is generous.
+_START_TIMEOUT_SEC = 180.0
 _MIN_EXE_BYTES = 1024 * 1024
 PENDING_DIR = Path(tempfile.gettempdir()) / "audio_studio_update"
 _PENDING_FILE = PENDING_DIR / "pending.json"
@@ -360,18 +367,39 @@ class InstallResult:
     rolled_back: bool = False
 
 
-def _restore_previous(current_exe: str, old_exe: str) -> bool:
+def _restore_previous(current_exe: Path, old_exe: Path) -> bool:
     """Put the previous executable back after the new one failed (retrying while Windows releases it)."""
     for _attempt in range(20):
         try:
-            if os.path.exists(current_exe):
-                os.remove(current_exe)
-            os.rename(old_exe, current_exe)
+            current_exe.unlink(missing_ok=True)
+            old_exe.rename(current_exe)
             return True
         except OSError:
             time.sleep(0.25)
-    log_error(f"Could not restore previous version from {old_exe}")
+    logger.error("Could not restore the previous version from %s", old_exe)
     return False
+
+
+def _remember_failed_update(tag: str) -> None:
+    """Record ``tag`` so it is not installed automatically again (the user can still ask for it)."""
+    try:
+        settings_mgr.update_settings(failed_update_tag=tag)
+    except (OSError, TypeError, ValueError) as err:
+        logger.warning("Could not record that update %s failed: %s", tag, err)
+
+
+def _swap_in(new_exe: Path, current_exe: Path, old_exe: Path) -> None:
+    """Rename the running executable to ``old_exe`` and move the new one into its place.
+
+    Raises OSError with the running executable back under its own name when either step fails.
+    """
+    _remove_quietly(old_exe)
+    current_exe.rename(old_exe)
+    try:
+        shutil.move(new_exe, current_exe)
+    except OSError:
+        _restore_previous(current_exe, old_exe)
+        raise
 
 
 def install_update(
@@ -385,65 +413,83 @@ def install_update(
     """Swap in the new executable, start it, and exit once it reports that it started.
 
     Returns (instead of exiting) when nothing was changed or the previous version had to be restored;
-    the caller should then keep running and, after a rollback, re-take the single-instance lock.
+    the caller should then keep running and re-take the single-instance lock. A release that could
+    not be installed is remembered, so it is not tried again (and its download hashed) at every start.
     """
     if not getattr(sys, "frozen", False):
         return InstallResult("Running in development mode (source code). Updates can be pulled with git pull.")
 
-    current_exe = sys.executable
-    old_exe = current_exe + ".old"
-    new_exe = str(new_exe_path)
-    if not os.path.exists(new_exe):
+    current_exe = Path(sys.executable)
+    old_exe = current_exe.with_name(current_exe.name + ".old")
+    new_exe = Path(new_exe_path)
+    if not new_exe.exists():
         return InstallResult("The downloaded update file was not found.")
 
-    _remove_quietly(old_exe)
     try:
-        os.rename(current_exe, old_exe)
-    except OSError as e:
-        log_error(f"install_update: cannot rename running executable: {e}")
-        return InstallResult(f"The update could not be installed: {e}")
-    try:
-        shutil.move(new_exe, current_exe)
-    except OSError as e:
-        log_error(f"install_update: cannot move new executable into place: {e}")
-        _restore_previous(current_exe, old_exe)
-        return InstallResult(f"The update could not be installed: {e}")
+        _swap_in(new_exe, current_exe, old_exe)
+    except OSError as err:
+        # Typically the app sits in a folder it may not change. Trying again at the next start
+        # would fail the same way, so the user is told once and can retry from the update button.
+        logger.error("Update %s could not be put in place: %s", tag, err)
+        _remember_failed_update(tag)
+        return InstallResult(
+            f"The new version ({tag}) could not be installed, so your current version was kept.\n\n"
+            "You can keep using the app as usual. To try again, click the update button at the "
+            "bottom of the window."
+        )
 
     event = create_named_event(UPDATE_OK_EVENT_NAME)
     # The new version must not find this instance's lock and think the app is already open.
     release_instance_mutex()
     try:
-        proc = launch_update_process(current_exe)
-    except OSError as e:
-        log_error(f"install_update: cannot start new version: {e}")
+        proc = launch_update_process(str(current_exe))
+    except OSError as err:
+        logger.error("Update %s could not be started: %s", tag, err)
         close_handle(event)
-        _restore_previous(current_exe, old_exe)
-        return InstallResult(f"The new version could not be started: {e}", rolled_back=True)
+        restored = _restore_previous(current_exe, old_exe)
+        _remember_failed_update(tag)
+        return InstallResult(_not_started_message(tag, restored, old_exe), rolled_back=restored)
     if on_launched:
         on_launched()
 
+    outcome: Literal["signaled", "exited", "timeout"]
     if event:
         outcome = wait_for_event_or_exit(event, proc, start_timeout_sec)
     else:
-        # Without the event, at least catch a version that dies straight away.
+        # Without the event, at least catch a version that dies straight away; one that is still
+        # running after that cannot be told apart from one that started properly.
         try:
             proc.wait(timeout=20)
             outcome = "exited"
         except subprocess.TimeoutExpired:
-            outcome = "timeout"
+            outcome = "signaled"
     close_handle(event)
-    if outcome != "exited":
+    if outcome == "signaled":
         clear_pending_update()
         exit_fn(0)
 
-    log_error(f"Update {tag} exited before its window opened; restoring the previous version.")
+    if outcome == "timeout":
+        # Still running, but its window never came up: it is stuck. Leaving it would leave the user
+        # with no working app (and an invisible process that blocks the next start), so it is stopped.
+        logger.error("Update %s did not open its window within %ss; stopping it.", tag, start_timeout_sec)
+        kill_process_tree(proc)
+    else:
+        logger.error("Update %s exited before its window opened.", tag)
     restored = _restore_previous(current_exe, old_exe)
     clear_pending_update()
-    with contextlib.suppress(Exception):
-        settings_mgr.update_settings(failed_update_tag=tag)
-    return InstallResult(
-        f"Version {tag} did not start correctly on this computer, so your current version was kept.",
-        rolled_back=restored,
+    _remember_failed_update(tag)
+    return InstallResult(_not_started_message(tag, restored, old_exe), rolled_back=restored)
+
+
+def _not_started_message(tag: str, restored: bool, old_exe: Path) -> str:
+    """What to tell the user after a new version failed to start (truthful about the rollback)."""
+    if restored:
+        return f"Version {tag} did not start correctly on this computer, so your current version was kept."
+    return (
+        f"Version {tag} did not start correctly on this computer, and the version you had could not be "
+        "put back automatically.\n\n"
+        "You can keep using this window for now. Before you close it, please ask someone to help: "
+        f"the working version is saved next to the app as '{old_exe.name}'."
     )
 
 
