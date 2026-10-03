@@ -278,8 +278,9 @@ def test_a_playlist_with_every_song_missing_stops_even_with_repeat_on(studio: An
         studio.play_playlist()
         _pump(studio, lambda: False, timeout=2.0)  # long enough for the three songs to be passed twice
 
-    warned.assert_called_once()
-    assert warned.call_args[0][1] == "Songs Not Found"
+    # By title: a PC without ffmpeg.exe (the CI runners) also gets the app's "Missing Helper File" warning.
+    titles = [call.args[1] for call in warned.call_args_list]
+    assert titles.count("Songs Not Found") == 1
     assert studio._pl_skip_timer is None
     assert not studio.is_playing_playlist
 
