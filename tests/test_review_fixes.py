@@ -623,3 +623,19 @@ def test_deleting_and_undoing_keep_the_library_scrolled_where_it_was(studio: Any
     studio._on_undo_click()
     assert "song070.mp3" in studio.visible_files
     assert abs(studio.listbox_lib.yview()[0] - scrolled_to) < 0.05
+
+
+# --- Volume Boost belongs to one song -------------------------------------------------------------------
+
+
+def test_volume_boost_is_reset_for_another_song_but_kept_for_the_same_one(studio: Any, tmp_path: Path) -> None:
+    first, second = _library(studio, tmp_path / "lib", "first.mp3", "second.mp3")
+    assert studio._load_track_ui(first, "first.mp3")
+    studio.scale_gain.set(6.0)
+
+    assert studio._load_track_ui(first, "first.mp3")  # the same song again (after a save, say)
+    assert float(studio.scale_gain.get()) == 6.0
+
+    assert studio._load_track_ui(second, "second.mp3")
+    assert float(studio.scale_gain.get()) == 0.0
+    assert "0 dB" in studio.lbl_gain.cget("text")

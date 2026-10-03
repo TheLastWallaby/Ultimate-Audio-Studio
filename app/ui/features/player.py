@@ -331,14 +331,17 @@ class PlayerMixin(AppBase):
         task_mgr.submit_task(_worker)
 
     def _load_track_ui(self, path: str, title: str | None = None) -> bool:
+        """Put a song in the player (title, timeline, waveform, cover); False when its file is gone."""
+        song = Path(path)
+        is_another_song = self.selected_file_path is None or song.absolute() != Path(self.selected_file_path).absolute()
         self.selected_file_path = path
-        base_name = title or os.path.basename(path)
+        base_name = title or song.name
         artist_name = "Unknown Artist"
 
         # Never probe on the UI thread: ffprobe/ffmpeg (for files whose header has no length) can take
         # seconds. Tags come from the fast header read; a missing duration is probed on a worker.
         meta = self._cached_metadata(path, probe=False)
-        if not meta.get("duration") and os.path.isfile(path):
+        if not meta.get("duration") and song.is_file():
             header = read_track_metadata(path, probe_fallback=False)
             if header.duration > 0:
                 cache_mgr.set_metadata(path, header)
@@ -349,10 +352,19 @@ class PlayerMixin(AppBase):
         if meta.get("artist"):
             artist_name = meta["artist"]
 
-        if not os.path.exists(path):
-            dialogs.show_warning(self.root, "Error", f"Audio file not found:\n{path}")
+        if not song.exists():
+            dialogs.show_warning(
+                self.root,
+                "Song Not Found",
+                f"This song could not be found:\n{path}\n\n"
+                "It may have been moved, renamed or deleted, or it is on a drive that is not connected.",
+            )
             return False
 
+        if is_another_song:
+            # Volume Boost belongs to the song it was set for: left on, the next Save Clip would
+            # boost a different song without anyone having asked for it.
+            self.reset_gain()
         self.lbl_selected.config(text=base_name)
         self.lbl_selected_artist.config(text=artist_name)
         self.track_duration = dur
