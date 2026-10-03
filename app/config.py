@@ -60,19 +60,6 @@ __all__ = [
     "setup_logging",
 ]
 
-# Bootstrap audioop for Python 3.13+ before importing pydub
-try:
-    import audioop
-except ImportError:
-    try:
-        import audioop_lts as audioop  # type: ignore[no-redef]
-
-        sys.modules["audioop"] = audioop
-    except ImportError:
-        pass
-
-from pydub import AudioSegment  # noqa: F401
-
 logger = logging.getLogger(__name__)
 
 # Frozen builds must use bundled CA certs or YouTube downloads fail SSL checks.
@@ -115,15 +102,6 @@ if ffmpeg_path and os.path.exists(ffmpeg_path):
     f_dir = os.path.dirname(os.path.abspath(ffmpeg_path))
     if f_dir and f_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = f_dir + os.pathsep + os.environ.get("PATH", "")
-
-AudioSegment.converter = ffmpeg_path
-AudioSegment.ffprobe = ffprobe_path
-try:
-    import pydub.utils
-
-    pydub.utils.get_prober_name = lambda: ffprobe_path
-except Exception:
-    pass
 
 MUSIC_DIR = str(_app_settings.paths.music_dir)
 PLAYLISTS_PATH = str(_app_settings.paths.playlists_path)
