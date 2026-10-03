@@ -10,7 +10,6 @@ from typing import Any
 from app.core.task_manager import task_mgr
 from app.models import SearchResult
 from app.services.downloader import (
-    cleanup_partial_downloads,
     download_audio_worker,
     download_playlist_worker,
     has_video_id,
@@ -101,10 +100,6 @@ class DownloadController:
 
         task_mgr.submit_task(_worker)
 
-    def cleanup_partial(self, library_folder: str) -> None:
-        """Clean up incomplete or temporary download artifacts."""
-        cleanup_partial_downloads(library_folder)
-
     def start_search(
         self,
         query: str,
@@ -133,14 +128,14 @@ class DownloadController:
             self.is_downloading = False
             on_success(fname)
 
+        # A download works in a folder of its own, which its worker removes: nothing is left in the
+        # Library to clean up after a stop or a failure.
         def _worker_cancelled() -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_cancelled()
 
         def _worker_error(err: str) -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_error(err)
 
         task_mgr.submit_task(
@@ -179,12 +174,10 @@ class DownloadController:
 
         def _cancelled() -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_cancelled()
 
         def _error(err: str) -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_error(err)
 
         def _batch_complete(downloaded_files: list[str], total: int) -> None:

@@ -320,13 +320,12 @@ class DownloadMixin(AppBase):
             self.notify_success("Download complete! The new song is marked in green in your Library on the left.")
 
     def _download_cancelled(self) -> None:
-        self.download_ctrl.cleanup_partial(self.library_folder)
+        """The stopped download has wound down: put the YouTube box back to idle."""
         self._reset_download_ui()
         self.set_busy(False, "Download stopped.")
 
     def _download_error(self, error: str) -> None:
         """Explain a failed download, and look for a fix when a newer version is the likely cure."""
-        self.download_ctrl.cleanup_partial(self.library_folder)
         self._reset_download_ui()
         self.set_busy(False, "Download failed.")
         self._look_for_update_after_failure([error])

@@ -149,7 +149,6 @@ def test_a_playlist_that_fails_while_downloading_reports_the_error() -> None:
     with (
         patch("yt_dlp.YoutubeDL") as ydl,
         patch("app.controllers.download_controller.task_mgr", _RunNow()),
-        patch("app.controllers.download_controller.cleanup_partial_downloads"),
     ):
         ydl.return_value.__enter__.return_value.extract_info.side_effect = DownloadError(OFFLINE)
         controller.start_playlist(
@@ -252,7 +251,6 @@ def test_a_search_right_after_stopping_a_download_does_not_leave_the_app_downloa
     tasks = _Queued()
     with (
         patch("app.controllers.download_controller.task_mgr", tasks),
-        patch("app.controllers.download_controller.cleanup_partial_downloads"),
         patch("app.services.downloader.yt_dlp.YoutubeDL") as ydl,
         patch("app.controllers.download_controller.search_youtube_worker"),
     ):
@@ -766,3 +764,47 @@ def test_songs_that_are_converted_count_by_their_length_not_their_file_size(tmp_
     small = tmp_path / "talk.mp3"
     small.write_bytes(bytes(1 * mb))
     assert exports.estimate_playlist_bytes([str(small)], four_minutes, normalize=True) == as_mp3 + 15 * mb
+
+
+# --- Only the app's own leftovers are removed from the Library ------------------------------------------
+
+
+def test_a_failed_or_stopped_download_deletes_nothing_in_the_library(studio: Any, tmp_path: Path) -> None:
+    lib = tmp_path / "lib"
+    _library(studio, lib)
+    mine = [lib / "Live at the.temp.club.mp3", lib / "notes.temp", lib / "old download.part"]
+    for path in mine:
+        path.write_bytes(b"the user's own file")
+
+    with patch("app.ui.features.download.show_friendly_error"), patch.object(studio, "_check_for_updates_on_launch"):
+        studio._download_error("ERROR: Private video")
+        studio._download_cancelled()
+
+    assert all(path.exists() for path in mine)
+
+
+def test_startup_removes_the_apps_own_unfinished_files_and_nothing_else(tmp_path: Path) -> None:
+    import os
+
+    from app.controllers.library_controller import LibraryController
+
+    other_run = 4242 if os.getpid() != 4242 else 4243
+    leftovers = [
+        f".clip_tmp_{other_run}_1700000000000.mp3",  # this one would show in the Library as a song
+        f"Song.mp3.{other_run}.partial",
+        f"Song.mp3.{other_run}.incoming",
+        f"Song.mp3.{other_run}.restoring",
+    ]
+    kept = [
+        "Song.mp3",
+        "Song.mp3.original.bak",
+        "My demo.partial",  # no process id: not one of the app's names
+        "clip_tmp_notes.mp3",
+        f"Other.mp3.{os.getpid()}.partial",  # this run's own file may be in use right now
+    ]
+    for name in leftovers + kept:
+        (tmp_path / name).write_bytes(b"data")
+
+    assert LibraryController.recover_stranded_deletes(str(tmp_path)) == len(leftovers)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(kept)
