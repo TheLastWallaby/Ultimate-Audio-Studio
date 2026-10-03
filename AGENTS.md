@@ -108,7 +108,7 @@ Keep the layering: services and controllers never import Tkinter widgets; UI cod
 ### A. Audio engine
 - **Mixer**: initialized once at startup with `pygame.mixer.pre_init(44100, -16, 2, 8192)`. Never call `pygame.mixer.quit()` or re-initialize per track. The 8192-sample buffer prevents crackling on slow PCs.
 - **Playback position**: computed from `time.monotonic()` and the start offset (`AudioEngine.current_play_seconds()`). Never use `pygame.mixer.music.get_pos()`, which drifts on VBR MP3s, and never use `time.time()`, which jumps when the system clock changes.
-- **Duration**: read with `tinytag` through `read_track_metadata()`. When the header has no length, the `ffprobe`/`ffmpeg` fallback (`probe_audio_duration`) may run, but only on a worker thread; on the UI thread pass `probe_fallback=False` / `probe=False`. Never call `pydub.utils.mediainfo`.
+- **Duration**: read with `tinytag` through `read_track_metadata()`. When the header has no length, the `ffprobe`/`ffmpeg` fallback (`probe_audio_duration`) may run, but only on a worker thread; on the UI thread pass `probe_fallback=False` / `probe=False`.
 - **Unsupported formats** (M4A, WMA, and so on) are converted to a cached WAV before playback. The conversion runs on a worker (`_when_playable`), never on the UI thread.
 
 ### B. Threading
@@ -184,7 +184,6 @@ Run all six before you call a change finished.
   - One-file, windowed, `upx=False`, with a splash screen that `app.main` closes.
   - Bundled binaries: `ffmpeg.exe`, `ffprobe.exe`, and the Deno runtime that yt-dlp needs for YouTube.
   - `collect_all` for `yt_dlp`, `yt_dlp_ejs`, `certifi`, and `tinytag`.
-  - Hidden imports include `audioop` and `audioop_lts` (Python 3.13 removed `audioop`; `audioop-lts` replaces it).
 - A module that is imported dynamically must be added to `hiddenimports`, or it will be missing from the `.exe`.
 - When frozen, bundled files are found under `sys._MEIPASS` (`BASE_PATH` in `app/config.py`). SSL uses the bundled `certifi` certificates.
 - CI runs the built `.exe` with `--self-test` (`app/self_test.py`). When you add a bundled tool or dependency, add a check for it there.
