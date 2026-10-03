@@ -23,12 +23,10 @@ from app.platform_utils import has_recycle_bin
 from app.ui import dialogs
 from app.ui.components import listbox_selection
 from app.ui.error_dialog import show_error, show_friendly_error
-from app.ui.features.base import UNDO_SECONDS, AppBase
+from app.ui.features.base import NEW_SONG_ROW_BG, UNDO_SECONDS, AppBase
 
 logger = logging.getLogger(__name__)
 
-# Background of a just-added library row that was not selected (music was playing at the time).
-NEW_SONG_ROW_BG = "#dcfce7"
 # An import of more songs than this, or of more data, is confirmed first: a whole Music folder dropped
 # by accident would otherwise be copied (and fill the disk) without a word.
 LARGE_IMPORT_SONGS = 200
@@ -276,17 +274,22 @@ class LibraryMixin(AppBase):
         self.apply_library_filter(select_name, preserve_view=preserve_view)
         self._warm_library_metadata()
 
-    def _reveal_new_song(self, filename: str) -> bool:
+    def _reveal_new_song(self, filename: str, keep_trim_work: bool = False) -> bool:
         """Show a song that was just added (download, saved clip) and return True if it was loaded.
 
         Selecting a row in code does not load it into the player, so PLAY used to play the previous
         song while the new one was highlighted. When the player is idle the new song is highlighted
         *and* loaded; while something is playing or paused that is left alone, and the new row is only
         tinted green (not selected), so the highlight never disagrees with what PLAY will do.
+
+        ``keep_trim_work`` also leaves the player alone while the loaded song has clip marks or a
+        Volume Boost set: a download that finishes meanwhile must not throw that work away.
         """
-        path = os.path.join(self.library_folder, filename)
+        path = self._library_row_path(filename)
         player_in_use = self.is_playing_main or self.is_playing_playlist or self.is_paused
-        if not player_in_use and os.path.isfile(path):
+        if keep_trim_work and self._has_trim_work():
+            player_in_use = True
+        if not player_in_use and Path(path).is_file():
             self.refresh_library(select_name=filename)
             self.stop_audio()
             return self._load_track_ui(path, filename)
@@ -379,6 +382,26 @@ class LibraryMixin(AppBase):
         if select_idx is not None:
             self.listbox_lib.selection_set(select_idx)
             self.listbox_lib.see(select_idx)
+        self._show_library_hint()
+
+    def _show_library_hint(self) -> None:
+        """Say what to do next over an empty Library list (no songs yet, or none match the search)."""
+        if not hasattr(self, "lbl_lib_empty"):
+            return
+        if self.visible_files:
+            self.lbl_lib_empty.place_forget()
+            return
+        if self.library_files:
+            typed = self.entry_search.get().strip()
+            text = f"No songs match '{typed}'.\n\nClick ✕ next to the search box to show all your songs."
+        else:
+            text = (
+                "Your Library is empty.\n\n"
+                "Type a song name at the top and click 'Download MP3',\n"
+                "or click 'Add Music from PC' below."
+            )
+        self.lbl_lib_empty.config(text=text)
+        self.lbl_lib_empty.place(relx=0.5, rely=0.4, anchor="center")
 
     def on_search_key_release(self, event: tk.Event[tk.Misc] | None = None) -> None:
         timer = getattr(self, "_search_debounce_timer", None)

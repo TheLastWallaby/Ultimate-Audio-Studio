@@ -768,6 +768,33 @@ def safely_eject_usb_drive(drive_root: str) -> tuple[bool, str]:
     )
 
 
+def send_fatal_errors_to(log_path: str | Path) -> bool:
+    """Make Python write a fatal interpreter error to ``log_path``; True when it now does.
+
+    Python reports such an error (and the stack of every thread) on the C ``stderr`` stream and
+    switches ``faulthandler`` off before it ends the process. A windowed program has no ``stderr``,
+    so the crash would leave no trace at all. A ``stderr`` that already goes somewhere (a console,
+    a redirect) is left alone.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        crt = ctypes.CDLL("ucrtbase")
+        crt.__acrt_iob_func.restype = ctypes.c_void_p
+        crt.__acrt_iob_func.argtypes = [ctypes.c_uint]
+        crt._fileno.restype = ctypes.c_int
+        crt._fileno.argtypes = [ctypes.c_void_p]
+        crt._wfreopen.restype = ctypes.c_void_p
+        crt._wfreopen.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p]
+        stderr_stream = crt.__acrt_iob_func(2)
+        if crt._fileno(stderr_stream) >= 0:
+            return False
+        return bool(crt._wfreopen(str(log_path), "a", stderr_stream))
+    except (OSError, AttributeError) as err:
+        logger.warning("Fatal errors cannot be written to %s: %s", log_path, err)
+        return False
+
+
 def get_desktop_dir() -> str:
     """Retrieve user's true Windows Desktop folder, handling OneDrive or network redirection."""
     if os.name == "nt":
@@ -803,8 +830,43 @@ def find_windows_media_player() -> str | None:
     return None
 
 
+_WM_DROPFILES = 0x0233
+_WM_DEVICECHANGE = 0x0219
+_GWLP_WNDPROC = -4
+_DROP_COUNT_QUERY = 0xFFFFFFFF
+
+
+def _dropped_paths(h_drop: int) -> list[str]:
+    """The file names held by a WM_DROPFILES handle; the handle is released afterwards."""
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    # Declared, because a drop handle is a 64-bit pointer: passed as a plain int, ctypes refuses it
+    # ("int too long to convert") and the drop is lost.
+    shell32.DragQueryFileW.restype = wintypes.UINT
+    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    shell32.DragFinish.restype = None
+    shell32.DragFinish.argtypes = [wintypes.HANDLE]
+    paths: list[str] = []
+    try:
+        for index in range(shell32.DragQueryFileW(h_drop, _DROP_COUNT_QUERY, None, 0)):
+            length = shell32.DragQueryFileW(h_drop, index, None, 0)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            shell32.DragQueryFileW(h_drop, index, buf, length + 1)
+            if buf.value:
+                paths.append(buf.value)
+    finally:
+        shell32.DragFinish(h_drop)
+    return paths
+
+
 class Win32DragDropHandler:
-    """Handles native Windows WM_DROPFILES messages and WM_DEVICECHANGE USB events without external C-extensions."""
+    """Receives files dropped on the window (WM_DROPFILES) and device changes (WM_DEVICECHANGE).
+
+    Both callbacks run *inside the window procedure*. They must not call tkinter: a tkinter call
+    made there bypasses tkinter's own bookkeeping, and the next timer callback then ends the whole
+    process with a fatal interpreter error. They should only hand the news to the UI thread's queue.
+    """
 
     def __init__(
         self,
@@ -821,86 +883,79 @@ class Win32DragDropHandler:
         self._drop_target_hwnd: int | None = None
         self._drop_wndproc_c: Any = None
 
+    def _closing(self) -> bool:
+        return bool(self.is_shutting_down_fn and self.is_shutting_down_fn())
+
+    def _on_message(self, msg: int, wparam: int) -> bool:
+        """Handle one window message without touching tkinter; True when it was a file drop."""
+        if msg == _WM_DEVICECHANGE:
+            if self.device_change_callback and not self._closing():
+                self.device_change_callback()
+            return False
+        if msg != _WM_DROPFILES:
+            return False
+        paths = _dropped_paths(wparam)
+        if paths and not self._closing():
+            self.callback(paths)
+        return True
+
     def setup(self) -> None:
+        """Start receiving dropped files and device changes for the window (Windows only)."""
         if os.name != "nt":
             return
+        from ctypes import wintypes
+        from tkinter import TclError
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        shell32.DragAcceptFiles.restype = None
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
+        user32.CallWindowProcW.argtypes = [
+            ctypes.c_ssize_t,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        wndproc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+        )
+
+        def py_wndproc(h_wnd: int, msg: int, wparam: int, lparam: int) -> int:
+            try:
+                if self._on_message(msg, wparam):
+                    return 0
+            except Exception:  # last-resort guard: an error must not escape into the window procedure
+                logger.exception("Handling window message %#x failed", msg)
+                if msg == _WM_DROPFILES:
+                    return 0
+            return int(user32.CallWindowProcW(self._old_wndproc, h_wnd, msg, wparam, lparam))
+
         try:
-            from ctypes import wintypes
-
-            WM_DROPFILES = 0x0233
-            WM_DEVICECHANGE = 0x0219
-            GWLP_WNDPROC = -4
-
-            user32 = ctypes.windll.user32
-            shell32 = ctypes.windll.shell32
-
             self.root.update_idletasks()
             hwnd = self.root.winfo_id()
-            parent_hwnd = user32.GetParent(hwnd)
-            target_hwnd = parent_hwnd if parent_hwnd else hwnd
-
-            WNDPROC = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-            )
-
-            def py_wndproc(h_wnd: int, msg: int, wparam: int, lparam: int) -> int:
-                if msg == WM_DEVICECHANGE:
-                    if self.device_change_callback and not (self.is_shutting_down_fn and self.is_shutting_down_fn()):
-                        try:
-                            self.root.after(600, self.device_change_callback)
-                        except Exception:
-                            pass
-                    return int(user32.CallWindowProcW(self._old_wndproc, h_wnd, msg, wparam, lparam))
-
-                if msg == WM_DROPFILES:
-                    h_drop = wparam
-                    try:
-                        count = shell32.DragQueryFileW(h_drop, 0xFFFFFFFF, None, 0)
-                        dropped_files = []
-                        for i in range(count):
-                            buf = ctypes.create_unicode_buffer(512)
-                            shell32.DragQueryFileW(h_drop, i, buf, 512)
-                            if buf.value:
-                                dropped_files.append(buf.value)
-                        shell32.DragFinish(h_drop)
-                        if dropped_files:
-                            if self.is_shutting_down_fn and self.is_shutting_down_fn():
-                                return 0
-                            self.root.after(0, self.callback, dropped_files)
-                    except Exception:
-                        pass
-                    return 0
-                return int(user32.CallWindowProcW(self._old_wndproc, h_wnd, msg, wparam, lparam))
-
-            self._drop_wndproc_c = WNDPROC(py_wndproc)
+            target_hwnd = user32.GetParent(hwnd) or hwnd
+            self._drop_wndproc_c = wndproc_type(py_wndproc)
             shell32.DragAcceptFiles(target_hwnd, True)
-
-            user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
-            user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
-            user32.CallWindowProcW.restype = ctypes.c_ssize_t
-            user32.CallWindowProcW.argtypes = [
-                ctypes.c_ssize_t,
-                wintypes.HWND,
-                wintypes.UINT,
-                wintypes.WPARAM,
-                wintypes.LPARAM,
-            ]
-
             self._drop_target_hwnd = target_hwnd
             self._old_wndproc = user32.SetWindowLongPtrW(
-                target_hwnd, GWLP_WNDPROC, ctypes.cast(self._drop_wndproc_c, ctypes.c_void_p).value
+                target_hwnd, _GWLP_WNDPROC, ctypes.cast(self._drop_wndproc_c, ctypes.c_void_p).value
             )
-        except Exception:
-            pass
+        except (OSError, ctypes.ArgumentError, TclError) as err:
+            logger.warning("Drag and drop could not be set up: %s", err)
 
     def teardown(self) -> None:
+        """Give the window its own window procedure back."""
         if os.name != "nt" or not self._old_wndproc or not self._drop_target_hwnd:
             return
         try:
-            user32 = ctypes.windll.user32
-            GWLP_WNDPROC = -4
-            user32.SetWindowLongPtrW(self._drop_target_hwnd, GWLP_WNDPROC, self._old_wndproc)
-            self._old_wndproc = None
-            self._drop_target_hwnd = None
-        except Exception:
-            pass
+            ctypes.windll.user32.SetWindowLongPtrW(self._drop_target_hwnd, _GWLP_WNDPROC, self._old_wndproc)
+        except (OSError, ctypes.ArgumentError) as err:
+            logger.warning("The window procedure could not be restored: %s", err)
+        self._old_wndproc = None
+        self._drop_target_hwnd = None

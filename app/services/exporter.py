@@ -45,6 +45,8 @@ _MIN_FREE_BYTES = 1024 * 1024
 # Why an export stopped before the end: its drive was removed, or it is full ("" when it did not stop).
 DriveProblem = Literal["", "removed", "full"]
 _EXPORTED_PLAYLIST_RE = re.compile(r"^00_.+\.m3u8?$", re.IGNORECASE)
+# What FFmpeg prints when the disk it writes to fills up.
+_NO_SPACE_RE = re.compile(r"no space left on device", re.IGNORECASE)
 
 ProgressFn = Callable[[float], None]
 StatusFn = Callable[[str], None]
@@ -199,11 +201,17 @@ def _ffmpeg_to(args: list[str], dest_file: Path, fmt: str, cancel_event: CancelT
     """Run FFmpeg with ``args`` into ``dest_file`` (format ``fmt``); True when a complete file is in place.
 
     FFmpeg writes under a ``.partial`` name that is renamed only after a clean finish, so a failed,
-    stopped or timed-out run never leaves a cut-off track under the real name.
+    stopped or timed-out run never leaves a cut-off track under the real name. Raises
+    OSError(ENOSPC) when FFmpeg ran out of disk space: that is the drive's problem, not the song's,
+    and trying the song again another way (or the next song) would only fail the same way.
     """
     partial = dest_file.with_name(dest_file.name + _PARTIAL_SUFFIX)
     # The format is named because ".partial" does not tell FFmpeg which one to write.
     result = run_ffmpeg([*args, "-f", fmt, str(partial)], timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
+    if result.returncode != 0 and _NO_SPACE_RE.search(str(result.stderr)):
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise OSError(errno.ENOSPC, f"No space left to write {dest_file.name}")
     try:
         if result.returncode == 0 and partial.stat().st_size > 0:
             replace_with_retry(partial, dest_file)

@@ -54,6 +54,7 @@ from app.platform_utils import (
     enable_windows_dpi,
     is_on_a_monitor,
     release_instance_mutex,
+    send_fatal_errors_to,
     set_keep_awake,
     signal_named_event,
     terminate_child_processes,
@@ -160,6 +161,8 @@ class UltimateAudioStudio(
     """
 
     _saved_geometry: str | None
+    # The Help Guide window while it is open, so the Help button shows it instead of opening another.
+    _help_window: tk.Toplevel | None = None
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -494,11 +497,23 @@ class UltimateAudioStudio(
             logging.getLogger(__name__).exception("Saving the settings failed")
 
     def _setup_drag_and_drop(self) -> None:
+        """Receive dropped files and device changes from Windows.
+
+        The handler calls back inside the window procedure, where tkinter must not be used (it ends
+        the process). Both callbacks therefore only queue the news; ``_drain_ui_callbacks`` acts on it.
+        """
+
+        def _dropped(paths: list[str]) -> None:
+            self._ui_callback_queue.put((self._handle_dropped_files, (paths,)))
+
+        def _device_changed() -> None:
+            self._ui_callback_queue.put((self._on_usb_hotplug, ()))
+
         self._dnd_handler = Win32DragDropHandler(
             self.root,
-            self._handle_dropped_files,
-            is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
-            device_change_callback=self._on_usb_hotplug,
+            _dropped,
+            is_shutting_down_fn=lambda: self._is_shutting_down,
+            device_change_callback=_device_changed,
         )
         self._dnd_handler.setup()
 
@@ -600,6 +615,8 @@ class UltimateAudioStudio(
             return "saving your clip"
         if self._importing:
             return "adding songs to your Library"
+        if self._restoring_original:
+            return "restoring the original song"
         return None
 
     def prepare_for_restart(self) -> None:
@@ -817,7 +834,7 @@ class UltimateAudioStudio(
             self.btn_undo.pack_forget()
         self._undo_callback = None
         if flush and hasattr(self, "library_ctrl"):
-            self.library_ctrl.flush_pending_trash()
+            self.library_ctrl.flush_pending_trash(background=True)
 
     def _on_undo_click(self) -> None:
         """Trigger the active undo callback."""
@@ -876,7 +893,15 @@ class UltimateAudioStudio(
         build_step3_view(self.col3.body, self)
 
     def show_help(self) -> None:
+        """Open the Help Guide, or bring it to the front when it is already open."""
+        existing = self._help_window
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_set()
+            return
         win = tk.Toplevel(self.root)
+        self._help_window = win
         win.title("Ultimate Audio Studio - Help Guide")
         win.geometry("640x600")
         win.minsize(480, 400)
@@ -953,6 +978,9 @@ def _install_crash_logging() -> None:
         too_big = crash_log.is_file() and crash_log.stat().st_size > _CRASH_LOG_MAX_BYTES
         _crash_log_file = open(crash_log, "w" if too_big else "a", encoding="utf-8")
         faulthandler.enable(file=_crash_log_file, all_threads=True)
+        # faulthandler does not see a fatal interpreter error: Python reports that one on stderr,
+        # which the packaged app does not have.
+        send_fatal_errors_to(crash_log)
     except OSError as e:
         logging.getLogger(__name__).warning("crash log unavailable: %s", e)
 

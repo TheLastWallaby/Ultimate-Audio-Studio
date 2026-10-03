@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from app.config import sanitize_filename
+from app.controllers.export_controller import UsbTarget
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
 from app.models import DriveInfo
@@ -233,6 +234,7 @@ class ExportMixin(AppBase):
             self._export_to_cd(files, normalize)
 
     def _export_to_usb(self, files: list[str], normalize: bool) -> None:
+        """Check the chosen drive on a worker, then ask the export questions (``_usb_target_checked``)."""
         choice = self.usb_choice.get()
         if not choice or choice not in self._usb_map:
             dialogs.show_warning(
@@ -247,12 +249,6 @@ class ExportMixin(AppBase):
             return
 
         drive_root = self._usb_map[choice]
-        if not Path(drive_root).exists():
-            dialogs.show_warning(
-                self.root, "Drive Missing", "The selected USB drive can no longer be found. Please plug it in again."
-            )
-            return
-
         fs_type = self._usb_fs_map.get(choice, "")
         if self.export_ctrl.is_ntfs(fs_type) and not dialogs.ask_yes_no(
             self.root,
@@ -267,19 +263,41 @@ class ExportMixin(AppBase):
         ):
             return
 
+        # Reading the drive (is it there, what is on it, how much room is left) can take seconds on
+        # a drive that has gone to sleep, so it is not done on the window's thread.
+        playlist = self.active_playlist_name
+        self.btn_export.config(text="Checking the drive...", state=tk.DISABLED)
+        self.set_busy(True, "Checking the USB drive...")
+
+        def _worker() -> None:
+            target = self.export_ctrl.inspect_usb_target(drive_root, playlist)
+            self._safe_after(0, self._usb_target_checked, files, normalize, choice, drive_root, playlist, target)
+
+        if task_mgr.submit_task(_worker) is None:  # the app is closing
+            self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
+            self.set_busy(False)
+
+    def _usb_target_checked(
+        self, files: list[str], normalize: bool, choice: str, drive_root: str, playlist: str, target: UsbTarget
+    ) -> None:
+        """Ask every remaining question about the drive (nothing on it is touched yet), then start."""
+        self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
+        self.set_busy(False)
+        if not target.connected:
+            dialogs.show_warning(
+                self.root, "Drive Missing", "The selected USB drive can no longer be found. Please plug it in again."
+            )
+            return
+
         # An earlier export of this playlist: its numbered files would otherwise stay on the drive, so
         # songs removed or moved since keep playing (and in the wrong order).
-        playlist_folder = self.export_ctrl.usb_playlist_folder(drive_root, self.active_playlist_name)
-        previous = self.export_ctrl.previous_export_files(playlist_folder)
         clear_existing = False
-        freed_bytes = 0
-        if previous:
-            songs = sum(1 for p in previous if not p.lower().endswith((".m3u", ".m3u8")))
+        if target.previous:
+            songs = sum(1 for p in target.previous if not p.lower().endswith((".m3u", ".m3u8")))
             answer = dialogs.ask_choice(
                 self.root,
                 "Playlist Already on This Drive",
-                f"The drive already has {songs} song(s) from an earlier export of "
-                f"'{self.active_playlist_name}'.\n\n"
+                f"The drive already has {songs} song(s) from an earlier export of '{playlist}'.\n\n"
                 "Replacing them makes the drive match your playlist exactly. Keeping them can leave "
                 "songs you have removed or moved since.",
                 [
@@ -292,44 +310,48 @@ class ExportMixin(AppBase):
             if answer == "cancel":
                 return
             clear_existing = answer == "replace"
-            if clear_existing:
-                freed_bytes = sum(Path(p).stat().st_size for p in previous if Path(p).is_file())
 
-        # Pre-flight disk space validation
         est_bytes = self.export_ctrl.estimate_playlist_bytes(files, self._cached_duration_only, normalize)
-        has_space, free_bytes = self.export_ctrl.check_usb_space(drive_root, est_bytes, freed_bytes)
-        if not has_space:
-            free_mb = free_bytes / (1024 * 1024)
-            needed_mb = est_bytes / (1024 * 1024)
-            dialogs.show_warning(
-                self.root,
-                "Not Enough Space on the USB Drive",
-                f"The selected USB drive only has {free_mb:.0f} MB of free space.\n\n"
-                f"This playlist needs about {needed_mb:.0f} MB.\n\n"
-                "Please delete files from the USB flash drive or use a drive with more free space.",
-            )
-            return
+        if target.free_bytes is not None:
+            free_bytes = target.free_bytes + (target.previous_bytes if clear_existing else 0)
+            if free_bytes < est_bytes:
+                dialogs.show_warning(
+                    self.root,
+                    "Not Enough Space on the USB Drive",
+                    f"The selected USB drive only has {free_bytes / 1024**2:.0f} MB of free space.\n\n"
+                    f"This playlist needs about {est_bytes / 1024**2:.0f} MB.\n\n"
+                    "Please delete files from the USB flash drive or use a drive with more free space.",
+                )
+                return
 
         self._export_drive_root = drive_root
         self._begin_export("Exporting...", f"Exporting {len(files)} songs to the USB flash drive...")
         self.export_ctrl.start_usb_export(
             drive_root,
-            self.active_playlist_name,
+            playlist,
             files,
             normalize,
             on_progress=lambda pct: self._safe_after(0, self._update_export_progress, pct),
             on_status=lambda text: self._safe_after(0, self.set_status, text),
-            # The drive is fixed here: by the time the export ends, another one may be selected.
-            on_success=lambda report: self._safe_after(0, self._usb_export_success, report, choice, drive_root),
+            # The drive and the playlist are fixed here: by the time the export ends, others may be selected.
+            on_success=lambda report: self._safe_after(
+                0, self._usb_export_success, report, choice, drive_root, playlist
+            ),
             on_error=lambda err: self._safe_after(0, self._export_error, err),
-            is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
+            is_shutting_down_fn=lambda: self._is_shutting_down,
             duration_fn=self._cached_duration,
             on_cancelled=lambda done, tot: self._safe_after(0, self._export_cancelled, done, tot, "USB"),
             clear_existing=clear_existing,
         )
 
     def _export_to_cd(self, files: list[str], normalize: bool) -> None:
-        cd_folder = self.export_ctrl.get_cd_burn_folder()
+        """Ask the CD export questions (nothing is removed or written before they are answered), then start."""
+        try:
+            cd_folder = self.export_ctrl.get_cd_burn_folder()
+        except OSError as err:
+            logger.error("The CD folder could not be made: %s", err)
+            show_friendly_error(self.root, err, "export")
+            return
         # Only tracks this app made count (and are ever removed); other files in the folder are the user's.
         previous = self.export_ctrl.previous_export_files(cd_folder)
         clear_existing = False
@@ -350,6 +372,21 @@ class ExportMixin(AppBase):
                 return
             # Nothing is removed here: the export job does it, once every question has been answered.
             clear_existing = answer == "clear"
+
+        # CD tracks are uncompressed, about 10 MB a minute: a full CD needs some 800 MB on this computer.
+        needed = self.export_ctrl.estimate_cd_bytes(files, self._cached_duration_only)
+        freed = sum(Path(p).stat().st_size for p in previous if Path(p).is_file()) if clear_existing else 0
+        has_space, free_bytes = self.export_ctrl.check_usb_space(cd_folder, needed, freed)
+        if not has_space:
+            dialogs.show_warning(
+                self.root,
+                "Not Enough Space on This Computer",
+                f"The CD tracks need about {needed / 1024**2:.0f} MB, but this computer's disk only has "
+                f"{free_bytes / 1024**2:.0f} MB of free space.\n\n"
+                "• Empty the Recycle Bin, or delete files you no longer need.\n"
+                "• Then export the playlist again.",
+            )
+            return
 
         # 80-minute CD capacity validation
         total_sec = self.export_ctrl.get_playlist_duration(files, self._cached_duration_only)
@@ -373,7 +410,7 @@ class ExportMixin(AppBase):
             on_status=lambda text: self._safe_after(0, self.set_status, text),
             on_success=lambda report: self._safe_after(0, self._cd_export_success, cd_folder, report),
             on_error=lambda err: self._safe_after(0, self._export_error, err),
-            is_shutting_down_fn=lambda: getattr(self, "_is_shutting_down", False),
+            is_shutting_down_fn=lambda: self._is_shutting_down,
             on_cancelled=lambda done, tot: self._safe_after(0, self._export_cancelled, done, tot, "CD"),
             clear_existing=clear_existing,
         )
@@ -415,8 +452,10 @@ class ExportMixin(AppBase):
         if hasattr(self, "prog_export"):
             self.prog_export["value"] = pct
 
-    def _usb_export_success(self, report: ExportReport, drive_label: str, drive_root: str) -> None:
-        """Report a finished USB export and offer to eject the drive it was written to."""
+    def _usb_export_success(
+        self, report: ExportReport, drive_label: str, drive_root: str, playlist: str | None = None
+    ) -> None:
+        """Report a finished USB export of ``playlist`` and offer to eject the drive it was written to."""
         problems = export_problems(report)
         if report.stopped == "removed":
             self._end_export("USB export stopped: the drive was unplugged.")
@@ -426,7 +465,7 @@ class ExportMixin(AppBase):
             self._end_export("USB export stopped: the drive is full. Eject the drive before unplugging it.")
         else:
             self._end_export("USB export finished. Eject the drive before unplugging it.")
-        clean_pl = sanitize_filename(self.active_playlist_name or "Playlist")
+        clean_pl = sanitize_filename(playlist or self.active_playlist_name or "Playlist")
         if problems:
             msg = (
                 f"Exported {report.exported} of {report.total} song(s) to the USB flash drive (with "
