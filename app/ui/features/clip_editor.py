@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tkinter as tk
 from pathlib import Path
@@ -15,6 +16,8 @@ from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 from app.ui.theme import COLOR_DOWNLOAD, TEXT_DARK
+
+logger = logging.getLogger(__name__)
 
 # Value of the "Replace the original song" button in the Save Clip dialog.
 CLIP_REPLACE_ORIGINAL = "replace"
@@ -240,6 +243,11 @@ class ClipEditorMixin(AppBase):
         fade_sec: float,
         loop: bool,
     ) -> None:
+        """Play the clip and say in the status bar what the preview includes.
+
+        Boost and fade are heard only from a rendered slice; without one the plain song plays, and
+        the status says so instead of claiming effects that are not in the preview.
+        """
         try:
             # Sets is_playing_main, previewing_clip and clip_end_time, and owns the preview slice file.
             self.playback_ctrl.start_audition(path, s_time, e_time, slice_path, loop=loop)
@@ -249,17 +257,21 @@ class ClipEditorMixin(AppBase):
             self._updating_ui = False
             self._render_waveform()
 
+            wants_effects = abs(gain_db) > 0.05 or soften
             notes = []
-            if abs(gain_db) > 0.05:
+            if slice_path and abs(gain_db) > 0.05:
                 notes.append(f"{gain_db:+.1f}dB boost")
-            if soften:
+            if slice_path and soften:
                 notes.append(f"{fade_sec:.1f}s smooth fade")
             if loop:
                 notes.append("loop on")
             note_str = f" ({', '.join(notes)})" if notes else ""
-            self.set_status(f"Previewing clip from {format_time(s_time)} to {format_time(e_time)}{note_str}.", icon="▶")
-        except Exception as e:
-            log_error(f"test_clip: {e}")
+            text = f"Previewing clip from {format_time(s_time)} to {format_time(e_time)}{note_str}."
+            if wants_effects and not slice_path:
+                text += " The boost and fade could not be added to this preview; Save Clip still adds them."
+            self.set_status(text, icon="▶")
+        except Exception as e:  # last-resort guard: a failed preview must not break the window
+            logger.exception("Test Clip could not start")
             show_friendly_error(self.root, e, "playback")
 
     def _restart_clip_loop(self) -> bool:

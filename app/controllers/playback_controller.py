@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from collections.abc import Sequence
@@ -11,6 +12,11 @@ import pygame
 from app.config import ffmpeg_path, log_error
 from app.core.audio_engine import AudioEngine
 from app.services.clipper import create_audition_slice
+
+logger = logging.getLogger(__name__)
+
+# A seek during a clip preview lands at least this far before the clip's end, so it still plays.
+_CLIP_SEEK_END_MARGIN_SEC = 0.05
 
 
 class PlaybackController:
@@ -80,11 +86,16 @@ class PlaybackController:
                 self.is_paused = False
                 self.play_guard_until = time.monotonic() + 0.45
                 return
-            except Exception:
-                pass
+            except pygame.error as err:
+                logger.info("Unpause failed (%s); reloading at the paused position", err)
         # If scrubbed while paused, the mixer was borrowed, or unpause failed: reload from saved offset
         target_pos = self.paused_position
-        if current_track_path:
+        if self._playing_audition_slice() and self._audition_slice_file:
+            # Reloading the song itself would drop the preview's boost and fade.
+            pygame.mixer.music.load(self._audition_slice_file)
+            pygame.mixer.music.play(start=target_pos - self.clip_start_time)
+            self.audio_engine.start_clock(target_pos)
+        elif current_track_path:
             self.audio_engine.load_and_play(current_track_path, target_pos)
             self.audio_engine.start_clock(target_pos)
         self.is_paused = False
@@ -103,26 +114,42 @@ class PlaybackController:
         if user:
             self.audio_engine.play_start_offset = 0.0
 
-    def seek(self, seconds: float, track_duration: float = 0.0) -> None:
-        """Seek playback to specified seconds position."""
+    def _playing_audition_slice(self) -> bool:
+        """True while Test Clip plays a rendered slice (boost or fade), which holds only the clip."""
+        return self.previewing_clip and self._is_audition_slice and bool(self._audition_slice_file)
+
+    def seek(self, seconds: float, track_duration: float = 0.0) -> float:
+        """Seek playback to ``seconds`` into the song; returns the position it actually went to.
+
+        While Test Clip plays a rendered slice, the slice starts at the clip's start, so the song
+        position is moved into the clip and made relative to it. Seeking the slice to a song
+        position past its short length used to stop the preview.
+        """
         seek_sec = max(0.0, min(track_duration or seconds, seconds))
+        in_slice = self._playing_audition_slice()
+        if in_slice:
+            last = max(self.clip_start_time, self.clip_end_time - _CLIP_SEEK_END_MARGIN_SEC)
+            seek_sec = max(self.clip_start_time, min(last, seek_sec))
+        file_pos = seek_sec - self.clip_start_time if in_slice else seek_sec
         if (self.is_playing_main or self.is_playing_playlist) and not self.is_paused:
             try:
-                pygame.mixer.music.play(start=seek_sec)
+                pygame.mixer.music.play(start=file_pos)
                 self.audio_engine.start_clock(seek_sec)
                 self.play_guard_until = time.monotonic() + 0.45
-            except Exception:
+            except pygame.error as err:
+                logger.info("Seeking with play(start=...) failed (%s); trying set_pos", err)
                 try:
                     pygame.mixer.music.rewind()
-                    pygame.mixer.music.set_pos(seek_sec)
+                    pygame.mixer.music.set_pos(file_pos)
                     self.audio_engine.start_clock(seek_sec)
-                except Exception:
-                    pass
+                except pygame.error as err2:
+                    logger.warning("This audio cannot be sought to %.1f s: %s", seek_sec, err2)
         else:
             self.audio_engine.seek_clock(seek_sec, is_playing=False)
             if self.is_paused:
                 self.paused_position = seek_sec
                 self._scrubbed_while_paused = True
+        return seek_sec
 
     def mark_mixer_taken(self) -> None:
         """Record that another player used the shared mixer, so resuming must reload the track."""
@@ -133,8 +160,7 @@ class PlaybackController:
         """Skip playback position by delta_seconds (+10s or -10s)."""
         curr = self.current_play_seconds()
         new_pos = max(0.0, min(track_duration, curr + delta_seconds))
-        self.seek(new_pos, track_duration)
-        return new_pos
+        return self.seek(new_pos, track_duration)
 
     def current_play_seconds(self) -> float:
         """Get elapsed playback position from high-precision monotonic clock."""
