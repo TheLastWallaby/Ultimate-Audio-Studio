@@ -364,22 +364,6 @@ def fetch_preview_worker(
             on_error(str(e))
 
 
-def cleanup_partial_downloads(library_folder: str) -> None:
-    """Remove stranded .part and .temp files from incomplete downloads."""
-    try:
-        if os.path.exists(library_folder):
-            for f in os.listdir(library_folder):
-                if f.endswith((".part", ".ytdl", ".temp")) or ".temp." in f:
-                    f_path = os.path.join(library_folder, f)
-                    try:
-                        if os.path.isfile(f_path):
-                            os.remove(f_path)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-
 def _finished_mp3(work_dir: Path) -> Path | None:
     """The MP3 a download left in its work folder (the newest, should there be more than one)."""
     mp3s = sorted(work_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)

@@ -6,6 +6,7 @@ import contextlib
 import ctypes
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 MetadataFn = Callable[[str], Mapping[str, Any]]
 
 UNDO_DIR_NAME = ".undo_trash"
+# Temporary files this app makes in the Library folder while it copies, clips or restores a song. Each
+# name carries the id of the process that made it, so no file of the user's can match.
+_WORK_FILE_RE = re.compile(
+    r"^(?:\.clip_tmp_(?P<clip_pid>\d+)_\d+\.(?:mp3|wav)|.+\.(?P<pid>\d+)\.(?:partial|incoming|restoring))$"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -65,6 +71,31 @@ def _free_name(dest: Path, taken_names: set[str]) -> Path:
         if candidate.name.casefold() not in taken_names and not candidate.exists():
             return candidate
         number += 1
+
+
+def remove_stale_work_files(folder: Path) -> int:
+    """Remove the app's own unfinished temporary files that an earlier run left in ``folder``.
+
+    A run that was ended mid-save (a crash, the power going) leaves its half-made copy or clip
+    behind; a leftover clip even shows up in the Library as a song. Files of this run are kept: one
+    of them may be in use right now. Returns the number of files removed.
+    """
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    for entry in entries:
+        match = _WORK_FILE_RE.match(entry.name)
+        if match is None or int(match.group("clip_pid") or match.group("pid")) == os.getpid():
+            continue
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError as err:
+            logger.warning("Could not remove the leftover file %s: %s", entry.name, err)
+    return removed
 
 
 def _hide_path(path: str) -> None:
@@ -391,22 +422,27 @@ class LibraryController:
             _trash_staged_file(staging_path, orig_path)
 
     @staticmethod
-    def recover_stranded_deletes(folder: str | None) -> int:
-        """Send files left in the undo area by a crash or forced exit to the Recycle Bin.
+    def recover_stranded_deletes(folder: str | Path | None) -> int:
+        """Tidy the Library folder after a crash or forced exit; returns the number of files handled.
 
-        Returns the number of files handled. Legacy '<name>.undo' files are supported too.
+        Files left in the undo area go to the Recycle Bin (legacy '<name>.undo' files too), and the
+        app's own unfinished temporary files are removed (``remove_stale_work_files``).
         """
-        undo_root = os.path.join(folder or "", UNDO_DIR_NAME)
-        if not folder or not os.path.isdir(undo_root):
+        if not folder:
             return 0
-        handled = 0
+        library = Path(folder)
+        handled = remove_stale_work_files(library)
+        undo_root = library / UNDO_DIR_NAME
+        if not undo_root.is_dir():
+            return handled
+        # os.walk, not Path.walk: that one needs Python 3.12.
         for root_dir, _dirs, files in os.walk(undo_root, topdown=False):
             for name in files:
                 original_name = name[: -len(".undo")] if name.endswith(".undo") else name
-                _trash_staged_file(os.path.join(root_dir, name), os.path.join(folder, original_name))
+                _trash_staged_file(str(Path(root_dir) / name), str(library / original_name))
                 handled += 1
             with contextlib.suppress(OSError):
-                os.rmdir(root_dir)
+                Path(root_dir).rmdir()
         return handled
 
     def import_external_files(

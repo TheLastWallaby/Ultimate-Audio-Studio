@@ -105,10 +105,7 @@ class TestDownloadJobs(unittest.TestCase):
         tasks = _InlineTasks()
         first_success: list[str] = []
         second_success: list[str] = []
-        with (
-            patch("app.controllers.download_controller.task_mgr", tasks),
-            patch("app.controllers.download_controller.cleanup_partial_downloads") as cleanup,
-        ):
+        with patch("app.controllers.download_controller.task_mgr", tasks):
             dl.start_download("u1", "lib", MagicMock(), first_success.append, MagicMock(), MagicMock())
             first_job = dl.cancel_event
             dl.cancel()
@@ -121,7 +118,6 @@ class TestDownloadJobs(unittest.TestCase):
             self.assertIs(job, first_job)
             on_cancelled()
             on_success("old.mp3")
-            cleanup.assert_not_called()
         self.assertTrue(dl.is_downloading)
         self.assertEqual(first_success, [])
         self.assertEqual(second_success, [])
