@@ -927,6 +927,8 @@ class UltimateAudioStudio(
         help_text = (
             "STEP 1: GETTING MUSIC\n"
             "• Search or Paste: Type any song and artist, or paste a YouTube link, then click 'Download MP3'.\n"
+            "• More Songs: While a song is downloading you can choose the next ones; they are downloaded "
+            "one after the other.\n"
             "• Add Music from PC: Click 'Add Music from PC' or drag & drop audio files directly into the window.\n"
             "• Search Library: Use the search bar to filter songs by title or artist.\n\n"
             "STEP 2: PLAYING & CLIPPING\n"

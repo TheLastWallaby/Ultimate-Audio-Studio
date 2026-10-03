@@ -30,12 +30,16 @@ class DownloadController:
     callback from a job that has since been replaced is dropped (progress, results, the
     ``is_downloading`` flag, and partial-file cleanup that could hit the new job's files). Starting
     a job stops the one it replaces: a job that can no longer report back must not keep running.
+
+    A search is a job of its own kind: it replaces an earlier search, but leaves a download alone,
+    so the next song can be looked up while one is being downloaded.
     """
 
     def __init__(self, app: object) -> None:
         self.app = app
         self.is_downloading = False
         self._download_cancel = threading.Event()
+        self._search_cancel = threading.Event()
 
     @property
     def cancel_event(self) -> threading.Event:
@@ -43,8 +47,9 @@ class DownloadController:
         return self._download_cancel
 
     def cancel(self) -> None:
-        """Cancel the active download or search worker."""
+        """Cancel the active download and the active search."""
         self._download_cancel.set()
+        self._search_cancel.set()
 
     def reset_cancel(self) -> threading.Event:
         """Start a new job: stop the one it replaces and give the new one a fresh cancel event.
@@ -110,16 +115,22 @@ class DownloadController:
         on_success: Callable[[list[SearchResult]], None],
         on_error: Callable[[str], None],
     ) -> None:
-        """Start YouTube search worker thread (a stopped or replaced search never delivers its results)."""
-        job = self.reset_cancel()
-        task_mgr.submit_task(
-            search_youtube_worker,
-            query,
-            max_results,
-            job,
-            self._for_job(job, on_success),
-            self._for_job(job, on_error),
-        )
+        """Search YouTube on a worker; a stopped or replaced search never delivers its results.
+
+        A download that is running goes on: only an earlier search is replaced.
+        """
+        self._search_cancel.set()
+        job = self._search_cancel = threading.Event()
+
+        def _results(results: list[SearchResult]) -> None:
+            if job is self._search_cancel and not job.is_set():
+                on_success(results)
+
+        def _failed(err: str) -> None:
+            if job is self._search_cancel and not job.is_set():
+                on_error(err)
+
+        task_mgr.submit_task(search_youtube_worker, query, max_results, job, _results, _failed)
 
     def start_download(
         self,
