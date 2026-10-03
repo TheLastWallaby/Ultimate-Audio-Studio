@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from app.controllers.download_controller import DownloadController
 from app.controllers.library_controller import LibraryController
 from app.controllers.playlist_controller import PlaylistController
+from app.core.cache_manager import cache_mgr
 from app.main import STATUS_BAR_BG, UltimateAudioStudio
 from app.services.downloader import download_playlist_worker
 from app.ui.theme import COLOR_PLAY
@@ -251,14 +252,23 @@ class TestMultiDelete(unittest.TestCase):
 class TestMainWindowHelpers(unittest.TestCase):
     def test_library_watcher_notices_renames(self) -> None:
         app = _make_app()
+        known = {"title": "", "artist": "", "duration": 100.0}
         try:
-            with tempfile.TemporaryDirectory() as td:
+            with (
+                tempfile.TemporaryDirectory() as td,
+                patch("app.ui.features.library.read_track_metadata") as read_details,
+            ):
                 Path(td, "old name.mp3").write_text("x")
                 app.library_folder = td
+                # With the details already known, no background reader (tinytag, then ffprobe) holds
+                # the file open while it is renamed or while the folder is deleted (WinError 32).
+                cache_mgr.set_metadata(os.path.join(app.library_folder, "old name.mp3"), known)
                 app.refresh_library()
                 os.rename(os.path.join(td, "old name.mp3"), os.path.join(td, "new name.mp3"))
+                cache_mgr.set_metadata(os.path.join(app.library_folder, "new name.mp3"), known)
                 app._watch_library()
                 self.assertEqual(app.library_files, ["new name.mp3"])
+            read_details.assert_not_called()
         finally:
             app.on_close()
 
