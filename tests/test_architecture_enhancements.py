@@ -129,3 +129,15 @@ def test_each_test_starts_from_the_default_settings() -> None:
     assert not os.path.exists(PLAYLISTS_PATH)
     assert settings_mgr.get_settings().library_folder == ""
     assert settings_mgr.damaged_copy is None and not settings_mgr.read_failed
+
+
+def test_tests_use_the_silent_audio_driver() -> None:
+    """The mixer must start on any machine: without an audio device it waits 8 s before it gives up."""
+    import pygame
+
+    from app.core.audio_engine import AudioEngine
+
+    AudioEngine()
+
+    assert os.environ.get("SDL_AUDIODRIVER") == "dummy"
+    assert pygame.mixer.get_init() is not None
