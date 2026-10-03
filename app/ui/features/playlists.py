@@ -408,11 +408,11 @@ class PlaylistMixin(AppBase):
         be skipped through forever, and Stop could not end it.
         """
         total = len(self.playlist_files)
+        self.set_status(f"Skipping missing song: {Path(path).name}", icon="⚠️")
         next_index = self.playlist_index + 1
         if next_index >= total and self.repeat_playlist.get():
             next_index = 0
         if next_index < total and skipped < total:
-            self.set_status(f"Skipping missing song: {Path(path).name}", icon="⚠️")
             self.playlist_index = next_index
             self._pl_skip_timer = self.root.after(MISSING_SONG_SKIP_MS, self._play_current_pl_track, skipped)
             return
