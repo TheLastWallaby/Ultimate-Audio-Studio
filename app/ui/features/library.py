@@ -507,15 +507,24 @@ class LibraryMixin(AppBase):
             )
 
     def _undo_delete_file(self) -> None:
-        try:
-            if self.library_ctrl.undo_delete(self.playlists):
-                self._resync_playlist_index()
-                self.save_playlists()
-                self.refresh_playlist_listbox()
-                self.refresh_library()
-                self.set_status("Restored deleted song(s).", icon="↩️")
-        except Exception as e:
-            log_error(f"_undo_delete_file: {e}")
+        """Undo button after a delete: bring the song(s) back and say so (or offer to try again)."""
+        result = self.library_ctrl.undo_delete(self.playlists)
+        if not result:
+            self.show_undo("The song(s) could not be put back. Press Undo to try again.", self._undo_delete_file)
+            return
+        self._resync_playlist_index()
+        self.save_playlists()
+        self.refresh_playlist_listbox()
+        self.refresh_library()
+        message = "Restored deleted song(s)."
+        if result.renamed:
+            message += (
+                f" A newer song has taken the old name, so one came back as '{result.renamed[0]}'."
+                if len(result.renamed) == 1
+                else f" Newer songs have taken {len(result.renamed)} of the old names, so those came back "
+                f"with a number, like '{result.renamed[0]}'."
+            )
+        self.set_status(message, icon="↩️")
 
     def on_library_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         """A Library row was clicked: load it into the player, unless a song is playing or paused.
