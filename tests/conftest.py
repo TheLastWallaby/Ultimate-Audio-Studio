@@ -43,6 +43,12 @@ os.environ.update(
 )
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
+# SDL's silent "dummy" audio driver, set before anything imports pygame. The tests never need to be
+# heard, and on a PC without an audio device (the GitHub runners) pygame.mixer.init() waits 8 s
+# before it gives up, once for every window a test opens. setdefault: a run can still choose a
+# real driver through the environment.
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
 TK_STARTUP_ATTEMPTS = 3
 
 
