@@ -8,7 +8,7 @@ import tkinter as tk
 from collections.abc import Callable
 
 from app.config import APP_VERSION, log_error
-from app.core.task_manager import task_mgr
+from app.core.task_manager import network_task_mgr as task_mgr
 from app.models import ReleaseInfo
 from app.services.updater import PendingUpdate, check_latest_release, failed_update_tag, stage_update
 

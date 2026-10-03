@@ -282,6 +282,8 @@ def test_clock_only_ends_a_song_well_past_its_known_length(studio: UltimateAudio
 
         studio.audio_engine.seek_clock(100.0 + player_feature.END_OF_SONG_GRACE_SEC + 0.1, is_playing=False)
         studio._monitor_tick()
+        # The song's real length is measured first (on a worker); it is no longer than the header said.
+        _pump(studio, lambda: not studio.is_playing_main)
         assert not studio.is_playing_main  # a mixer that never reports the end cannot hang the player
 
 

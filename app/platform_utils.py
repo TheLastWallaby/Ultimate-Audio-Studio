@@ -98,6 +98,8 @@ def enable_windows_dpi() -> None:
 
 
 _instance_mutex: int | None = None
+_INSTANCE_MUTEX_NAME = "Local\\UltimateAudioStudioSingleInstance"
+_ERROR_ALREADY_EXISTS = 183
 
 
 def already_running() -> bool:
@@ -105,12 +107,16 @@ def already_running() -> bool:
     global _instance_mutex
     if os.name != "nt":
         return False
-    # Use Local\ namespace so standard non-admin user accounts don't fail with ERROR_ACCESS_DENIED
-    kernel32 = ctypes.windll.kernel32
+    # use_last_error: ctypes then keeps the error code of this very call. Asking Windows for it
+    # afterwards (GetLastError) can return the code of a call Python made in between, and a second
+    # copy of the app would start and overwrite the first one's playlists.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.restype = ctypes.c_void_p
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\UltimateAudioStudioSingleInstance")
-    return bool(kernel32.GetLastError() == 183)
+    ctypes.set_last_error(0)
+    # Local\ namespace, so standard (non-admin) accounts do not fail with ERROR_ACCESS_DENIED.
+    _instance_mutex = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+    return ctypes.get_last_error() == _ERROR_ALREADY_EXISTS
 
 
 def release_instance_mutex() -> None:

@@ -46,7 +46,7 @@ from app.controllers import (
 )
 from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
-from app.core.task_manager import task_mgr
+from app.core.task_manager import network_task_mgr, task_mgr
 from app.platform_utils import (
     Win32DragDropHandler,
     activate_existing_window,
@@ -107,7 +107,11 @@ from app.ui.views.step2_player import build_step2_view
 from app.ui.views.step3_export import build_step3_view
 from app.ui.waveform_view import WaveformView
 
+logger = logging.getLogger(__name__)
+
 STATUS_BAR_BG = "#0f172a"
+# How often the window looks for results that worker threads have queued for it.
+UI_QUEUE_POLL_MS = 25
 # The window title starts with this; a second start finds the open window by it.
 WINDOW_TITLE_PREFIX = "Ultimate Audio Studio v"
 STATUS_FLASH_MS = 5000
@@ -307,29 +311,27 @@ class UltimateAudioStudio(
         self.monitor_audio()
 
     def _drain_ui_callbacks(self) -> None:
-        """Drain and execute queued worker callbacks on Tkinter main thread."""
-        if getattr(self, "_is_shutting_down", False):
+        """Run the callbacks that workers queued, on the Tkinter thread, and come back shortly.
+
+        The next run is scheduled before any callback runs. A callback that opens a dialog waits
+        inside that dialog until it is closed; scheduled afterwards, nothing from any other worker
+        (export progress, a finished download, the next playlist song being ready) arrived until then.
+        """
+        if self._is_shutting_down:
             return
-        while True:
+        with contextlib.suppress(tk.TclError):  # the window is already gone
+            self._drain_timer = self.root.after(UI_QUEUE_POLL_MS, self._drain_ui_callbacks)
+        while not self._is_shutting_down:
             try:
-                item = self._ui_callback_queue.get_nowait()
+                callback, args = self._ui_callback_queue.get_nowait()
             except queue.Empty:
                 break
             try:
-                cb, args = item
-                cb(*args)
-            except Exception as e:
-                import traceback
-
-                log_error(f"_drain_ui_callbacks: {e}\n{traceback.format_exc()}")
+                callback(*args)
+            except Exception:  # last-resort guard: one failed update must not stop the ones behind it
+                logger.exception("A queued window update failed")
             finally:
                 self._ui_callback_queue.task_done()
-        if not getattr(self, "_is_shutting_down", False):
-            try:
-                if hasattr(self, "root") and self.root and self.root.winfo_exists():
-                    self._drain_timer = self.root.after(25, self._drain_ui_callbacks)
-            except Exception:
-                pass
 
     def _safe_after(self, delay: int, callback: UiCallback, *args: Any) -> None:
         """Safely schedule a callback on Tkinter main thread, guarding against Python 3.13 cross-thread errors."""
@@ -546,6 +548,7 @@ class UltimateAudioStudio(
         self.export_ctrl.cancel()
         self.update_ctrl.cancel_staging()
         task_mgr.shutdown(wait=False, cancel_futures=True)
+        network_task_mgr.shutdown(wait=False, cancel_futures=True)
         self._teardown_drag_and_drop()
         if hasattr(self, "_waveform_queue"):
             try:

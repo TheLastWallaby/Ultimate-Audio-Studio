@@ -187,18 +187,23 @@ class LibraryController:
         self._pending_deletes: list[PendingDelete] = []
         self._search_index: dict[str, str] = {}
 
-    def scan_files(self, folder: str) -> list[str]:
-        """Return sorted list of audio filenames in folder."""
-        if not folder or not os.path.exists(folder):
-            try:
-                os.makedirs(folder, exist_ok=True)
-            except Exception:
-                return []
-        try:
-            return sorted([f for f in os.listdir(folder) if f.lower().endswith(AUDIO_EXTS)], key=lambda s: s.lower())
-        except Exception as e:
-            log_error(f"LibraryController.scan_files: {e}")
+    def scan_files(self, folder: str | Path) -> list[str]:
+        """The audio file names in ``folder``, sorted; empty when the folder cannot be read.
+
+        The app's own unfinished files are left out: a clip is cut under a temporary ``.mp3`` name
+        in this folder, and it would otherwise show as a song until the save has finished.
+        """
+        library = Path(folder)
+        if not str(folder):
             return []
+        try:
+            library.mkdir(parents=True, exist_ok=True)
+            names = [entry.name for entry in library.iterdir()]
+        except OSError as err:
+            logger.warning("The Library folder %s could not be read: %s", library, err)
+            return []
+        songs = [name for name in names if name.lower().endswith(AUDIO_EXTS) and not _WORK_FILE_RE.match(name)]
+        return sorted(songs, key=str.lower)
 
     def scan_and_filter(
         self, folder: str, query: str = "", get_metadata_fn: MetadataFn | None = None

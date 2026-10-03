@@ -3,6 +3,7 @@
 import os
 import tempfile
 import threading
+import time
 import tkinter as tk
 import unittest
 from unittest.mock import patch
@@ -78,6 +79,10 @@ class TestUSBExportFsTypeResolution(unittest.TestCase):
         with patch("os.path.exists", return_value=True), patch("pathlib.Path.exists", return_value=True):
             # Calling export_playlist should evaluate is_ntfs(fs_type) safely and trigger the askyesno warning
             app.export_playlist()
+            deadline = time.monotonic() + 5.0  # the songs are looked for on a worker first
+            while not mock_ask.called and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
 
         # Verify askyesno was called (meaning fs_type was checked without raising NameError)
         mock_ask.assert_called_once()

@@ -11,8 +11,10 @@ import threading
 import wave
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.config import CREATE_NO_WINDOW, ffmpeg_path, log_error
+from app.core.metadata import read_track_metadata
 
 
 def _samples_to_peaks(samples: Sequence[int], n_bars: int) -> list[float]:
@@ -36,6 +38,12 @@ def _samples_to_peaks(samples: Sequence[int], n_bars: int) -> list[float]:
 
 
 ANALYSIS_RATE_HZ = 4000
+# FFmpeg decodes many times faster than the music plays, so a twentieth of the song's length (plus a
+# margin) is plenty even on a slow PC. The fixed 25 seconds this replaces was too short there for a
+# recording of an hour or two, which then never got a waveform.
+_ANALYSIS_TIMEOUT_MIN_SEC = 25
+_ANALYSIS_TIMEOUT_MAX_SEC = 300
+_ANALYSIS_TIMEOUT_UNKNOWN_SEC = 60
 _BLOCK_SECONDS = 0.4
 _ABSOLUTE_GATE_DB = -70.0
 _RELATIVE_GATE_DB = -10.0
@@ -121,6 +129,14 @@ def _analysis_from_wav_file(audio_path: str, n_bars: int, cancel_event: threadin
     return _analysis_from_samples(samples, n_bars, rate // step)
 
 
+def analysis_timeout_sec(audio_path: str | Path) -> int:
+    """Seconds FFmpeg may take to decode ``audio_path`` for its waveform, scaled to the song's length."""
+    duration = read_track_metadata(str(audio_path), probe_fallback=False).duration
+    if duration <= 0:
+        return _ANALYSIS_TIMEOUT_UNKNOWN_SEC
+    return int(min(_ANALYSIS_TIMEOUT_MAX_SEC, max(_ANALYSIS_TIMEOUT_MIN_SEC, 15 + duration / 20)))
+
+
 def analyze_audio(
     audio_path: str,
     n_bars: int = 220,
@@ -136,6 +152,7 @@ def analyze_audio(
         return empty
     if cancel_event and cancel_event.is_set():
         return empty
+    timeout = analysis_timeout_sec(audio_path)
 
     # 1. Fast direct extraction via ffmpeg raw PCM pipe
     proc = None
@@ -172,7 +189,7 @@ def analyze_audio(
                 pass
 
         try:
-            stdout_data, stderr_data = proc.communicate(timeout=25)
+            stdout_data, stderr_data = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_data, stderr_data = proc.communicate()
@@ -254,7 +271,7 @@ def analyze_audio(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             creationflags=CREATE_NO_WINDOW,
-            timeout=25,
+            timeout=timeout,
         )
         if res.returncode == 0 and os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 44:
             with wave.open(tmp_wav, "rb") as wf:

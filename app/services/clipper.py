@@ -224,7 +224,6 @@ def clip_audio_worker(
     source = str(filepath)
     target = Path(save_name)
     save_dir = target.absolute().parent
-    save_dir.mkdir(parents=True, exist_ok=True)
     wav = target.suffix.lower() == ".wav"
     tmp_ext = ".wav" if wav else ".mp3"
     tmp_save = save_dir / f".clip_tmp_{os.getpid()}_{int(time.time() * 1000)}{tmp_ext}"
@@ -234,6 +233,8 @@ def clip_audio_worker(
     replaced = False
 
     try:
+        # Inside the guard: on a drive that has gone, this fails, and the window must hear of it.
+        save_dir.mkdir(parents=True, exist_ok=True)
         dur = max(0.01, e_time - s_time)
         audio_filter = clip_filter_chain(dur, gain_db, soften, fade_sec)
         timeout = _clip_timeout_sec(e_time)
