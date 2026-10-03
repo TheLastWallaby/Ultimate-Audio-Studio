@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 import tkinter as tk
 from collections.abc import Callable
@@ -343,3 +344,73 @@ def test_songs_on_an_unplugged_drive_are_not_relinked_to_namesakes(tmp_path: Pat
 
     assert controller.playlists["Car"] == [on_usb]
     assert controller.playlists["Kitchen"] == [str(library / "01 Track 1.wma")]
+
+
+# --- Written through to the disk before the swap --------------------------------------------------------
+
+
+def _record_order(module: str, events: list[str]) -> contextlib.ExitStack:
+    """Patch ``os.fsync`` and ``os.replace`` (as seen by ``module``) to note the order they run in."""
+    import os
+
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def _replace(src: Any, dst: Any) -> None:
+        events.append("replace")
+        real_replace(src, dst)
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch(f"{module}.os.fsync", side_effect=_fsync))
+    stack.enter_context(patch(f"{module}.os.replace", side_effect=_replace))
+    return stack
+
+
+def test_a_copied_song_is_on_the_disk_before_it_is_renamed_into_place(tmp_path: Path) -> None:
+    from app.core.file_utils import copy_file_atomic
+
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"ID3" + bytes(4096))
+    events: list[str] = []
+    with _record_order("app.core.file_utils", events):
+        copy_file_atomic(src, tmp_path / "copy.mp3")
+
+    assert events == ["fsync", "replace"]
+    assert (tmp_path / "copy.mp3").read_bytes() == src.read_bytes()
+
+
+def test_saved_settings_and_playlists_are_on_the_disk_before_the_swap(tmp_path: Path) -> None:
+    from app.core.file_utils import atomic_save_json
+
+    events: list[str] = []
+    with _record_order("app.core.file_utils", events):
+        atomic_save_json(tmp_path / "playlists.json", {"My Playlist": ["a.mp3"]})
+
+    assert events == ["fsync", "replace"]
+
+
+def test_a_clip_is_on_the_disk_before_it_replaces_the_song(tmp_path: Path) -> None:
+    from app.core.process_utils import ProcessResult
+    from app.services import clipper
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"ID3" + bytes(4096))
+    events: list[str] = []
+
+    def _ffmpeg(args: list[str], **_kwargs: object) -> ProcessResult:
+        Path(args[-1]).write_bytes(b"ID3 clip")
+        return ProcessResult(0, "", "")
+
+    done: list[str] = []
+    with (
+        patch.object(clipper, "run_ffmpeg", side_effect=_ffmpeg),
+        patch.object(clipper, "fsync_file", side_effect=lambda p: events.append(f"fsync {Path(p).suffix}")),
+        patch.object(clipper, "_replace_with_retry", side_effect=lambda s, d: events.append("replace")),
+    ):
+        clipper.clip_audio_worker(song, 1.0, 2.0, song, is_self_overwrite=True, on_success=lambda *a: done.append("ok"))
+
+    assert events == ["fsync .mp3", "replace"]
+    assert done == ["ok"]
