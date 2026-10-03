@@ -639,3 +639,28 @@ def test_volume_boost_is_reset_for_another_song_but_kept_for_the_same_one(studio
     assert studio._load_track_ui(second, "second.mp3")
     assert float(studio.scale_gain.get()) == 0.0
     assert "0 dB" in studio.lbl_gain.cget("text")
+
+
+# --- A failed update check in plain words ---------------------------------------------------------------
+
+
+def test_a_failed_update_check_is_explained_without_technical_text(studio: Any) -> None:
+    raw = "Update check error: <urlopen error [Errno 11001] getaddrinfo failed>"
+    with (
+        patch("app.ui.features.updates.show_friendly_error") as shown,
+        patch("app.ui.dialogs.show_warning") as warned,
+    ):
+        studio._handle_manual_update_result(False, None, raw)
+
+    warned.assert_not_called()
+    shown.assert_called_once_with(studio.root, raw, "update")
+    message = friendly_error(raw, "update")
+    assert message.title == "No Internet Connection"
+    assert "getaddrinfo" not in message.message
+
+
+def test_a_github_refusal_is_not_explained_as_youtube_refusing_a_download() -> None:
+    message = friendly_error("GitHub API error 403: Forbidden.", "update")
+
+    assert message.title == "Could Not Check for Updates"
+    assert "YouTube" not in message.message and "403" not in message.message

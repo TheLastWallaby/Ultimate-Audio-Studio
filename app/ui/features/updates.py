@@ -8,6 +8,7 @@ from app.config import APP_VERSION
 from app.models import ReleaseInfo
 from app.services.updater import PendingUpdate
 from app.ui import dialogs
+from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
 
 
@@ -84,11 +85,7 @@ class UpdatesMixin(AppBase):
             self._open_update_dialog()
         elif err:
             self.set_status("Update check failed.", icon="⚠️")
-            dialogs.show_warning(
-                self.root,
-                "Could Not Check for Updates",
-                f"{err}\n\nCheck your internet connection and try again later.",
-            )
+            show_friendly_error(self.root, err, "update")  # the raw text stays under "Copy Details"
         else:
             self.set_status(f"Ultimate Audio Studio is up to date (v{APP_VERSION}).", icon="✅")
             dialogs.show_info(
