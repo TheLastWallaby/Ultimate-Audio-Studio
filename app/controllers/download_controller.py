@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -18,6 +19,8 @@ from app.services.downloader import (
     resolve_download_query,
     search_youtube_worker,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DownloadController:
@@ -72,17 +75,24 @@ class DownloadController:
         """Check if URL names a single video (so "just this song" can be offered)."""
         return has_video_id(url)
 
-    def probe_playlist(self, url: str, on_done: Callable[[dict[str, Any] | None], None]) -> None:
+    def probe_playlist(self, url: str, on_done: Callable[[dict[str, Any] | None, str | None], None]) -> None:
         """Read a playlist's title and songs in the background, as a job Stop can cancel.
 
-        ``on_done(info)`` gets ``{"title", "count", "entries"}`` or None when it could not be read.
+        ``on_done(info, error)`` gets ``{"title", "count", "entries"}`` (None when the playlist has no
+        songs), or None and the reason when YouTube could not be reached or read.
         """
         job = self.reset_cancel()
 
         def _worker() -> None:
-            info = probe_playlist_info(url)
+            info: dict[str, Any] | None = None
+            error: str | None = None
+            try:
+                info = probe_playlist_info(url)
+            except Exception as err:  # last-resort guard: yt-dlp raises many kinds; the window must hear back
+                logger.warning("Reading the playlist %s failed: %s", url, err)
+                error = str(err)
             if not job.is_set():
-                self._for_job(job, on_done)(info)
+                self._for_job(job, on_done)(info, error)
 
         task_mgr.submit_task(_worker)
 
@@ -177,7 +187,12 @@ class DownloadController:
             on_batch_complete(downloaded_files, total)
 
         def _worker() -> None:
-            info = probed if probed is not None else probe_playlist_info(url)
+            try:
+                info = probed if probed is not None else probe_playlist_info(url)
+            except Exception as err:  # last-resort guard: yt-dlp raises many kinds; the window must hear back
+                logger.warning("Reading the playlist %s failed: %s", url, err)
+                self._for_job(job, _error)(str(err))
+                return
             if job.is_set():
                 self._for_job(job, _cancelled)()
                 return

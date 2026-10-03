@@ -7,7 +7,7 @@ import tkinter as tk
 from typing import Any
 
 from app.config import YOUTUBE_RE, ffmpeg_path
-from app.core.errors import friendly_error
+from app.core.errors import friendly_error, is_recognised
 from app.models import SearchResult
 from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
@@ -104,12 +104,19 @@ class DownloadMixin(AppBase):
         self.btn_cancel_dl.config(state=tk.NORMAL)
         self.set_busy(True, "Checking the YouTube playlist...")
         self.download_ctrl.probe_playlist(
-            url, on_done=lambda info: self._safe_after(0, self._on_playlist_checked, url, info)
+            url, on_done=lambda info, error: self._safe_after(0, self._on_playlist_checked, url, info, error)
         )
 
-    def _on_playlist_checked(self, url: str, info: dict[str, Any] | None) -> None:
+    def _on_playlist_checked(self, url: str, info: dict[str, Any] | None, error: str | None = None) -> None:
+        """Offer the playlist's songs, or explain why it could not be read (offline, YouTube changed...)."""
         self._reset_download_ui()
         self.set_busy(False)
+        if error and is_recognised(error):
+            # Being offline is not "private or empty": say what is wrong, and look for a fix.
+            self.set_status("The YouTube playlist could not be read.", icon="⚠️")
+            self._look_for_update_after_failure([error])
+            show_friendly_error(self.root, error, "download")
+            return
         single_ok = self.download_ctrl.has_video(url)
         if not info or not info.get("entries"):
             if single_ok and dialogs.ask_yes_no(
@@ -258,8 +265,10 @@ class DownloadMixin(AppBase):
         self.playback_ctrl.mark_mixer_taken()
 
     def _handle_search_error(self, err: str) -> None:
+        """Explain a failed search, and look for a fix when a newer version is the likely cure."""
         self._reset_download_ui()
         self.set_busy(False, "Search failed.")
+        self._look_for_update_after_failure([err])
         show_friendly_error(self.root, err, "search")
 
     def _start_download_url(self, target_url: str, display_title: str | None = None) -> None:

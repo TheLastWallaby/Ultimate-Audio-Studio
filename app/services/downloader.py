@@ -143,7 +143,11 @@ def is_playlist_url(query: str) -> bool:
 
 
 def probe_playlist_info(url: str) -> dict[str, Any] | None:
-    """Retrieve playlist title and item count using flat metadata extraction."""
+    """Read a playlist's title and songs without downloading; None when it has no songs.
+
+    Raises (``yt_dlp.utils.DownloadError``, ``OSError``) when YouTube could not be reached or read,
+    so the caller can say why instead of calling the playlist empty.
+    """
     ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
@@ -152,28 +156,26 @@ def probe_playlist_info(url: str) -> dict[str, Any] | None:
         "cachedir": YT_CACHE_DIR,
         "socket_timeout": 15,
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return None
-            entries = list(info.get("entries") or [])
-            valid_entries = [e for e in entries if e]
-            if not valid_entries:
-                return None
-            title = info.get("title") or "YouTube Playlist"
-            return {
-                "title": title,
-                "count": len(valid_entries),
-                "entries": valid_entries,
-            }
-    except Exception as e:
-        log_error(f"probe_playlist_info: {e}")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
         return None
+    valid_entries = [e for e in list(info.get("entries") or []) if e]
+    if not valid_entries:
+        return None
+    return {
+        "title": info.get("title") or "YouTube Playlist",
+        "count": len(valid_entries),
+        "entries": valid_entries,
+    }
 
 
 def search_youtube(query: str, max_results: int = 10) -> list[SearchResult]:
-    """Search YouTube for matching tracks using yt-dlp metadata extraction without downloading."""
+    """Search YouTube for matching tracks without downloading; an empty list means no matches.
+
+    Raises (``yt_dlp.utils.DownloadError``, ``OSError``) when the search itself failed: being offline
+    or a YouTube change must not be reported as "no matches".
+    """
     q = query.strip()
     if not q:
         return []
@@ -186,13 +188,9 @@ def search_youtube(query: str, max_results: int = 10) -> list[SearchResult]:
         "cachedir": YT_CACHE_DIR,
         "socket_timeout": 20,
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=False)
-            entries = list(info.get("entries") or []) if (info and isinstance(info, dict)) else []
-    except Exception as e:
-        log_error(f"search_youtube query '{query}': {e}")
-        return []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(search_query, download=False)
+    entries = list(info.get("entries") or []) if (info and isinstance(info, dict)) else []
 
     results = []
     for entry in entries:

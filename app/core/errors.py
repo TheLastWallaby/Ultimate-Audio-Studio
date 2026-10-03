@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-__all__ = ["FriendlyError", "friendly_error"]
+__all__ = ["FriendlyError", "friendly_error", "is_recognised"]
 
 ErrorContext = Literal["download", "search", "export", "save_clip", "playback", "import", "generic"]
 
@@ -170,6 +170,12 @@ _GENERIC: dict[ErrorContext, FriendlyError] = {
     "import": FriendlyError("Could Not Add Songs", "Some songs could not be copied into your Library."),
     "generic": FriendlyError("Something Went Wrong", "The app hit an unexpected problem."),
 }
+
+
+def is_recognised(raw: object) -> bool:
+    """True when the error has a specific explanation (offline, YouTube changed...), not just a generic one."""
+    text = str(raw or "")
+    return any(rule.pattern.search(text) for rule in _RULES)
 
 
 def friendly_error(raw: object, context: ErrorContext = "generic") -> FriendlyError:
