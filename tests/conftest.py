@@ -90,6 +90,26 @@ def _working_task_manager() -> None:
     task_mgr.restart()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_settings_and_playlists() -> None:
+    """Start every test from the default settings and an empty playlist, like a first start.
+
+    A window saves its settings and playlists when it closes, and many tests point the Library at a
+    temporary folder that is deleted afterwards. The app keeps a saved folder that is missing (it may
+    be an unplugged drive), so without this every later window would start without its Library and
+    schedule a "Music Folder Not Found" warning, and open playlists left by other tests.
+    """
+    from app.config import PLAYLISTS_PATH, SETTINGS_PATH, settings_mgr
+    from app.controllers.playlist_controller import last_good_path
+
+    # The spare copy goes too, or the app would "restore" the playlists from it and say so.
+    for leftover in (Path(SETTINGS_PATH), Path(PLAYLISTS_PATH), last_good_path(Path(PLAYLISTS_PATH))):
+        with contextlib.suppress(FileNotFoundError):
+            leftover.unlink()
+    settings_mgr.reload()
+    settings_mgr.damaged_copy = None
+
+
 @pytest.fixture
 def studio(tmp_path: Path) -> Iterator[Any]:
     """The real main window, hidden, with a playlists file of its own; closed again after the test."""

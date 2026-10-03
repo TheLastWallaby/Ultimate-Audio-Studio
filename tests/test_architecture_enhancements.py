@@ -1,5 +1,6 @@
 """Automated unit tests verifying TaskManager, platform security, and models."""
 
+import os
 import time
 import unittest
 
@@ -118,3 +119,13 @@ class TestModels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_each_test_starts_from_the_default_settings() -> None:
+    """conftest clears what a previous test's window saved (e.g. a deleted temporary Library)."""
+    from app.config import PLAYLISTS_PATH, SETTINGS_PATH, settings_mgr
+
+    assert not os.path.exists(SETTINGS_PATH)
+    assert not os.path.exists(PLAYLISTS_PATH)
+    assert settings_mgr.get_settings().library_folder == ""
+    assert settings_mgr.damaged_copy is None and not settings_mgr.read_failed
