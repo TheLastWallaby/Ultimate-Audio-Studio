@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from app.controllers.library_controller import LibraryController
 from app.core.cache_manager import cache_mgr
 from app.main import UltimateAudioStudio
+from app.services import clipper
 
 
 def _pump(window: UltimateAudioStudio, until: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -78,3 +83,69 @@ def test_missing_songs_are_reported_for_the_playlist_that_was_exported(
 
     messages = [call.args[2] for call in warning.call_args_list if call.args[1] == "Songs Not Found"]
     assert messages and "'Car'" in messages[0]
+
+
+# --- 2. A save that was interrupted between its two steps is finished at the next start -------------
+
+
+def _other_run() -> int:
+    """A process id that is not this one's: the leftovers of this run are never touched."""
+    return 4242 if os.getpid() != 4242 else 4243
+
+
+@pytest.mark.parametrize("kind", ["restoring", "incoming"])
+def test_startup_puts_back_a_song_whose_swap_was_interrupted(tmp_path: Path, kind: str) -> None:
+    # The old song is already in the Recycle Bin; its finished replacement was never renamed into place.
+    ready = tmp_path / f"Song.mp3.{_other_run()}.{kind}"
+    ready.write_bytes(b"the complete copy")
+    backup = tmp_path / "Song.mp3.original.bak"
+    backup.write_bytes(b"backup of the song that is gone")
+    recycled: list[str] = []
+
+    def recycle_bin(path: str) -> None:
+        recycled.append(Path(path).name)
+        Path(path).unlink()
+
+    with patch.object(clipper, "_send2trash", recycle_bin):
+        handled = LibraryController.recover_stranded_deletes(tmp_path)
+
+    assert (tmp_path / "Song.mp3").read_bytes() == b"the complete copy"
+    assert not ready.exists()
+    # The backup belonged to the song that is gone, so it cannot be "restored" over this one.
+    assert recycled == ["Song.mp3.original.bak"]
+    assert handled == 1
+
+
+def test_startup_removes_a_ready_copy_whose_song_is_still_there(tmp_path: Path) -> None:
+    song = tmp_path / "Song.mp3"
+    song.write_bytes(b"the song, untouched")
+    backup = tmp_path / "Song.mp3.original.bak"
+    backup.write_bytes(b"its original")
+    ready = tmp_path / f"Song.mp3.{_other_run()}.restoring"
+    ready.write_bytes(b"a copy made before the run ended")
+
+    assert LibraryController.recover_stranded_deletes(tmp_path) == 1
+
+    assert song.read_bytes() == b"the song, untouched"
+    assert backup.read_bytes() == b"its original"
+    assert not ready.exists()
+
+
+def test_startup_never_takes_a_half_made_copy_for_a_song(tmp_path: Path) -> None:
+    partial = tmp_path / f"Song.mp3.{_other_run()}.restoring.{_other_run()}.partial"
+    partial.write_bytes(b"cut off")
+
+    LibraryController.recover_stranded_deletes(tmp_path)
+
+    assert not partial.exists()
+    assert not (tmp_path / "Song.mp3").exists()
+
+
+def test_a_copy_that_cannot_be_put_back_is_kept_for_the_next_start(tmp_path: Path) -> None:
+    ready = tmp_path / f"Song.mp3.{_other_run()}.restoring"
+    ready.write_bytes(b"the complete copy")
+
+    with patch("app.controllers.library_controller.replace_with_retry", side_effect=PermissionError("locked")):
+        assert LibraryController.recover_stranded_deletes(tmp_path) == 0
+
+    assert ready.read_bytes() == b"the complete copy"
