@@ -1,5 +1,7 @@
 """Application configuration, global constants, paths, and shared utilities."""
 
+from __future__ import annotations
+
 import json
 import logging
 import logging.handlers
@@ -9,11 +11,11 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import Any
 
 from app.core.config import Settings, clear_settings_cache, get_settings
-from app.core.file_utils import atomic_save_json, sanitize_filename
+from app.core.file_utils import atomic_save_json, replace_with_retry, sanitize_filename
 from app.core.process_utils import find_system_binary, is_valid_binary, run_ffmpeg
 from app.core.time_utils import format_time
 from app.models import AppSettings
@@ -70,6 +72,8 @@ except ImportError:
         pass
 
 from pydub import AudioSegment  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 # Frozen builds must use bundled CA certs or YouTube downloads fail SSL checks.
 _app_settings = get_settings()
@@ -141,45 +145,98 @@ GITHUB_REPO = _app_settings.github.repo
 RELEASES_API_URL = str(_app_settings.github.releases_api_url)
 
 
-class SettingsManager:
-    """Thread-safe centralized repository for application settings and update credentials."""
+# A locked settings file is tried this many times before the app starts without it.
+_SETTINGS_READ_ATTEMPTS = 3
 
-    def __init__(self, settings_path: str = SETTINGS_PATH):
+
+class SettingsManager:
+    """Thread-safe store of the user's settings, kept in a JSON file.
+
+    A settings file that cannot be read is never written over. A damaged one is set aside as
+    ``<name>.damaged-<time>.json`` (``damaged_copy``, for the window to mention), so a chosen
+    Library folder can still be recovered from it. One that cannot be opened at all (locked by
+    another program, no permission) is left alone: settings are not saved for the rest of the
+    session (``read_failed``).
+    """
+
+    def __init__(self, settings_path: str | Path = SETTINGS_PATH) -> None:
         self.settings_path = settings_path
         self._lock = threading.Lock()
         self._cached_settings: AppSettings | None = None
+        self.read_failed = False
+        self.damaged_copy: Path | None = None
 
     def get_settings(self) -> AppSettings:
+        """The settings, read from disk once; the defaults when the file is missing or unreadable."""
         with self._lock:
             if self._cached_settings is None:
                 self._cached_settings = self._load_from_disk()
             return self._cached_settings
 
     def reload(self) -> AppSettings:
+        """Read the settings file again."""
         with self._lock:
             self._cached_settings = self._load_from_disk()
             return self._cached_settings
 
-    def _load_from_disk(self) -> AppSettings:
-        if os.path.exists(self.settings_path):
+    def _read_bytes(self, path: Path) -> bytes | None:
+        """The file's contents, or None when it does not exist; retries while it is briefly locked."""
+        for attempt in range(_SETTINGS_READ_ATTEMPTS):
             try:
-                with open(self.settings_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return AppSettings.from_dict(data)
-            except Exception as e:
-                log_error(f"SettingsManager load error: {e}")
+                return path.read_bytes()
+            except FileNotFoundError:
+                return None
+            except PermissionError:
+                # OneDrive and antivirus scanners hold a file for a moment after it changes.
+                if attempt == _SETTINGS_READ_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+        return None
+
+    def _load_from_disk(self) -> AppSettings:
+        """Read the settings file; never raises, and never leaves a damaged file where a save would replace it."""
+        path = Path(self.settings_path)
+        self.read_failed = False
+        try:
+            raw = self._read_bytes(path)
+        except OSError as err:
+            logger.warning("The settings file %s could not be opened: %s", path, err)
+            self.read_failed = True
+            return AppSettings()
+        if raw is None:
+            return AppSettings()
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(data, dict):
+                raise ValueError("the file does not hold a set of settings")
+            return AppSettings.from_dict(data)
+        except (ValueError, TypeError) as err:  # bad UTF-8 and bad JSON are ValueErrors too
+            logger.error("The settings file %s is damaged: %s", path, err)
+        kept = path.with_name(f"{path.stem}.damaged-{time.strftime('%Y%m%d-%H%M%S')}{path.suffix}")
+        try:
+            replace_with_retry(path, kept)
+        except OSError as err:
+            logger.error("Could not set the damaged settings file %s aside: %s", path, err)
+            self.read_failed = True
+            return AppSettings()
+        self.damaged_copy = kept
         return AppSettings()
 
-    def update_settings(self, **kwargs: Any) -> AppSettings:
+    def update_settings(self, **kwargs: object) -> AppSettings:
+        """Change some settings and save them all; raises OSError when the file must not be written."""
         with self._lock:
-            current = self._cached_settings or self._load_from_disk()
+            if self._cached_settings is None:
+                self._cached_settings = self._load_from_disk()
+            if self.read_failed:
+                # The window started from the defaults, so saving now would replace the user's real
+                # settings (their Library folder above all) with them.
+                raise OSError(f"{Path(self.settings_path).name} could not be read, so it is left as it is")
+            current = self._cached_settings
             for k, v in kwargs.items():
                 if hasattr(current, k) and k != "extra":
                     setattr(current, k, v)
                 else:
                     current.extra[k] = v
-            self._cached_settings = current
             atomic_save_json(self.settings_path, current.to_dict())
             return current
 

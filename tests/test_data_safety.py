@@ -5,15 +5,17 @@ from __future__ import annotations
 import json
 import threading
 import time
+import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.config import DEFAULT_PLAYLIST_NAME, YT_CACHE_DIR
+from app.config import DEFAULT_PLAYLIST_NAME, YT_CACHE_DIR, SettingsManager
 from app.controllers.library_controller import ImportResult, LibraryController
 from app.controllers.playlist_controller import PlaylistController, PlaylistLoadResult, last_good_path
 from app.main import UltimateAudioStudio
+from app.models import AppSettings
 from app.services import downloader, exporter
 from app.services.clipper import clip_audio_worker, has_original_backup, original_backup_path
 
@@ -577,3 +579,127 @@ def test_failed_download_reports_and_adds_nothing(tmp_path: Path) -> None:
     assert len(errors) == 1
     assert _names(library) == ["Song.mp3"]
     assert not any((Path(YT_CACHE_DIR) / "downloads").iterdir())
+
+
+# --- An unreadable settings file --------------------------------------------------------------------
+
+
+def _damaged_kept(folder: Path) -> list[Path]:
+    return sorted(folder.glob("settings.damaged-*.json"))
+
+
+def test_damaged_settings_file_is_set_aside_not_overwritten(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_bytes(b'{"library_folder": "D:/My Songs", "volume": 6')  # cut off mid-write
+    mgr = SettingsManager(settings_path=settings_file)
+
+    loaded = mgr.get_settings()
+    mgr.update_settings(volume=50)
+
+    assert loaded.library_folder == ""
+    assert mgr.damaged_copy is not None and mgr.damaged_copy.parent == tmp_path
+    assert [p.read_bytes() for p in _damaged_kept(tmp_path)] == [b'{"library_folder": "D:/My Songs", "volume": 6']
+    assert json.loads(settings_file.read_text(encoding="utf-8"))["volume"] == 50
+
+
+def test_settings_with_impossible_values_count_as_damaged(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"volume": "loud"}', encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+
+    mgr.get_settings()
+
+    assert len(_damaged_kept(tmp_path)) == 1
+    assert not settings_file.exists()
+
+
+def test_locked_settings_file_is_never_saved_over(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"library_folder": "D:/My Songs"}', encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+    real_read = Path.read_bytes
+
+    def _locked(path: Path) -> bytes:
+        if path == settings_file:
+            raise PermissionError(32, "The process cannot access the file because it is being used")
+        return real_read(path)
+
+    with patch.object(Path, "read_bytes", _locked), patch("app.config.time.sleep"):
+        loaded = mgr.get_settings()
+        try:
+            mgr.update_settings(library_folder="C:/Users/me/Music")
+        except OSError:
+            pass
+        else:
+            raise AssertionError("a settings file that could not be read was saved over")
+
+    assert mgr.read_failed and loaded.library_folder == ""
+    assert json.loads(settings_file.read_text(encoding="utf-8")) == {"library_folder": "D:/My Songs"}
+    assert _damaged_kept(tmp_path) == []
+
+
+def test_settings_file_locked_for_a_moment_is_read(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"library_folder": "D:/My Songs"}', encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+    real_read = Path.read_bytes
+    attempts: list[int] = []
+
+    def _locked_once(path: Path) -> bytes:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise PermissionError(32, "The process cannot access the file because it is being used")
+        return real_read(path)
+
+    with patch.object(Path, "read_bytes", _locked_once), patch("app.config.time.sleep"):
+        loaded = mgr.get_settings()
+
+    assert loaded.library_folder == "D:/My Songs"
+    assert not mgr.read_failed
+
+
+def _open_window(mgr: SettingsManager, tmp_path: Path) -> UltimateAudioStudio:
+    root = tk.Tk()
+    root.withdraw()
+    with (
+        patch("app.main.settings_mgr", mgr),
+        patch("app.ui.features.playlists.PLAYLISTS_PATH", str(tmp_path / "p.json")),
+    ):
+        return UltimateAudioStudio(root)
+
+
+def test_window_reports_damaged_settings_once(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_bytes(b"\x00\x00\x00")
+    mgr = SettingsManager(settings_path=settings_file)
+
+    with patch("app.main.settings_mgr", mgr), patch("app.ui.dialogs.show_warning") as warn:
+        window = _open_window(mgr, tmp_path)
+        try:
+            deadline = time.monotonic() + 5
+            while not warn.called and time.monotonic() < deadline:
+                window.root.update()
+                time.sleep(0.01)
+            window._report_settings_problem()  # a second report has nothing new to say
+        finally:
+            window.on_close()
+
+    warn.assert_called_once()
+    assert "Change..." in warn.call_args[0][2]
+    assert _damaged_kept(tmp_path)[0].name in warn.call_args[0][2]
+    assert [p.read_bytes() for p in _damaged_kept(tmp_path)] == [b"\x00\x00\x00"]
+
+
+def test_window_does_not_save_over_settings_it_could_not_read(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"library_folder": "D:/My Songs"}', encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+    mgr.read_failed = True
+    mgr._cached_settings = AppSettings()
+
+    with patch("app.main.settings_mgr", mgr):
+        window = _open_window(mgr, tmp_path)
+        window._save_settings()
+        window.on_close()
+
+    assert json.loads(settings_file.read_text(encoding="utf-8")) == {"library_folder": "D:/My Songs"}

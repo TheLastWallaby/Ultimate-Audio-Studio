@@ -386,6 +386,33 @@ class UltimateAudioStudio(
         self.text_size = s.text_size if s.text_size in TEXT_SIZES else DEFAULT_TEXT_SIZE
         self._saved_active_playlist = s.active_playlist
         self._saved_geometry = restorable_geometry(s.geometry)
+        if settings_mgr.damaged_copy is not None or settings_mgr.read_failed:
+            # After the window is up: a dialog during start-up would appear before the app does.
+            self.root.after(800, self._report_settings_problem)
+
+    def _report_settings_problem(self) -> None:
+        """Tell the user that their saved settings could not be used, and what to do about it."""
+        if getattr(self, "_is_shutting_down", False):
+            return
+        kept, settings_mgr.damaged_copy = settings_mgr.damaged_copy, None  # told once per damaged file
+        if kept is not None:
+            dialogs.show_warning(
+                self.root,
+                "Settings Could Not Be Opened",
+                "Your saved settings could not be opened, so the app started with its standard settings.\n\n"
+                "Your songs and playlists are not affected. If you had chosen your own music folder, "
+                "choose it again with the 'Change...' button at the top of your Library.\n\n"
+                f"The file that could not be opened was kept as '{kept.name}' in your '{kept.parent.name}' "
+                "folder, in case someone can help you recover it.",
+            )
+        elif settings_mgr.read_failed:
+            dialogs.show_warning(
+                self.root,
+                "Settings Could Not Be Opened",
+                "Another program is using your saved settings, so the app started with its standard "
+                "settings. Your saved settings are kept as they are.\n\n"
+                "Close Ultimate Audio Studio and open it again to get your settings back.",
+            )
 
     def _schedule_settings_save(self, *_args: object) -> None:
         """Persist settings shortly after any change (debounced), so a crash loses nothing."""
@@ -408,12 +435,15 @@ class UltimateAudioStudio(
             self._schedule_settings_save()
 
     def _save_settings(self) -> None:
-        # Cancel any pending debounced save; when called directly (e.g. from on_close) that timer
-        # would otherwise fire later against a destroyed window.
+        """Save the window's preferences now (also cancels a pending debounced save)."""
+        # When called directly (e.g. from on_close) the pending timer would otherwise fire later
+        # against a destroyed window.
         timer, self._timer_settings_save = self._timer_settings_save, None
         if timer is not None:
             with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(timer)
+        if settings_mgr.read_failed:
+            return  # the saved settings could not be read; saving would replace them with the defaults
         try:
             volume = 80
             if hasattr(self, "scale_volume"):
@@ -433,8 +463,8 @@ class UltimateAudioStudio(
                 text_size=getattr(self, "text_size", DEFAULT_TEXT_SIZE),
                 active_playlist=self.active_playlist_name or "",
             )
-        except Exception as e:
-            log_error(f"_save_settings: {e}")
+        except Exception:  # last-resort guard: a failed save must not break the window
+            logging.getLogger(__name__).exception("Saving the settings failed")
 
     def _setup_drag_and_drop(self) -> None:
         self._dnd_handler = Win32DragDropHandler(
