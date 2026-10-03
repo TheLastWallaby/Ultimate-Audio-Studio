@@ -297,3 +297,22 @@ def test_downloads_and_searches_are_still_explained() -> None:
     assert friendly_error("ERROR: Private video", "download").title == "Private Video"
     assert friendly_error("<urlopen error [Errno 11001] getaddrinfo failed>", "search").title == "No Internet Connection"
     assert friendly_error("HTTP Error 403: Forbidden", "download").suggests_update
+
+
+# --- 6. +10s and -10s work on a song whose length is not known yet ---------------------------------
+
+
+def test_skipping_in_a_song_of_unknown_length_does_not_restart_it() -> None:
+    ctrl = PlaybackController(object(), AudioEngine())
+    ctrl.audio_engine.play_start_offset = 50.0  # paused 50 seconds in; the length (0) is not known yet
+
+    assert ctrl.skip_by(10.0, 0.0) == pytest.approx(60.0)
+    assert ctrl.skip_by(-10.0, 0.0) == pytest.approx(50.0)
+    assert ctrl.skip_by(-80.0, 0.0) == 0.0  # never before the start
+
+
+def test_skipping_still_stops_at_the_end_of_a_song_of_known_length() -> None:
+    ctrl = PlaybackController(object(), AudioEngine())
+    ctrl.audio_engine.play_start_offset = 95.0
+
+    assert ctrl.skip_by(10.0, 100.0) == pytest.approx(100.0)
