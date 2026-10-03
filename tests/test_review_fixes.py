@@ -296,3 +296,23 @@ def test_stop_cancels_a_pending_skip_past_a_missing_song(studio: Any, tmp_path: 
 
     play.assert_not_called()
     assert studio.selected_file_path != song
+
+
+# --- A new playlist while another one plays -------------------------------------------------------------
+
+
+def test_creating_a_playlist_stops_the_playlist_that_was_playing(studio: Any, tmp_path: Path) -> None:
+    from app.ui.dialogs import TextAnswer
+
+    songs = _library(studio, tmp_path / "lib", "a.mp3", "b.mp3")
+    _set_playlist(studio, songs)
+    studio.playlist_index = 0
+    studio.playback_ctrl.is_playing_playlist = True
+    with patch("app.ui.dialogs.ask_text", return_value=TextAnswer("Party")):
+        studio.create_playlist()
+
+    assert studio.active_playlist_name == "Party"
+    assert not studio.is_playing_playlist
+    with patch.object(studio.playback_ctrl, "play_track") as play:
+        studio._song_finished()  # what the monitor does when the old song runs out
+    play.assert_not_called()

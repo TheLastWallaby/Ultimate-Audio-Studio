@@ -150,6 +150,10 @@ class PlaylistMixin(AppBase):
         if not self.playlist_ctrl.create_playlist(name):
             dialogs.show_warning(self.root, "Already Exists", f"A playlist named '{name}' already exists.")
             return
+        if self.is_playing_playlist:
+            # The new, empty playlist is now the active one: playback would otherwise go on showing
+            # "PLAYING" in silence after this song, or play a song of the new list by its old position.
+            self.stop_audio(user=True)
         self.save_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
