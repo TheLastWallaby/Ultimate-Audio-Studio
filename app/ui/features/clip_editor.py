@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import logging
-import os
 import tkinter as tk
 from pathlib import Path
 
-from app.config import format_time, log_error, sanitize_filename
+from app.config import format_time, sanitize_filename
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
 from app.core.time_utils import parse_time
+from app.platform_utils import has_recycle_bin
 from app.services.clipper import clip_audio_worker, has_original_backup, restore_original
 from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
@@ -417,12 +417,17 @@ class ClipEditorMixin(AppBase):
         if not path or not has_original_backup(path):
             self._update_restore_original_button()
             return
-        name = os.path.basename(path)
+        name = Path(path).name
+        trimmed_goes = (
+            "is moved to the Recycle Bin"
+            if has_recycle_bin(path)
+            else "is deleted for good (this drive has no Recycle Bin)"
+        )
         if not dialogs.ask_yes_no(
             self.root,
             "Restore the Original Song?",
             f"This puts back the full, untrimmed '{name}' as it was before you saved a clip over it.\n\n"
-            "The trimmed version is moved to the Recycle Bin.",
+            f"The trimmed version {trimmed_goes}.",
             yes="Restore the original",
             no="Cancel",
         ):
@@ -431,9 +436,9 @@ class ClipEditorMixin(AppBase):
         self._release_audio_file()
         try:
             restore_original(path)
-        except OSError as e:
-            log_error(f"restore_original_song: {e}")
-            show_friendly_error(self.root, e, "generic")
+        except OSError as err:
+            logger.error("Could not restore the original of %s: %s", name, err)
+            show_friendly_error(self.root, err, "generic")
             return
         cache_mgr.invalidate(path)
         self.library_ctrl.invalidate_search_index(path)

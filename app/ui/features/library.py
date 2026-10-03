@@ -18,10 +18,11 @@ from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.metadata import read_track_metadata
 from app.core.task_manager import task_mgr
+from app.platform_utils import has_recycle_bin
 from app.ui import dialogs
 from app.ui.components import listbox_selection
 from app.ui.error_dialog import show_error, show_friendly_error
-from app.ui.features.base import AppBase
+from app.ui.features.base import UNDO_SECONDS, AppBase
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +89,16 @@ class LibraryMixin(AppBase):
             return
 
         if dest_exists:
+            gone = (
+                "go to the Recycle Bin"
+                if has_recycle_bin(self.library_folder)
+                else "are deleted for good (this drive has no Recycle Bin)"
+            )
             replace = dialogs.ask_yes_no(
                 self.root,
                 "Songs Already in Your Library",
                 f"{len(dest_exists)} of the {source} song(s) are already in your Library.\n\n"
-                "If you replace them, the copies you have now go to the Recycle Bin.",
+                f"If you replace them, the copies you have now {gone}.",
                 yes="Replace them",
                 no="Keep the ones I have",
                 default_yes=False,
@@ -339,10 +345,12 @@ class LibraryMixin(AppBase):
                     f" {len(result.renamed)} had the same name as another song, so they were added with a "
                     f"number, like '{result.renamed[0]}'."
                 )
+            bin_note = "is in the Recycle Bin" if has_recycle_bin(self.library_folder) else "was deleted"
             if len(result.replaced) == 1:
-                message += f" The older copy of '{result.replaced[0]}' is in the Recycle Bin."
+                message += f" The older copy of '{result.replaced[0]}' {bin_note}."
             elif result.replaced:
-                message += f" The {len(result.replaced)} older copies they replaced are in the Recycle Bin."
+                were = "are in the Recycle Bin" if bin_note.startswith("is") else "were deleted"
+                message += f" The {len(result.replaced)} older copies they replaced {were}."
             self.notify_success(message)
         else:
             self.set_status("No songs were added to your Library.", icon="⚠️")
@@ -427,21 +435,29 @@ class LibraryMixin(AppBase):
             return
         names = [self.visible_files[i] for i in sel]
         paths = [self._library_row_path(name) for name in names]
+        one = len(names) == 1
+        # USB sticks, memory cards and network folders have no Recycle Bin: there, deleting is for good.
+        recyclable = has_recycle_bin(self.library_folder)
 
-        if len(names) == 1:
+        if one:
             title = "Delete Song"
-            question = f"Are you sure you want to delete '{names[0]}'?\n\nIt will be moved"
+            question = f"Are you sure you want to delete '{names[0]}'?"
         else:
             title = "Delete Songs"
             listed = "\n".join(f"• {name}" for name in names[:8])
             more = f"\n... and {len(names) - 8} more." if len(names) > 8 else ""
-            question = (
-                f"Are you sure you want to delete these {len(names)} songs?\n\n{listed}{more}\n\nThey will be moved"
+            question = f"Are you sure you want to delete these {len(names)} songs?\n\n{listed}{more}"
+        if recyclable:
+            where = f"{'It' if one else 'They'} will be moved safely to your Windows Recycle Bin."
+        else:
+            where = (
+                f"This drive has no Recycle Bin, so {'it is' if one else 'they are'} deleted for good. "
+                f"You can still press Undo for {UNDO_SECONDS:.0f} seconds afterwards."
             )
         if not dialogs.ask_yes_no(
             self.root,
             title,
-            f"{question} safely to your Windows Recycle Bin.",
+            f"{question}\n\n{where}",
             yes="Delete" if len(names) == 1 else f"Delete {len(names)} songs",
             no="Keep",
             danger=True,
@@ -475,7 +491,11 @@ class LibraryMixin(AppBase):
         self.refresh_library()
         if staged:
             what = f"'{staged[0]}'" if len(staged) == 1 else f"{len(staged)} songs"
-            self.show_undo(f"Moved {what} to Recycle Bin.", callback=self._undo_delete_file)
+            them = "it" if len(staged) == 1 else "them"
+            done = (
+                f"Moved {what} to Recycle Bin." if recyclable else f"Deleted {what}. Press Undo to bring {them} back."
+            )
+            self.show_undo(done, callback=self._undo_delete_file)
         if failed:
             fe = friendly_error(failed[0][1], "generic")
             listed = "\n".join(f"• {name}" for name, _err in failed[:8])
