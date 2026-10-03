@@ -1,8 +1,9 @@
-"""Regression tests: the export's playlist, crash recovery, tall dialogs, and the download queue."""
+"""Regression tests: export target, crash recovery, tall dialogs, download queue, and smaller fixes."""
 
 from __future__ import annotations
 
 import io
+import json
 import os
 import threading
 import time
@@ -18,6 +19,7 @@ import pytest
 
 from app.controllers.library_controller import LibraryController
 from app.controllers.playback_controller import PlaybackController
+from app.controllers.playlist_controller import PlaylistController
 from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
 from app.core.errors import ErrorContext, friendly_error
@@ -298,7 +300,9 @@ def test_file_errors_keep_their_own_explanations() -> None:
 
 def test_downloads_and_searches_are_still_explained() -> None:
     assert friendly_error("ERROR: Private video", "download").title == "Private Video"
-    assert friendly_error("<urlopen error [Errno 11001] getaddrinfo failed>", "search").title == "No Internet Connection"
+    assert (
+        friendly_error("<urlopen error [Errno 11001] getaddrinfo failed>", "search").title == "No Internet Connection"
+    )
     assert friendly_error("HTTP Error 403: Forbidden", "download").suggests_update
 
 
@@ -653,3 +657,80 @@ def test_a_missing_folder_does_not_cover_up_a_running_job(studio: UltimateAudioS
     assert "cannot be found" in _library_hint(studio)
     studio._exporting = False
     studio.set_busy(False)
+
+
+# --- 11. A deleted playlist can be brought back with Undo -------------------------------------------
+
+
+def _three_playlists() -> PlaylistController:
+    controller = PlaylistController(None)
+    controller.playlists = {"Morning": ["a.mp3"], "Car": ["b.mp3", "c.mp3"], "Party": ["d.mp3"]}
+    controller.active_playlist_name = "Car"
+    return controller
+
+
+def test_undo_brings_a_deleted_playlist_back_in_its_place_with_its_songs() -> None:
+    controller = _three_playlists()
+
+    assert controller.delete_playlist("Car")
+    assert list(controller.playlists) == ["Morning", "Party"]
+
+    assert controller.undo_delete_playlist() == "Car"
+    assert list(controller.playlists) == ["Morning", "Car", "Party"]
+    assert controller.playlists["Car"] == ["b.mp3", "c.mp3"]
+    assert controller.active_playlist_name == "Car"
+    assert controller.undo_delete_playlist() is None  # only once
+
+
+def test_undo_never_replaces_a_playlist_made_under_the_same_name_meanwhile() -> None:
+    controller = _three_playlists()
+    controller.delete_playlist("Car")
+    controller.create_playlist("Car")
+    controller.add_track("Car", "new.mp3")
+
+    assert controller.undo_delete_playlist() == "Car (2)"
+
+    assert controller.playlists["Car"] == ["new.mp3"]
+    assert controller.playlists["Car (2)"] == ["b.mp3", "c.mp3"]
+
+
+def test_the_last_playlist_cannot_be_deleted_and_leaves_nothing_to_undo() -> None:
+    controller = PlaylistController(None)
+
+    assert not controller.delete_playlist(controller.active_playlist_name)
+    assert controller.undo_delete_playlist() is None
+
+
+def test_deleting_a_playlist_offers_undo_and_undo_saves_it_again(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    saved = tmp_path / "studio_playlists.json"  # where the ``studio`` fixture keeps its playlists
+    studio.playlists["Car"] = [_song(tmp_path / "lib", "One.mp3"), _song(tmp_path / "lib", "Two.mp3")]
+    studio.active_playlist_name = "Car"
+    studio.refresh_playlist_dropdown()
+    studio.refresh_playlist_listbox()
+
+    with patch("app.ui.dialogs.ask_yes_no", return_value=True):
+        studio.delete_playlist()
+
+    assert "Car" not in json.loads(saved.read_text(encoding="utf-8"))
+    assert studio.btn_undo.winfo_manager() == "pack"
+    assert "Press Undo" in studio.status.cget("text")
+
+    studio.btn_undo.invoke()
+
+    assert [Path(p).name for p in json.loads(saved.read_text(encoding="utf-8"))["Car"]] == ["One.mp3", "Two.mp3"]
+    assert studio.active_playlist_name == "Car"
+    assert studio.playlist_var.get() == "Car"
+    assert studio.listbox_pl.size() == 2
+    assert "is back" in studio.status.cget("text")
+
+
+def test_keeping_the_playlist_changes_nothing_and_offers_no_undo(studio: UltimateAudioStudio) -> None:
+    studio.playlists["Car"] = []
+    studio.active_playlist_name = "Car"
+    studio.refresh_playlist_dropdown()
+
+    with patch("app.ui.dialogs.ask_yes_no", return_value=False):
+        studio.delete_playlist()
+
+    assert "Car" in studio.playlists
+    assert not studio.btn_undo.winfo_manager()
