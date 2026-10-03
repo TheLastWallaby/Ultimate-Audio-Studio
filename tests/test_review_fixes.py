@@ -603,3 +603,23 @@ def test_a_click_on_the_bar_of_a_slider_moves_the_handle_there() -> None:
 def test_the_timeline_volume_and_boost_sliders_jump_to_a_click(studio: Any) -> None:
     for scale in (studio.scale_progress, studio.scale_volume, studio.scale_gain):
         assert "_press" in scale.bind("<ButtonPress-1>"), scale
+
+
+# --- The Library list stays where it was scrolled to ----------------------------------------------------
+
+
+def test_deleting_and_undoing_keep_the_library_scrolled_where_it_was(studio: Any, tmp_path: Path) -> None:
+    _library(studio, tmp_path / "lib", *[f"song{i:03d}.mp3" for i in range(120)])
+    studio.listbox_lib.yview_moveto(0.5)
+    scrolled_to = studio.listbox_lib.yview()[0]
+    assert scrolled_to > 0.4
+    _select_row(studio, "song070.mp3")
+
+    with patch("app.ui.dialogs.ask_yes_no", return_value=True):
+        studio.delete_library_file()
+    assert "song070.mp3" not in studio.visible_files
+    assert abs(studio.listbox_lib.yview()[0] - scrolled_to) < 0.05
+
+    studio._on_undo_click()
+    assert "song070.mp3" in studio.visible_files
+    assert abs(studio.listbox_lib.yview()[0] - scrolled_to) < 0.05
