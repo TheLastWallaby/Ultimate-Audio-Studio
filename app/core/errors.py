@@ -43,6 +43,14 @@ _OFFLINE_STEPS = (
 # Evaluated in order; the first match wins.
 _RULES: tuple[_Rule, ...] = (
     _Rule(
+        re.compile(r"no audio output device|mixer not initiali[sz]ed|no available audio device", re.I),
+        "No Speakers or Headphones Found",
+        "The app could not find any speakers or headphones to play sound through.\n\n"
+        "• Check that your speakers or headphones are plugged in and switched on.\n"
+        "• For Bluetooth speakers or headphones, check that they are connected.\n"
+        "• Then press PLAY again.",
+    ),
+    _Rule(
         re.compile(r"private video|video is private", re.I),
         "Private Video",
         "This video is private, so it cannot be downloaded.\n\nPlease choose a different version of the song.",
