@@ -464,12 +464,12 @@ def test_cd_export_says_when_a_track_could_not_be_levelled(tmp_path: Path) -> No
 
     with (
         patch("app.services.exporter.measure_loudnorm", return_value=None),
-        patch("app.services.exporter.run_ffmpeg", return_value=SimpleNamespace(returncode=1, stdout="", stderr="")),
-        patch("app.services.exporter.AudioSegment"),  # the fallback conversion
+        patch("app.services.exporter.run_ffmpeg", side_effect=_ffmpeg_failing_to_level),
     ):
         exporter.cd_export_worker(str(cd), [str(song)], normalize=True, on_success=done.append)
 
     assert done == [ExportReport(total=1, exported=1, not_leveled=("song0.mp3",))]
+    assert [p.name for p in cd.iterdir()] == ["01 - song0.wav"]
 
 
 def test_export_summary_separates_skipped_songs_from_unlevelled_ones() -> None:
@@ -856,3 +856,69 @@ def test_older_drive_scan_is_not_shown_over_a_newer_one(studio: UltimateAudioStu
     studio._show_usb_drives(stale_scan, [DriveInfo("E:\\", "USB E", "FAT32")], "always")
 
     assert studio._usb_map == {"USB F": "F:\\"}
+
+
+# --- Fallback conversions run through run_ffmpeg, with a time limit ---------------------------------
+
+
+def _ffmpeg_failing_to_level(args: list[str], **_kwargs: object) -> SimpleNamespace:
+    """Stands in for run_ffmpeg: a run that levels the volume ("-af") fails, a plain one succeeds."""
+    if "-af" in args:
+        return SimpleNamespace(returncode=1, stdout="", stderr="loudnorm failed")
+    Path(args[-1]).write_bytes(b"converted")
+    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_usb_fallback_conversion_has_a_time_limit(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    song = _make_song(tmp_path / "library", "song0.m4a")
+    done: list[ExportReport] = []
+    ffmpeg = MagicMock(side_effect=_ffmpeg_failing_to_level)
+
+    with (
+        patch("app.services.exporter.measure_loudnorm", return_value=None),
+        patch("app.services.exporter._encode_mp3", return_value=False),  # levelling failed
+        patch("app.services.exporter.run_ffmpeg", ffmpeg),
+    ):
+        exporter.usb_export_worker(str(drive), "Trip", [str(song)], normalize=True, on_success=done.append)
+
+    assert done == [ExportReport(total=1, exported=1, not_leveled=("song0.m4a",))]
+    assert (drive / "01 - song0.mp3").read_bytes() == b"converted"
+    assert ffmpeg.call_args.kwargs["timeout"] > 0
+    assert "0:v?" not in ffmpeg.call_args.args[0]  # the last try leaves the cover picture out
+
+
+def test_usb_song_that_cannot_be_converted_is_skipped_cleanly(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    song = _make_song(tmp_path / "library", "song0.wma")
+    done: list[ExportReport] = []
+
+    with (
+        patch("app.services.exporter._encode_mp3", return_value=False),
+        patch("app.services.exporter.run_ffmpeg", return_value=SimpleNamespace(returncode=1, stdout="", stderr="bad")),
+    ):
+        exporter.usb_export_worker(str(drive), "Trip", [str(song)], on_success=done.append)
+
+    assert done == [
+        ExportReport(total=1, exported=0, skipped=("song0.wma (could not be converted; the file may be damaged)",))
+    ]
+    assert list(drive.iterdir()) == []  # no half-made track
+
+
+def test_cd_track_that_fails_without_levelling_is_not_converted_twice(tmp_path: Path) -> None:
+    cd = tmp_path / "cd"
+    cd.mkdir()
+    song = _make_song(tmp_path / "library")
+    done: list[ExportReport] = []
+    failed = SimpleNamespace(returncode=1, stdout="", stderr="Invalid data found when processing input")
+
+    with patch("app.services.exporter.run_ffmpeg", return_value=failed) as ffmpeg:
+        exporter.cd_export_worker(str(cd), [str(song)], on_success=done.append)
+
+    assert ffmpeg.call_count == 1  # a second, identical run could only fail the same way
+    assert done == [
+        ExportReport(total=1, exported=0, skipped=("song0 (could not be converted; the file may be damaged)",))
+    ]
+    assert list(cd.iterdir()) == []

@@ -53,3 +53,11 @@ def clip_filter_chain(clip_dur: float, gain_db: float = 0.0, soften: bool = Fals
 def fade_duration(clip_dur: float, soften: bool, fade_sec: float) -> float:
     """Length of each fade actually applied (never more than half the clip)."""
     return min(float(fade_sec or 1.5), clip_dur / 2.0) if soften else 0.0
+
+
+def mp3_audio_only_args(resample_44k: bool = False) -> list[str]:
+    """Output options for an MP3 without the cover picture: the last try when a picture breaks the encode."""
+    args = ["-map", "0:a", "-map_metadata", "0", "-id3v2_version", "3", "-c:a", "libmp3lame", "-q:a", MP3_VBR_QUALITY]
+    if resample_44k:
+        args += ["-ar", "44100"]
+    return args

@@ -807,34 +807,49 @@ def test_clip_that_timed_out_is_not_tried_again_the_slow_ways(tmp_path: Path) ->
     song = tmp_path / "album.mp3"
     song.write_bytes(b"original")
     errors: list[str] = []
-    with (
-        patch("app.services.clipper.run_ffmpeg", return_value=TIMED_OUT) as ffmpeg,
-        patch("app.services.clipper.AudioSegment.from_file") as decode_into_memory,
-    ):
+    with patch("app.services.clipper.run_ffmpeg", return_value=TIMED_OUT) as ffmpeg:
         clip_audio_worker(str(song), 0.0, 60.0, str(song), is_self_overwrite=True, on_error=errors.append)
 
     assert ffmpeg.call_count == 1  # no second FFmpeg run that would time out again
-    decode_into_memory.assert_not_called()
     assert len(errors) == 1
     assert song.read_bytes() == b"original"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["album.mp3"]  # no backup, no leftover clip
 
 
-def test_big_song_is_not_decoded_into_memory_when_ffmpeg_fails(tmp_path: Path) -> None:
+def test_clip_ffmpeg_cannot_make_is_reported_after_the_last_try(tmp_path: Path) -> None:
     song = tmp_path / "album.mp3"
     song.write_bytes(b"x" * 64)
     errors: list[str] = []
     failed = ProcessResult(returncode=1, stdout="", stderr="Invalid data found when processing input")
-    with (
-        patch("app.services.clipper.run_ffmpeg", return_value=failed),
-        patch.object(clipper, "_FALLBACK_MAX_BYTES", 16),
-        patch("app.services.clipper.AudioSegment.from_file") as decode_into_memory,
-    ):
+    with patch("app.services.clipper.run_ffmpeg", return_value=failed) as ffmpeg:
         clip_audio_worker(str(song), 0.0, 60.0, str(tmp_path / "clip.mp3"), on_error=errors.append)
 
-    decode_into_memory.assert_not_called()
+    # Cover copied, cover re-encoded, then no cover; each run has a time limit (no in-memory decode).
+    assert ffmpeg.call_count == 3
+    assert all(call.kwargs["timeout"] > 0 for call in ffmpeg.call_args_list)
+    assert "0:v?" not in ffmpeg.call_args_list[-1].args[0]
     assert len(errors) == 1
     assert sorted(p.name for p in tmp_path.iterdir()) == ["album.mp3"]
+
+
+def test_clip_is_saved_without_the_cover_when_the_picture_breaks_it(tmp_path: Path) -> None:
+    song = tmp_path / "album.mp3"
+    song.write_bytes(b"x" * 64)
+    saved: list[str] = []
+
+    def _picture_breaks_it(args: list[str], **_kwargs: object) -> ProcessResult:
+        if "0:v?" in args:
+            return ProcessResult(returncode=1, stdout="", stderr="Could not write header (bad picture)")
+        Path(args[-1]).write_bytes(b"clip without cover")
+        return ProcessResult(returncode=0, stdout="", stderr="")
+
+    with patch("app.services.clipper.run_ffmpeg", side_effect=_picture_breaks_it):
+        clip_audio_worker(
+            str(song), 0.0, 60.0, str(tmp_path / "clip.mp3"), on_success=lambda name, *_a: saved.append(name)
+        )
+
+    assert saved == ["clip.mp3"]
+    assert (tmp_path / "clip.mp3").read_bytes() == b"clip without cover"
 
 
 @pytest.mark.skipif(not HAVE_FFMPEG, reason="needs a working ffmpeg")

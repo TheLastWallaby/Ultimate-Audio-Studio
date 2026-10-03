@@ -8,14 +8,13 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
-
-from pydub import AudioSegment
+from typing import Literal
 
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
 from app.core.file_utils import copy_file_atomic
 from app.core.file_utils import replace_with_retry as _replace_with_retry
 from app.core.process_utils import ffmpeg_timed_out
-from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, fade_duration, mp3_output_args
+from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, mp3_audio_only_args, mp3_output_args
 
 try:
     from send2trash import send2trash as _send2trash
@@ -37,8 +36,6 @@ logger = logging.getLogger(__name__)
 ORIGINAL_BACKUP_SUFFIX = ".original.bak"
 _CLIP_TIMEOUT_MIN_SEC = 120.0
 _CLIP_TIMEOUT_MAX_SEC = 1800.0
-# Largest song the in-memory fallback is tried on (pydub holds the decoded audio in RAM).
-_FALLBACK_MAX_BYTES = 50 * 1024 * 1024
 
 
 def original_backup_path(song_path: str) -> str:
@@ -124,13 +121,20 @@ def create_audition_slice(
     return None
 
 
-def _clip_args(filepath: str, s_time: float, dur: float, audio_filter: str, wav: bool, cover: str) -> list[str]:
+# How an MP3 clip carries the song's cover picture: copied, re-encoded (PNG art), or left out.
+ClipCover = Literal["copy", "mjpeg", "none"]
+
+
+def _clip_args(filepath: str, s_time: float, dur: float, audio_filter: str, wav: bool, cover: ClipCover) -> list[str]:
+    """FFmpeg arguments (without the output file) that cut one clip out of ``filepath``."""
     if wav:
         args = ["-y", "-accurate_seek", "-ss", f"{s_time:.3f}", "-i", filepath, "-t", f"{dur:.3f}"]
         return args + ["-af", audio_filter, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]
     # Place -ss after -i for MP3 so stream 0:v (attached cover art at t=0) is preserved
     args = ["-y", "-i", filepath, "-ss", f"{s_time:.3f}", "-t", f"{dur:.3f}", "-af", audio_filter]
-    return args + mp3_output_args("copy" if cover == "copy" else "mjpeg")
+    if cover == "none":
+        return args + mp3_audio_only_args()
+    return args + mp3_output_args(cover)
 
 
 def _has_content(path: Path) -> bool:
@@ -177,41 +181,21 @@ def clip_audio_worker(
         audio_filter = clip_filter_chain(dur, gain_db, soften, fade_sec)
         timeout = _clip_timeout_sec(e_time)
 
-        result = run_ffmpeg(
-            _clip_args(source, s_time, dur, audio_filter, wav, "copy") + [str(tmp_save)], timeout=timeout
-        )
-        if result.returncode != 0 and not wav and not ffmpeg_timed_out(result):
-            # Retry transcoding video stream to mjpeg in case source art was PNG
+        # An MP3 is tried with its cover picture copied, then re-encoded (PNG art cannot be copied
+        # into an MP3), then without it. Every try runs through run_ffmpeg, so each has a time limit.
+        covers: tuple[ClipCover, ...] = ("none",) if wav else ("copy", "mjpeg", "none")
+        for cover in covers:
             with contextlib.suppress(OSError):
                 tmp_save.unlink()
             result = run_ffmpeg(
-                _clip_args(source, s_time, dur, audio_filter, wav, "mjpeg") + [str(tmp_save)], timeout=timeout
+                _clip_args(source, s_time, dur, audio_filter, wav, cover) + [str(tmp_save)], timeout=timeout
             )
-        if result.returncode != 0 or not _has_content(tmp_save):
-            with contextlib.suppress(OSError):
-                tmp_save.unlink()
-            # The fallback decodes the whole song into memory, so it is kept for what it can help
-            # with: a normal-sized song that FFmpeg rejected. A run that timed out would only take
-            # even longer this way, and a long recording would not fit in memory.
+            if result.returncode == 0 and _has_content(tmp_save):
+                break
             if ffmpeg_timed_out(result):
-                raise RuntimeError(str(result.stderr))
-            if Path(source).stat().st_size > _FALLBACK_MAX_BYTES:
-                raise RuntimeError(f"FFmpeg could not clip {Path(source).name}: {str(result.stderr)[-300:]}")
-            audio = AudioSegment.from_file(source)
-            clipped = audio[s_time * 1000 : e_time * 1000]
-            if abs(gain_db) > 0.05:
-                clipped = clipped + gain_db
-            fade_dur = fade_duration(dur, soften, fade_sec)
-            if soften and fade_dur > 0.01:
-                fade_ms = int(fade_dur * 1000)
-                clipped = clipped.fade_in(fade_ms).fade_out(fade_ms)
-            if wav:
-                clipped.export(str(tmp_save), format="wav")
-            else:
-                clipped.export(str(tmp_save), format="mp3", parameters=["-q:a", MP3_VBR_QUALITY])
-
-        if not _has_content(tmp_save):
-            raise RuntimeError("Audio clipping produced an empty file.")
+                raise RuntimeError(str(result.stderr))  # another try would only time out again
+        else:
+            raise RuntimeError(f"FFmpeg could not clip {Path(source).name}: {str(result.stderr)[-300:]}")
 
         if is_self_overwrite:
             time.sleep(0.05)
