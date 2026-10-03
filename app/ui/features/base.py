@@ -150,6 +150,7 @@ class AppBase:
         _saving_clip: bool
         _importing: bool
         _restoring_original: bool
+        _replacing_song: str | None
         _is_shutting_down: bool
         _is_checking_updates_manual: bool
         _available_update: ReleaseInfo | None
@@ -226,6 +227,8 @@ class AppBase:
         btn_restore_original: tk.Button
         cmb_playlists: ttk.Combobox
         listbox_pl: tk.Listbox
+        f_usb: tk.Frame
+        chk_even_volume: tk.Checkbutton
         cmb_usb: ttk.Combobox
         btn_usb_eject: tk.Button
         prog_export: ttk.Progressbar
@@ -269,8 +272,13 @@ class AppBase:
         def _release_audio_file(self) -> None: ...
         def _render_waveform(self, full_redraw: bool = False) -> None: ...
         def _set_card_playing_state(self, state: str) -> None: ...
+        def _being_replaced(self, path: str) -> bool: ...
         def _when_playable(
-            self, path: str, start_fn: Callable[[], None], busy_text: str = "Preparing this song for playback..."
+            self,
+            path: str,
+            start_fn: Callable[[], None],
+            busy_text: str = "Preparing this song for playback...",
+            on_failed: Callable[[], None] | None = None,
         ) -> None: ...
         def _update_clip_length_label(self) -> None: ...
         def reset_gain(self) -> None: ...

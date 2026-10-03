@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import tkinter as tk
 from pathlib import Path
 from typing import Any
@@ -15,9 +14,27 @@ from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import NEW_SONG_ROW_BG, AppBase
 from app.ui.search_dialog import SearchChoiceDialog
 
+# A search result longer than this is confirmed before it is downloaded: it is an album, a mix or a
+# "10 hours of..." video far more often than one song.
+LONG_DOWNLOAD_SEC = 20 * 60
+
+
+def _length_in_words(seconds: float) -> str:
+    """A length the way people say it: "25 minutes", "1 hour 5 minutes", "10 hours"."""
+    hours, minutes = divmod(round(seconds / 60), 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes or not hours:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return " ".join(parts)
+
 
 class DownloadMixin(AppBase):
     """Step 1 YouTube box: search, single and playlist downloads, progress and cancel."""
+
+    # True when a search preview paused the user's music; it plays on once the results window closes.
+    _resume_after_search = False
 
     def paste_youtube_link(self) -> None:
         try:
@@ -70,11 +87,17 @@ class DownloadMixin(AppBase):
             self.lbl_dl_metrics.config(text=" • ".join(parts))
 
     def start_download(self) -> None:
+        """Download MP3 button, and Enter in the box: search for the typed song, or download the pasted link."""
+        if str(self.btn_download.cget("state")) == tk.DISABLED:
+            # Enter in the box does not look at the button. A second search would open a second
+            # list of results, and a new job would take the Stop button away from a running download.
+            self.set_status("Still working on the last one. Click 'Stop Download' first to start another.", icon="⏳")
+            return
         query = self.entry_url.get().strip()
         if not query:
             dialogs.show_warning(self.root, "Nothing to Download", "Type a song name or paste a YouTube link first.")
             return
-        if not os.path.exists(ffmpeg_path):
+        if not Path(ffmpeg_path).exists():
             dialogs.show_warning(self.root, "Cannot Download", "ffmpeg.exe is missing, so audio cannot be converted.")
             return
 
@@ -280,12 +303,13 @@ class DownloadMixin(AppBase):
             )
             return
 
+        self._resume_after_search = False
         SearchChoiceDialog(
             self.root,
             query,
             results,
-            on_select=lambda item: self._start_download_url(item["url"], item.get("title")),
-            on_cancel=lambda: self.set_status("Ready"),
+            on_select=self._search_result_chosen,
+            on_cancel=self._search_cancelled,
             audio_engine=self.audio_engine,
             on_preview_play=self._on_search_preview_play,
         )
@@ -295,7 +319,39 @@ class DownloadMixin(AppBase):
         so resuming must reload the song at the paused position."""
         if (self.is_playing_main or self.is_playing_playlist) and not self.is_paused:
             self.pause_audio()
+            self._resume_after_search = True
         self.playback_ctrl.mark_mixer_taken()
+
+    def _resume_after_search_preview(self) -> None:
+        """Carry on with the music that a search preview paused (music the user paused stays paused)."""
+        resume, self._resume_after_search = self._resume_after_search, False
+        if resume and self.is_paused and self.selected_file_path:
+            self.pause_audio()  # on a paused song this resumes it
+
+    def _search_cancelled(self) -> None:
+        """The results window was closed without choosing a song."""
+        self._resume_after_search_preview()
+        if not (self.is_playing_main or self.is_playing_playlist):
+            self.set_status("Ready")
+
+    def _search_result_chosen(self, item: SearchResult) -> None:
+        """Download the chosen search result, asking first when it is far longer than a song."""
+        self._resume_after_search_preview()
+        seconds = float(item.duration_sec or 0.0)
+        if seconds > LONG_DOWNLOAD_SEC and not dialogs.ask_yes_no(
+            self.root,
+            "This Is a Long Recording",
+            f"'{item.title}' is {_length_in_words(seconds)} long, so it is probably a whole album, a mix "
+            "or a concert rather than one song.\n\n"
+            "It takes much longer to download and uses more disk space.",
+            yes="Download it anyway",
+            no="Cancel",
+            default_yes=False,
+            icon=dialogs.ICON_WARNING,
+        ):
+            self.set_status("Nothing was downloaded. Search again to choose a different version.")
+            return
+        self._start_download_url(item.url, item.title)
 
     def _handle_search_error(self, err: str) -> None:
         """Explain a failed search, and look for a fix when a newer version is the likely cure."""
