@@ -67,7 +67,10 @@ def unused_path(dest: str | Path) -> Path:
 
 
 def atomic_save_json(filepath: str | Path, data: Any) -> None:
-    """Atomically write JSON data to avoid corruption during crashes or power cuts (see ``fsync_file``)."""
+    """Atomically write JSON data to avoid corruption during crashes or power cuts (see ``fsync_file``).
+
+    The swap is retried while OneDrive or an antivirus scan briefly holds the file that is replaced.
+    """
     p = Path(filepath).resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = p.with_name(f"{p.name}.{os.getpid()}_{int(time.time() * 1000)}.tmp")
@@ -76,7 +79,7 @@ def atomic_save_json(filepath: str | Path, data: Any) -> None:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        tmp_path.replace(p)
+        replace_with_retry(tmp_path, p)
     except Exception:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()

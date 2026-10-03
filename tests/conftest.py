@@ -86,14 +86,15 @@ import pytest  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _working_task_manager() -> None:
-    """Give every test a running worker pool.
+    """Give every test running worker pools (the shared one, and the one for internet work).
 
-    Closing a window shuts the shared pool down for the rest of the process; without this, background
+    Closing a window shuts the shared pools down for the rest of the process; without this, background
     work in every later test would be dropped without an error and the test would prove nothing.
     """
-    from app.core.task_manager import task_mgr
+    from app.core.task_manager import network_task_mgr, task_mgr
 
     task_mgr.restart()
+    network_task_mgr.restart()
 
 
 @pytest.fixture(autouse=True)

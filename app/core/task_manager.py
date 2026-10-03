@@ -17,9 +17,12 @@ class TaskManager:
     and clean shutdown on application teardown.
     """
 
-    def __init__(self, max_workers: int = 6) -> None:
+    def __init__(self, max_workers: int = 6, thread_name_prefix: str = "UAS_Worker") -> None:
         self.max_workers = max_workers
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="UAS_Worker")
+        self._thread_name_prefix = thread_name_prefix
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix=thread_name_prefix
+        )
         self._lock = threading.RLock()
         self._futures: set[concurrent.futures.Future[Any]] = set()
         self._is_shutting_down = False
@@ -88,10 +91,15 @@ class TaskManager:
             if not self._is_shutting_down:
                 return
             self._executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.max_workers, thread_name_prefix="UAS_Worker"
+                max_workers=self.max_workers, thread_name_prefix=self._thread_name_prefix
             )
             self._is_shutting_down = False
 
 
 # Global singleton instance
 task_mgr = TaskManager(max_workers=6)
+
+# Everything that waits on the internet (YouTube searches, downloads and previews, update checks)
+# runs here. A stopped search or download keeps its thread until its connection times out; in the
+# shared pool a few of those left no thread for playing, clipping or exporting a song.
+network_task_mgr = TaskManager(max_workers=4, thread_name_prefix="UAS_Network")

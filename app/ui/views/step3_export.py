@@ -103,6 +103,11 @@ def build_step3_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     app.listbox_pl.bind("<ButtonRelease-1>", app._pl_drag_end, add="+")
     ToolTip(app.listbox_pl, "Drag a song up or down to change the order. Double-click a song to play it.")
 
+    # Number of songs and total length (see PlaylistMixin._show_playlist_length).
+    app.lbl_pl_total = tk.Label(parent, text="", font=FONT_BODY, fg=TEXT_MUTED, bg=BG_CARD, anchor="w", justify="left")
+    app.lbl_pl_total.pack(fill=tk.X)
+    app.lbl_pl_total.bind("<Configure>", lambda event: app.lbl_pl_total.config(wraplength=max(120, event.width - 4)))
+
     # Track Reordering Row
     f_reorder = tk.Frame(parent, bg=BG_CARD)
     f_reorder.pack(fill=tk.X, pady=1)

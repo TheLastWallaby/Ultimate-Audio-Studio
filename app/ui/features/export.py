@@ -12,7 +12,6 @@ from typing import Literal
 
 from app.config import sanitize_filename
 from app.controllers.export_controller import UsbTarget
-from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
 from app.models import DriveInfo
 from app.platform_utils import find_windows_media_player, list_removable_drives
@@ -147,6 +146,7 @@ class ExportMixin(AppBase):
             self.f_usb.pack(fill=tk.X, pady=2, before=self.chk_even_volume)
         else:
             self.f_usb.pack_forget()
+        self._show_playlist_length()  # for a CD it is measured against the 80 minutes one holds
 
     def eject_selected_usb(self) -> None:
         """Eject the drive chosen in the list (the Eject button)."""
@@ -205,33 +205,65 @@ class ExportMixin(AppBase):
             )
 
     def export_playlist(self) -> None:
-        """Check the songs' lengths off the UI thread when needed, then ask the export questions."""
+        """Check on a worker which songs are there and how long they are, then ask the export questions.
+
+        Both checks read the songs' drive, which can take seconds (a sleeping USB disk, ffprobe for
+        a song whose header has no length), so neither runs on the window's thread.
+        """
         if not self.playlist_files:
             dialogs.show_warning(self.root, "Empty Playlist", "Add some songs to this playlist before exporting.")
             return
         files = list(self.playlist_files)
-        # Durations drive the disk-space and 80-minute checks; reading an uncached one can start
-        # ffprobe, which must not freeze the window. Usually they were read in the background already.
-        uncached = [f for f in files if os.path.isfile(f) and cache_mgr.get_duration(f) is None]
-        if not uncached:
-            self._export_after_preflight(files)
-            return
         self.btn_export.config(text="Checking songs...", state=tk.DISABLED)
-        self.set_busy(True, f"Checking {len(uncached)} song(s) before exporting...")
+        self.set_busy(True, f"Checking {len(files)} song(s) before exporting...")
 
         def _worker() -> None:
-            for path in uncached:
-                if getattr(self, "_is_shutting_down", False):
+            present: list[str] = []
+            for path in files:
+                if self._is_shutting_down:
                     return
-                self._cached_duration(path)
-            self._safe_after(0, _ready)
+                if Path(path).exists():
+                    present.append(path)
+                    self._cached_duration(path)  # the disk-space and 80-minute checks need the lengths
+            self._safe_after(0, self._export_songs_checked, files, present)
 
-        def _ready() -> None:
+        if task_mgr.submit_task(_worker) is None:  # the app is closing
             self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
             self.set_busy(False)
-            self._export_after_preflight(files)
 
-        task_mgr.submit_task(_worker)
+    def _export_songs_checked(self, files: list[str], present: list[str]) -> None:
+        """Say which songs cannot be found before anything is asked about, or done to, the drive.
+
+        An export of songs that are all missing would otherwise remove the previous export from the
+        drive and put nothing in its place. Only the songs that were found are exported.
+        """
+        self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
+        self.set_busy(False)
+        plug_in = "If your music is on a USB drive or memory card, plug it in and export the playlist again."
+        if not present:
+            self.set_status("Nothing was exported: the songs of this playlist could not be found.", icon="⚠️")
+            dialogs.show_warning(
+                self.root,
+                "Songs Not Found",
+                f"None of the songs in the playlist '{self.active_playlist_name}' could be found, so nothing "
+                f"was exported.\n\n{plug_in}\n\nOtherwise, remove the missing songs (marked ⚠️) from the playlist.",
+            )
+            return
+        found = set(present)
+        missing = [Path(path).name for path in files if path not in found]
+        if missing and not dialogs.ask_yes_no(
+            self.root,
+            "Some Songs Could Not Be Found",
+            f"{len(missing)} of the {len(files)} songs in this playlist could not be found:\n{_listed(missing)}\n\n"
+            f"{plug_in}",
+            yes=f"Export the other {len(present)} song(s)",
+            no="Cancel",
+            default_yes=False,
+            icon=dialogs.ICON_WARNING,
+        ):
+            self.set_status("Nothing was exported.")
+            return
+        self._export_after_preflight(present)
 
     def _cached_duration_only(self, path: str) -> float:
         return self._cached_duration(path, probe=False)
@@ -471,6 +503,15 @@ class ExportMixin(AppBase):
             self._end_export("USB export stopped: the drive was unplugged.")
             dialogs.show_warning(self.root, "Export Stopped", problems)  # there is nothing left to eject
             return
+        if report.exported == 0 and not report.stopped:
+            # "Finished" would not be true, and there is no new music on the drive to eject it for.
+            self._end_export("No songs were copied to the USB drive.")
+            dialogs.show_warning(
+                self.root,
+                "No Songs Were Exported",
+                f"None of the {report.total} song(s) could be copied to the USB flash drive.\n\n{problems}",
+            )
+            return
         if report.stopped == "full":
             self._end_export("USB export stopped: the drive is full. Eject the drive before unplugging it.")
         else:
@@ -494,9 +535,30 @@ class ExportMixin(AppBase):
             self._eject_drive(drive_label, drive_root)
 
     def _cd_export_success(self, cd_folder: str, report: ExportReport) -> None:
-        """Report the prepared CD tracks and hand over to Windows Media Player for burning."""
-        self._end_export("CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
+        """Report the prepared CD tracks and hand over to Windows Media Player for burning.
+
+        An export that made no track, or that stopped early, says so instead: "ready to burn" and
+        the burning steps would send the user off to burn a CD that is empty or incomplete.
+        """
         problems = export_problems(report, drive="This computer's disk")
+        if report.exported == 0:
+            self._end_export("No CD tracks could be prepared.")
+            dialogs.show_warning(
+                self.root,
+                "CD Tracks Not Prepared",
+                f"None of the {report.total} song(s) could be prepared for a CD.\n\n{problems}",
+            )
+            return
+        if report.stopped:
+            self._end_export(f"CD export stopped after {report.exported} of {report.total} tracks.")
+            dialogs.show_warning(
+                self.root,
+                "Export Stopped",
+                f"{problems}\n\nThe {report.exported} track(s) prepared so far are in 'My_CD_Burn_Folder' "
+                "on your Desktop.",
+            )
+            return
+        self._end_export("CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
         warn_text = f"\n\nNote: {problems}" if problems else ""
 
         # File Explorer's 'Send to / Burn to disc' makes a DATA disc that most CD players and car
