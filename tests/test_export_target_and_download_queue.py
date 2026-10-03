@@ -20,6 +20,7 @@ from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
 from app.core.errors import ErrorContext, friendly_error
 from app.main import UltimateAudioStudio
+from app.models import DriveInfo
 from app.services import clipper, exporter
 from app.services.exporter import ExportReport
 from app.services.updater import _GitHubAssetRedirectHandler
@@ -350,3 +351,28 @@ def test_token_is_kept_on_a_redirect_within_github(url: str) -> None:
 
     assert redirected is not None
     assert redirected.headers.get("Authorization") == "Bearer secret"
+
+
+# --- 8. A short job that ends does not switch off the "working" sign of a long one ------------------
+
+
+def test_a_short_job_ending_leaves_the_export_shown_as_working(studio: UltimateAudioStudio) -> None:
+    studio._exporting = True
+    studio.set_busy(True, "Exporting song 3 of 12...")
+
+    studio.set_busy(True, "Preparing this song for playback...")
+    studio.set_busy(False)  # the song is ready; the export is still running
+
+    assert studio._busy
+    assert str(studio.root.cget("cursor")) == "watch"
+    # A drive that is plugged in meanwhile does not cover up the export's progress either.
+    studio.set_status("Exporting song 4 of 12...")
+    studio._usb_scan_id += 1
+    studio._show_usb_drives(studio._usb_scan_id, [DriveInfo("E:\\", "USB E", "FAT32")], "changes")
+    assert studio.status.cget("text") == "Exporting song 4 of 12..."
+
+    studio._exporting = False
+    studio.set_busy(False)
+
+    assert not studio._busy
+    assert str(studio.root.cget("cursor")) == ""
