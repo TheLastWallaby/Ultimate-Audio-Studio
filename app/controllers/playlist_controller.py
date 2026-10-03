@@ -123,9 +123,9 @@ class PlaylistController:
             except (OSError, ValueError) as err:
                 logger.error("The spare playlists file %s could not be read either: %s", backup, err)
 
+        # The default playlist is only made when there is none at all: added to every load, it came
+        # back empty at each start after the user had renamed or deleted it.
         self.playlists = loaded or {DEFAULT_PLAYLIST_NAME: []}
-        if DEFAULT_PLAYLIST_NAME not in self.playlists:
-            self.playlists[DEFAULT_PLAYLIST_NAME] = []
         self.active_playlist_name = next(iter(self.playlists))
         return PlaylistLoadResult(unreadable=unreadable, restored_from_backup=restored, damaged_copy=damaged_copy)
 

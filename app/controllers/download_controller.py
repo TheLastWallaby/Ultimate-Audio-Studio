@@ -28,7 +28,8 @@ class DownloadController:
     Every search or download is a *job* with its own cancel event. Stopping a job sets only that
     event, so starting the next job can never revive a worker that is still winding down, and every
     callback from a job that has since been replaced is dropped (progress, results, the
-    ``is_downloading`` flag, and partial-file cleanup that could hit the new job's files).
+    ``is_downloading`` flag, and partial-file cleanup that could hit the new job's files). Starting
+    a job stops the one it replaces: a job that can no longer report back must not keep running.
     """
 
     def __init__(self, app: object) -> None:
@@ -46,11 +47,13 @@ class DownloadController:
         self._download_cancel.set()
 
     def reset_cancel(self) -> threading.Event:
-        """Start a new job: give it a fresh cancel event (earlier jobs keep their own, possibly set, event).
+        """Start a new job: stop the one it replaces and give the new one a fresh cancel event.
 
         A replaced job can no longer report back, so it cannot clear ``is_downloading`` either: left
         set, the app would warn "still downloading" at every close and keep the PC awake for good.
+        Left running, it would go on downloading with no Stop button and no word when it ends.
         """
+        self._download_cancel.set()
         self.is_downloading = False
         self._download_cancel = threading.Event()
         return self._download_cancel
@@ -107,9 +110,16 @@ class DownloadController:
         on_success: Callable[[list[SearchResult]], None],
         on_error: Callable[[str], None],
     ) -> None:
-        """Start YouTube search worker thread (a stopped search never delivers its results)."""
+        """Start YouTube search worker thread (a stopped or replaced search never delivers its results)."""
         job = self.reset_cancel()
-        task_mgr.submit_task(search_youtube_worker, query, max_results, job, on_success, on_error)
+        task_mgr.submit_task(
+            search_youtube_worker,
+            query,
+            max_results,
+            job,
+            self._for_job(job, on_success),
+            self._for_job(job, on_error),
+        )
 
     def start_download(
         self,

@@ -181,14 +181,18 @@ def build_step3_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     f_exp_top.pack(fill=tk.X)
     tk.Label(f_exp_top, text="Export To:", font=FONT_SECTION_HDR, fg=TEXT_DARK, bg=BG_SUB_CARD).pack(side=tk.LEFT)
     app.export_var = tk.StringVar(value="USB")
-    tk.Radiobutton(
-        f_exp_top, text="💾 USB", variable=app.export_var, value="USB", font=FONT_BODY_BOLD, bg=BG_SUB_CARD
-    ).pack(side=tk.LEFT, padx=4)
-    tk.Radiobutton(
-        f_exp_top, text="💿 CD", variable=app.export_var, value="CD", font=FONT_BODY_BOLD, bg=BG_SUB_CARD
-    ).pack(side=tk.LEFT, padx=4)
+    for text, value in (("💾 USB", "USB"), ("💿 CD", "CD")):
+        tk.Radiobutton(
+            f_exp_top,
+            text=text,
+            variable=app.export_var,
+            value=value,
+            font=FONT_BODY_BOLD,
+            bg=BG_SUB_CARD,
+            command=app.on_export_target_changed,
+        ).pack(side=tk.LEFT, padx=4)
 
-    f_usb = tk.Frame(f_exp_card, bg=BG_SUB_CARD)
+    f_usb = app.f_usb = tk.Frame(f_exp_card, bg=BG_SUB_CARD)
     f_usb.pack(fill=tk.X, pady=2)
     app.cmb_usb = ttk.Combobox(f_usb, textvariable=app.usb_choice, font=FONT_BODY, state="readonly")
     app.cmb_usb.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -212,9 +216,10 @@ def build_step3_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     app.btn_usb_eject.pack(side=tk.LEFT, padx=(3, 0))
     ToolTip(app.btn_usb_eject, "Safely eject the selected USB drive so it can be unplugged")
 
-    tk.Checkbutton(
+    app.chk_even_volume = tk.Checkbutton(
         f_exp_card, text="Make all songs equally loud", variable=app.even_volume, font=FONT_BODY, bg=BG_SUB_CARD
-    ).pack(fill=tk.X, pady=1)
+    )
+    app.chk_even_volume.pack(fill=tk.X, pady=1)
 
     app.prog_export = ttk.Progressbar(parent, mode="determinate", style="Export.Horizontal.TProgressbar")
 
