@@ -170,6 +170,7 @@ Run all six before you call a change finished.
   - **A throwaway Music folder.** The `UAS_*` paths (Library, playlists, settings, error log) point at a temporary folder, set before anything imports `app`.
   - **Dialogs never block.** Every dialog from `app/ui/dialogs.py` returns its cancel value, and error dialogs are dismissed. Patch the dialog to test another answer, or mark the test `@pytest.mark.real_dialogs`.
   - **A running worker pool.** Closing a window shuts the shared `task_mgr` down; it is restarted before each test.
+  - **No real sound device.** `SDL_AUDIODRIVER` is set to SDL's silent `dummy` driver, so the mixer starts at once on any machine. Without it, every window opened on a runner without audio waits 8 s for pygame to give up.
   - **Window start-up is retried.** `tk.Tk()` tries again when Tcl fails with "Can't find a usable init.tcl", an intermittent error on the Windows CI runners.
 - Use the `studio` fixture for a real, hidden main window. It closes the window afterwards.
 - Background results reach the window through its event loop, so a test must pump it (`root.update()`) until the result arrives.
