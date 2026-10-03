@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from app.config import ERROR_LOG_PATH, MUSIC_DIR, PLAYLISTS_PATH, SETTINGS_PATH
 from app.controllers.library_controller import ImportResult, LibraryController
+from app.core import audio_engine
 from app.core.audio_engine import AudioEngine
 from app.core.file_utils import copy_file_atomic
 from app.core.task_manager import TaskManager, task_mgr
@@ -279,17 +280,17 @@ def test_prepare_for_playback_reports_whether_the_conversion_worked(tmp_path: Pa
 
     with (
         patch("app.core.audio_engine.PREVIEW_CACHE_DIR", str(tmp_path / "cache")),
-        patch("app.core.audio_engine.subprocess.run", return_value=SimpleNamespace(returncode=1)),
+        patch("app.core.audio_engine.run_ffmpeg", return_value=SimpleNamespace(returncode=1, stderr="")),
     ):
         assert engine.prepare_for_playback(str(song)) is False
 
-    def _converts(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
-        Path(cmd[-1]).write_bytes(b"RIFF")
-        return SimpleNamespace(returncode=0)
+    def _converts(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        Path(args[-1]).write_bytes(b"RIFF")
+        return SimpleNamespace(returncode=0, stderr="")
 
     with (
         patch("app.core.audio_engine.PREVIEW_CACHE_DIR", str(tmp_path / "cache")),
-        patch("app.core.audio_engine.subprocess.run", side_effect=_converts),
+        patch("app.core.audio_engine.run_ffmpeg", side_effect=_converts),
     ):
         assert engine.prepare_for_playback(str(song)) is True
 
@@ -622,3 +623,86 @@ def test_unplugged_drive_is_not_offered_for_eject(studio: UltimateAudioStudio) -
     assert warn.call_args[0][1] == "Export Stopped"
     ask.assert_not_called()
     assert "unplugged" in studio.status.cget("text")
+
+
+# --- Converting a song for playback ------------------------------------------------------------------
+
+
+def _fake_conversion(written: bytes = b"RIFF complete", returncode: int = 0, delay: float = 0.0) -> MagicMock:
+    """Stands in for run_ffmpeg: writes ``written`` to the output file (the last argument)."""
+
+    def _run(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        out = Path(args[-1])
+        out.write_bytes(written[:4])
+        time.sleep(delay)  # another conversion may look at the file meanwhile
+        out.write_bytes(written)
+        return SimpleNamespace(returncode=returncode, stderr="")
+
+    return MagicMock(side_effect=_run)
+
+
+def test_conversion_that_times_out_is_never_played_half_written(tmp_path: Path) -> None:
+    song = _make_song(tmp_path, "song.m4a", b"not really audio")
+    cache = tmp_path / "cache"
+    engine = AudioEngine()
+    timed_out = _fake_conversion(written=b"RIFF half", returncode=-1)
+
+    with (
+        patch("app.core.audio_engine.PREVIEW_CACHE_DIR", str(cache)),
+        patch("app.core.audio_engine.run_ffmpeg", timed_out),
+    ):
+        assert engine.prepare_for_playback(str(song)) is False
+        assert list(cache.iterdir()) == []  # nothing left that a later call could take for a finished WAV
+        assert engine.prepare_for_playback(str(song)) is False
+
+    assert timed_out.call_count == 2  # the second call converted again instead of trusting a leftover
+
+
+def test_two_conversions_of_one_song_run_one_after_the_other(tmp_path: Path) -> None:
+    song = _make_song(tmp_path, "song.wma", b"not really audio")
+    engine = AudioEngine()
+    slow = _fake_conversion(delay=0.3)
+    results: list[str] = []
+
+    with (
+        patch("app.core.audio_engine.PREVIEW_CACHE_DIR", str(tmp_path / "cache")),
+        patch("app.core.audio_engine.run_ffmpeg", slow),
+    ):
+        threads = [
+            threading.Thread(target=lambda: results.append(engine.get_playable_audio_path(str(song)))) for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+    assert slow.call_count == 1
+    assert len(set(results)) == 1 and results[0].endswith(".wav")
+    assert Path(results[0]).read_bytes() == b"RIFF complete"
+
+
+def test_replaced_song_is_converted_again(tmp_path: Path) -> None:
+    song = _make_song(tmp_path, "song.m4a", b"the old song")
+    engine = AudioEngine()
+
+    with patch("app.core.audio_engine.PREVIEW_CACHE_DIR", str(tmp_path / "cache")):
+        with patch("app.core.audio_engine.run_ffmpeg", _fake_conversion(b"RIFF old")):
+            old_wav = engine.get_playable_audio_path(str(song))
+        song.write_bytes(b"a different, longer song")
+        assert engine.needs_conversion(str(song))
+        with patch("app.core.audio_engine.run_ffmpeg", _fake_conversion(b"RIFF new")):
+            new_wav = engine.get_playable_audio_path(str(song))
+
+    assert new_wav != old_wav
+    assert Path(new_wav).read_bytes() == b"RIFF new"
+    assert not Path(old_wav).exists()  # the old song's WAV is cleaned up
+
+
+def test_conversion_timeout_grows_with_the_song() -> None:
+    def _timeout(seconds: float) -> int:
+        with patch("app.core.audio_engine.read_track_metadata", return_value=SimpleNamespace(duration=seconds)):
+            return audio_engine._conversion_timeout_sec("song.m4a")
+
+    assert _timeout(0) == 600  # length unknown
+    assert _timeout(30) == 75
+    assert _timeout(2 * 3600) == 1800
