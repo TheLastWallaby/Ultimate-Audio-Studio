@@ -1,5 +1,6 @@
 """Automated unit tests verifying TaskManager, platform security, and models."""
 
+import os
 import time
 import unittest
 
@@ -118,3 +119,15 @@ class TestModels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_tests_use_the_silent_audio_driver() -> None:
+    """The mixer must start on any machine: without an audio device it waits 8 s before it gives up."""
+    import pygame
+
+    from app.core.audio_engine import AudioEngine
+
+    AudioEngine()
+
+    assert os.environ.get("SDL_AUDIODRIVER") == "dummy"
+    assert pygame.mixer.get_init() is not None
