@@ -316,3 +316,37 @@ def test_skipping_still_stops_at_the_end_of_a_song_of_known_length() -> None:
     ctrl.audio_engine.play_start_offset = 95.0
 
     assert ctrl.skip_by(10.0, 100.0) == pytest.approx(100.0)
+
+
+# --- 7. The GitHub token is only ever sent to github.com ------------------------------------------
+
+
+def _redirected(url: str) -> urllib.request.Request | None:
+    request = urllib.request.Request("https://api.github.com/asset", headers={"Authorization": "Bearer secret"})
+    return _GitHubAssetRedirectHandler().redirect_request(request, io.BytesIO(), 302, "Found", HTTPMessage(), url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com.example.net/file.exe",  # "github.com" is in the name, but it is not GitHub
+        "https://notgithub.com/file.exe",
+        "https://example.net/github.com/file.exe",
+        "https://objects.githubusercontent.com/file.exe",
+        "https://release-assets.s3.amazonaws.com/file.exe",
+    ],
+)
+def test_token_is_dropped_on_a_redirect_to_any_other_host(url: str) -> None:
+    redirected = _redirected(url)
+
+    assert redirected is not None
+    sent = {**redirected.headers, **redirected.unredirected_hdrs}
+    assert "authorization" not in {name.lower() for name in sent}
+
+
+@pytest.mark.parametrize("url", ["https://github.com/file.exe", "https://API.GitHub.com/file.exe"])
+def test_token_is_kept_on_a_redirect_within_github(url: str) -> None:
+    redirected = _redirected(url)
+
+    assert redirected is not None
+    assert redirected.headers.get("Authorization") == "Bearer secret"
