@@ -118,6 +118,11 @@ TITLE_BAR_INSET, TITLE_BAR_HEIGHT = 80, 40
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)(?:\+(-?\d+)\+(-?\d+))?")
 
 
+def _same_folder(a: str | Path, b: str | Path) -> bool:
+    """True when both name the same folder (Windows compares paths without regard to case)."""
+    return str(Path(a).absolute()).casefold() == str(Path(b).absolute()).casefold()
+
+
 def restorable_geometry(geometry: str | None) -> str | None:
     """The saved window geometry if the window would be usable there, else None (use the default).
 
@@ -377,6 +382,11 @@ class UltimateAudioStudio(
         s = settings_mgr.get_settings()  # never raises: an unreadable file gives the defaults
         if s.library_folder and Path(s.library_folder).is_dir():
             self.library_folder = s.library_folder
+        elif s.library_folder and not _same_folder(s.library_folder, self.default_lib_path):
+            # On a drive or share that is not connected now: use the default folder for this session,
+            # but keep the user's choice so it is back once the drive is.
+            self._unavailable_library_folder = s.library_folder
+            self.root.after(800, self._report_unavailable_library_folder)
         self._saved_volume = s.volume
         self._saved_repeat = s.repeat_playlist
         self._saved_soften = s.soften_clip
@@ -389,6 +399,21 @@ class UltimateAudioStudio(
         if settings_mgr.damaged_copy is not None or settings_mgr.read_failed:
             # After the window is up: a dialog during start-up would appear before the app does.
             self.root.after(800, self._report_settings_problem)
+
+    def _report_unavailable_library_folder(self) -> None:
+        """Tell the user that their chosen music folder is not there, and how to get it back."""
+        missing = self._unavailable_library_folder
+        if missing is None or getattr(self, "_is_shutting_down", False):
+            return
+        dialogs.show_warning(
+            self.root,
+            "Music Folder Not Found",
+            f"Your music folder could not be found:\n{missing}\n\n"
+            "If it is on a USB drive, a memory card or another computer, connect it, then close "
+            "Ultimate Audio Studio and open it again.\n\n"
+            f"Until then, the app uses the '{Path(self.library_folder).name}' folder. To use a different "
+            "folder from now on, click the 'Change...' button at the top of your Library.",
+        )
 
     def _report_settings_problem(self) -> None:
         """Tell the user that their saved settings could not be used, and what to do about it."""
@@ -450,7 +475,8 @@ class UltimateAudioStudio(
                 volume = int(self.scale_volume.get())
 
             settings_mgr.update_settings(
-                library_folder=self.library_folder,
+                # A chosen folder that is offline stays chosen; only 'Change...' replaces it.
+                library_folder=self._unavailable_library_folder or self.library_folder,
                 volume=volume,
                 repeat_playlist=bool(self.repeat_playlist.get()) if hasattr(self, "repeat_playlist") else False,
                 soften_clip=bool(self.soften_clip.get()) if hasattr(self, "soften_clip") else True,

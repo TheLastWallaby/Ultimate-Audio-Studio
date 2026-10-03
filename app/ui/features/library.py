@@ -42,6 +42,9 @@ class LibraryMixin(AppBase):
     # A Library song that was clicked while another one was playing or paused. A click never cuts
     # the music off; this song is loaded once PLAY or STOP is pressed, or the music ends.
     _pending_library_song: str | None = None
+    # The chosen Library folder when it was offline at start-up (a USB drive, memory card or network
+    # share). The window then shows the default folder, but this one is what gets saved.
+    _unavailable_library_folder: str | None = None
 
     def _library_row_path(self, filename: str) -> str:
         """Path of a Library row, in the exact form the player and the playlists keep it in.
@@ -280,11 +283,13 @@ class LibraryMixin(AppBase):
         return data.to_dict() if hasattr(data, "to_dict") else dict(data)
 
     def change_folder(self) -> None:
+        """Let the user pick the Library folder; this is the only way a saved choice is replaced."""
         f = filedialog.askdirectory(
             initialdir=self.library_folder, title="Choose Your Music Library Folder", parent=self.root
         )
         if f and os.path.isdir(f):
             self.library_folder = f
+            self._unavailable_library_folder = None
             self._save_settings()
             task_mgr.submit_task(self.library_ctrl.recover_stranded_deletes, f)
             self.refresh_library()

@@ -703,3 +703,76 @@ def test_window_does_not_save_over_settings_it_could_not_read(tmp_path: Path) ->
         window.on_close()
 
     assert json.loads(settings_file.read_text(encoding="utf-8")) == {"library_folder": "D:/My Songs"}
+
+
+# --- A Library folder that is offline when the app starts --------------------------------------------
+
+
+def _saved_library_folder(settings_file: Path) -> str:
+    return str(json.loads(settings_file.read_text(encoding="utf-8"))["library_folder"])
+
+
+def test_offline_library_folder_stays_chosen(tmp_path: Path) -> None:
+    usb_music = tmp_path / "USB stick" / "My Songs"  # the stick is not plugged in
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"library_folder": str(usb_music)}), encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+
+    with patch("app.main.settings_mgr", mgr), patch("app.ui.dialogs.show_warning") as warn:
+        window = _open_window(mgr, tmp_path)
+        try:
+            deadline = time.monotonic() + 5
+            while not warn.called and time.monotonic() < deadline:
+                window.root.update()
+                time.sleep(0.01)
+            shown_folder = window.library_folder
+            window._save_settings()  # e.g. after the window was moved
+        finally:
+            window.on_close()
+
+    assert shown_folder == window.default_lib_path  # the default folder is used meanwhile
+    assert _saved_library_folder(settings_file) == str(usb_music)  # ...but the choice is kept
+    warn.assert_called_once()
+    assert warn.call_args[0][1] == "Music Folder Not Found"
+    assert str(usb_music) in warn.call_args[0][2]
+    assert "Change..." in warn.call_args[0][2]
+
+
+def test_choosing_a_folder_replaces_the_offline_one(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"library_folder": str(tmp_path / "gone")}), encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+    chosen = tmp_path / "New Music"
+    chosen.mkdir()
+
+    with patch("app.main.settings_mgr", mgr):
+        window = _open_window(mgr, tmp_path)
+        try:
+            with patch("app.ui.features.library.filedialog.askdirectory", return_value=str(chosen)):
+                window.change_folder()
+        finally:
+            window.on_close()
+
+    assert _saved_library_folder(settings_file) == str(chosen)
+
+
+def test_available_library_folder_is_used_without_a_warning(tmp_path: Path) -> None:
+    music = tmp_path / "My Songs"
+    music.mkdir()
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"library_folder": str(music)}), encoding="utf-8")
+    mgr = SettingsManager(settings_path=settings_file)
+
+    with patch("app.main.settings_mgr", mgr), patch("app.ui.dialogs.show_warning") as warn:
+        window = _open_window(mgr, tmp_path)
+        try:
+            deadline = time.monotonic() + 1.2  # past the 800 ms the warning would wait
+            while time.monotonic() < deadline:
+                window.root.update()
+                time.sleep(0.01)
+            shown_folder = window.library_folder
+        finally:
+            window.on_close()
+
+    assert shown_folder == str(music)
+    warn.assert_not_called()
