@@ -271,3 +271,29 @@ def test_usb_export_keeps_the_extension_of_a_song_with_a_very_long_name(tmp_path
     # The next export of this playlist finds it, so "Replace the old songs" can remove it.
     assert str(drive_folder / tracks[0]) in exporter.find_previous_export(str(drive_folder))
     assert tracks[0] in (drive_folder / "00_Car.m3u8").read_text(encoding="utf-8")
+
+
+# --- 5. A word in a song's name never turns a file error into a message about YouTube --------------
+
+
+@pytest.mark.parametrize("context", ["export", "save_clip", "import", "playback", "generic"])
+@pytest.mark.parametrize(
+    "song", ["Private Video Blues", "Timeout", "Forbidden Love", "This Live Stream", "Video Unavailable"]
+)
+def test_file_errors_are_not_explained_as_youtube_problems(context: ErrorContext, song: str) -> None:
+    raw = f"[WinError 3] The system cannot find the path specified: 'E:\\\\Car\\\\03 - {song}.mp3'"
+
+    assert friendly_error(raw, context).title == friendly_error("something odd", context).title
+
+
+def test_file_errors_keep_their_own_explanations() -> None:
+    raw = "[WinError 32] The process cannot access the file: 'C:\\\\Music\\\\Private Video Blues.mp3'"
+
+    assert friendly_error(raw, "export").title == "File Is In Use"
+    assert friendly_error("[Errno 28] No space left on device: 'Timeout.mp3'", "save_clip").title == "Disk Is Full"
+
+
+def test_downloads_and_searches_are_still_explained() -> None:
+    assert friendly_error("ERROR: Private video", "download").title == "Private Video"
+    assert friendly_error("<urlopen error [Errno 11001] getaddrinfo failed>", "search").title == "No Internet Connection"
+    assert friendly_error("HTTP Error 403: Forbidden", "download").suggests_update
