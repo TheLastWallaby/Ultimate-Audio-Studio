@@ -389,8 +389,17 @@ def _is_usb_bus_drive(drive_root: str) -> bool:
     return False
 
 
+# SetThreadErrorMode flags: no "There is no disk in the drive" box while empty slots are checked.
+_SEM_FAILCRITICALERRORS = 0x0001
+_SEM_NOOPENFILEERRORBOX = 0x8000
+
+
 def list_removable_drives() -> list[DriveInfo]:
-    """Enumerate connected USB flash drives with volume label and filesystem type (e.g. FAT32, NTFS)."""
+    """Enumerate connected USB flash drives with volume label and filesystem type (e.g. FAT32, NTFS).
+
+    A card-reader slot keeps its drive letter when no card is in it. Such a slot has no volume to
+    read, so it is left out: listed, it could be chosen (even by default) for an export.
+    """
     drives: list[DriveInfo] = []
     if os.name != "nt":
         return drives
@@ -415,8 +424,12 @@ def list_removable_drives() -> list[DriveInfo]:
         label_buf = ctypes.create_unicode_buffer(261)
         fs_buf = ctypes.create_unicode_buffer(261)
         sys_drive = get_settings().system.system_drive.upper() + "\\"
-        for i in range(26):
-            if bitmask & (1 << i):
+        old_mode = ctypes.c_uint32(0)
+        kernel32.SetThreadErrorMode(_SEM_FAILCRITICALERRORS | _SEM_NOOPENFILEERRORBOX, ctypes.byref(old_mode))
+        try:
+            for i in range(26):
+                if not bitmask & (1 << i):
+                    continue
                 root = f"{chr(65 + i)}:\\"
                 if root.upper() == sys_drive:
                     continue
@@ -425,19 +438,17 @@ def list_removable_drives() -> list[DriveInfo]:
                 is_usb = (dtype == 2) or (dtype == 3 and _is_usb_bus_drive(root))
                 if not is_usb:
                     continue
-                label = "USB Drive"
-                fs_type = "FAT32"
-                try:
-                    if kernel32.GetVolumeInformationW(root, label_buf, 261, None, None, None, fs_buf, 261):
-                        label = label_buf.value or label
-                        fs_type = fs_buf.value or fs_type
-                except Exception:
-                    pass
+                if not kernel32.GetVolumeInformationW(root, label_buf, 261, None, None, None, fs_buf, 261):
+                    continue  # no card or stick in it, or nothing Windows can read
+                label = label_buf.value or "USB Drive"
+                fs_type = fs_buf.value or "FAT32"  # the strictest limits (4 GB files) are the safe guess
                 drives.append(
                     DriveInfo(root=root, display_label=f"USB Drive: {label} ({root}) [{fs_type}]", fs_type=fs_type)
                 )
-    except Exception:
-        pass
+        finally:
+            kernel32.SetThreadErrorMode(old_mode.value, None)
+    except (OSError, AttributeError) as err:
+        logger.warning("Could not list the USB drives: %s", err)
     return drives
 
 
