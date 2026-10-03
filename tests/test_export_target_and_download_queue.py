@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable
+import tkinter as tk
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,8 @@ from app.controllers.library_controller import LibraryController
 from app.core.cache_manager import cache_mgr
 from app.main import UltimateAudioStudio
 from app.services import clipper
+from app.ui import dialogs, error_dialog
+from app.ui.theme import init_fonts
 
 
 def _pump(window: UltimateAudioStudio, until: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -149,3 +152,93 @@ def test_a_copy_that_cannot_be_put_back_is_kept_for_the_next_start(tmp_path: Pat
         assert LibraryController.recover_stranded_deletes(tmp_path) == 0
 
     assert ready.read_bytes() == b"the complete copy"
+
+
+# --- 3. A dialog taller than the screen scrolls its message; its buttons stay on the screen ---------
+
+# What a dialog must leave free of the screen's height for its title bar and the taskbar (at 100%).
+SCREEN_MARGIN_PX = 110
+LONG_MESSAGE = "\n".join(f"• Song number {n} could not be converted; the file may be damaged" for n in range(1, 201))
+
+
+@pytest.fixture
+def root() -> Iterator[tk.Tk]:
+    """A hidden window with the app's fonts at the biggest Text Size."""
+    window = tk.Tk()
+    window.withdraw()
+    init_fonts(window, "Extra Large")
+    yield window
+    window.destroy()
+
+
+def _descendants(widget: tk.Misc) -> list[tk.Misc]:
+    found = []
+    for child in widget.winfo_children():
+        found.append(child)
+        found.extend(_descendants(child))
+    return found
+
+
+def _room_on_screen(window: tk.Misc) -> int:
+    scale = max(1.0, window.winfo_fpixels("1i") / 96.0)
+    return window.winfo_screenheight() - round(SCREEN_MARGIN_PX * scale)
+
+
+def _inspect_then_click(root: tk.Tk, label: str, seen: dict[str, object]) -> None:
+    """Once the dialog is up: note its height and what it shows, then click the button ``label``."""
+
+    def _run() -> None:
+        dialog = next((w for w in root.winfo_children() if isinstance(w, tk.Toplevel)), None)
+        if dialog is None:
+            root.after(50, _run)
+            return
+        try:
+            dialog.update_idletasks()
+            widgets = _descendants(dialog)
+            seen["height"] = dialog.winfo_reqheight()
+            seen["room"] = _room_on_screen(dialog)
+            seen["text"] = "".join(w.get("1.0", tk.END) for w in widgets if isinstance(w, tk.Text))
+            seen["scrolls"] = any(isinstance(w, tk.Scrollbar) for w in widgets)
+            next(w for w in widgets if isinstance(w, tk.Button) and w.cget("text") == label).invoke()
+        finally:
+            if dialog.winfo_exists():  # never leave the test waiting on a dialog nobody will close
+                dialog.destroy()
+
+    root.after(100, _run)
+
+
+@pytest.mark.real_dialogs
+def test_a_dialog_taller_than_the_screen_scrolls_its_message(root: tk.Tk) -> None:
+    seen: dict[str, object] = {}
+    _inspect_then_click(root, "Open the CD folder", seen)
+
+    answer = dialogs.ask_yes_no(root, "Ready to Burn", LONG_MESSAGE, yes="Open the CD folder", no="Not now")
+
+    assert answer is True  # the button could be reached
+    assert isinstance(seen["height"], int) and isinstance(seen["room"], int)
+    assert seen["height"] <= seen["room"]
+    assert seen["scrolls"]
+    assert "Song number 1 " in str(seen["text"]) and "Song number 200 " in str(seen["text"])  # nothing was cut
+
+
+@pytest.mark.real_dialogs
+def test_a_long_error_message_scrolls_too(root: tk.Tk) -> None:
+    seen: dict[str, object] = {}
+    _inspect_then_click(root, "OK", seen)
+
+    error_dialog.show_error(root, "Some Songs Could Not Be Deleted", LONG_MESSAGE)
+
+    assert isinstance(seen["height"], int) and isinstance(seen["room"], int)
+    assert seen["height"] <= seen["room"]
+    assert "Song number 200 " in str(seen["text"])
+
+
+@pytest.mark.real_dialogs
+def test_a_dialog_that_fits_keeps_its_plain_message(root: tk.Tk) -> None:
+    seen: dict[str, object] = {}
+    _inspect_then_click(root, "OK", seen)
+
+    dialogs.show_info(root, "Export Finished", "Your playlist was copied to the USB flash drive.")
+
+    assert not seen["scrolls"]
+    assert seen["text"] == ""
