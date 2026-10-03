@@ -35,6 +35,12 @@ def _same_file(a: str, b: str) -> bool:
     return str(Path(a).absolute()).casefold() == str(Path(b).absolute()).casefold()
 
 
+def _drive_connected(path: Path) -> bool:
+    """True when the drive (or network share) that ``path`` is on is connected right now."""
+    anchor = path.absolute().anchor
+    return not anchor or Path(anchor).exists()
+
+
 def last_good_path(playlists_file: Path) -> Path:
     """Where the copy of the playlists file that last loaded correctly is kept."""
     return playlists_file.with_name(playlists_file.name + LAST_GOOD_SUFFIX)
@@ -270,20 +276,26 @@ class PlaylistController:
         """Point playlist entries whose file is gone at a same-named file in library_folder.
 
         Returns the number of entries relinked (e.g. after the library folder was moved or changed).
+        A song on a drive that is not connected now (a USB drive, a network folder) is left alone: it
+        is only missing until the drive is back, and a song with the same name elsewhere ("01 Track
+        1.wma") is usually a different song. Relinking it would be saved, and could not be undone.
         """
-        if not library_folder or not os.path.isdir(library_folder):
+        library = Path(library_folder)
+        if not library_folder or not library.is_dir():
             return 0
         try:
-            by_name = {f.lower(): f for f in os.listdir(library_folder)}
+            by_name = {entry.name.casefold(): entry.name for entry in library.iterdir()}
         except OSError:
             return 0
         relinked = 0
         for tracks in self.playlists.values():
-            for idx, path in enumerate(tracks):
-                if not path or os.path.exists(path):
+            for idx, track in enumerate(tracks):
+                song = Path(track)
+                if not track or song.exists() or not _drive_connected(song):
                     continue
-                match = by_name.get(os.path.basename(path).lower())
+                match = by_name.get(song.name.casefold())
                 if match:
+                    # Spelled like the Library rows (``_library_row_path``), which are compared as text.
                     tracks[idx] = os.path.join(library_folder, match)
                     relinked += 1
         return relinked

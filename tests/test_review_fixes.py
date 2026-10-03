@@ -316,3 +316,30 @@ def test_creating_a_playlist_stops_the_playlist_that_was_playing(studio: Any, tm
     with patch.object(studio.playback_ctrl, "play_track") as play:
         studio._song_finished()  # what the monitor does when the old song runs out
     play.assert_not_called()
+
+
+# --- Relinking playlist songs ---------------------------------------------------------------------------
+
+
+def _unused_drive_letter() -> str:
+    for letter in "ZYXWVUTSRQPONMLKJIHGFED":
+        if not Path(f"{letter}:\\").exists():
+            return letter
+    pytest.skip("every drive letter is in use")
+
+
+def test_songs_on_an_unplugged_drive_are_not_relinked_to_namesakes(tmp_path: Path) -> None:
+    from app.controllers.playlist_controller import PlaylistController
+
+    library = tmp_path / "Music"
+    library.mkdir()
+    (library / "01 Track 1.wma").write_bytes(b"other song")
+    on_usb = f"{_unused_drive_letter()}:\\My Music\\01 Track 1.wma"
+    moved = str(tmp_path / "old folder" / "01 Track 1.wma")  # this drive is here: the folder was moved
+    controller = PlaylistController(None)
+    controller.playlists = {"Car": [on_usb], "Kitchen": [moved]}
+
+    assert controller.relink_missing(str(library)) == 1
+
+    assert controller.playlists["Car"] == [on_usb]
+    assert controller.playlists["Kitchen"] == [str(library / "01 Track 1.wma")]
