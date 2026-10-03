@@ -126,6 +126,9 @@ class ExportMixin(AppBase):
 
         added = [label for label in options if label not in old_labels]
         removed = old_labels - set(options)
+        if (added or removed) and announce != "quiet":
+            # Songs on that drive are there again (or gone): the lists re-check their "[Missing]" marks.
+            self._warm_library_metadata()
         if announce == "quiet" or self._busy:
             return  # never cover up the progress of a download or an export
         if added and announce == "changes":
@@ -137,6 +140,13 @@ class ExportMixin(AppBase):
                 self.set_status(f"Found {len(options)} USB flash drive(s).")
             else:
                 self.set_status("No USB flash drives found. Plug in a USB drive and click 🔄.")
+
+    def on_export_target_changed(self) -> None:
+        """USB or CD was chosen: the drive list and Eject are shown only for USB, where they apply."""
+        if self.export_var.get() == "USB":
+            self.f_usb.pack(fill=tk.X, pady=2, before=self.chk_even_volume)
+        else:
+            self.f_usb.pack_forget()
 
     def eject_selected_usb(self) -> None:
         """Eject the drive chosen in the list (the Eject button)."""

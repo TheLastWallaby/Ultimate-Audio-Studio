@@ -248,7 +248,9 @@ class UpdateDialog(tk.Toplevel):
         self._is_downloading = True
         self.btn_action.config(state=tk.DISABLED, text="Downloading...")
         self.btn_cancel.config(text="Cancel")
-        self.lbl_status.config(text="Connecting to the download server...")
+        # When the app is already fetching this version in the background, that download is waited
+        # for instead of starting a second one, so the bar may stay empty until it is done.
+        self.lbl_status.config(text="Downloading the new version... This can take a few minutes.")
         threading.Thread(target=self._download_worker, daemon=True).start()
 
     def _download_worker(self) -> None:

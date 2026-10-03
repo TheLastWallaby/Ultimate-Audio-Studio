@@ -37,6 +37,9 @@ class ClipEditorMixin(AppBase):
 
     # True while 'Restore Original Song' is copying the original back on a worker.
     _restoring_original = False
+    # The song whose file Save Clip or Restore Original is about to replace; it must not be played
+    # meanwhile (see ``_being_replaced``).
+    _replacing_song: str | None = None
 
     def on_gain_change(self, val: str | float) -> None:
         v = float(val)
@@ -207,6 +210,8 @@ class ClipEditorMixin(AppBase):
         if s_time >= e_time:
             dialogs.show_warning(self.root, "Invalid Range", "Clip End must be after Clip Start.")
             return
+        if self._being_replaced(self.selected_file_path):
+            return
         self.stop_audio()
 
         soften = bool(self.soften_clip.get()) if hasattr(self, "soften_clip") else False
@@ -362,6 +367,7 @@ class ClipEditorMixin(AppBase):
         fade_sec = self._get_fade_sec()
 
         self._saving_clip = True
+        self._replacing_song = source if is_self_overwrite else None
         self.btn_save_clip.config(text="Saving...", state=tk.DISABLED)
         self.set_busy(True, "Trimming and saving your clip...")
 
@@ -388,6 +394,7 @@ class ClipEditorMixin(AppBase):
     def _save_success(self, name: str, full_path: str, was_self_overwrite: bool, note: str = "") -> None:
         """Show the saved clip in the Library and confirm it (``note`` says when it was given another name)."""
         self._saving_clip = False
+        self._replacing_song = None
         self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
         self.set_busy(False)
         cache_mgr.invalidate(full_path)
@@ -407,7 +414,9 @@ class ClipEditorMixin(AppBase):
             self.notify_success(f"Clip saved! It is marked in green in your Library on the left.{note}", icon="💾")
 
     def _save_error(self, err: str) -> None:
+        """Say why the clip could not be saved; the song it was cut from is as it was."""
         self._saving_clip = False
+        self._replacing_song = None
         self.btn_save_clip.config(text="💾 Save Clip", state=tk.NORMAL)
         self.set_busy(False, "Could not save clip.")
         show_friendly_error(self.root, err, "save_clip")
@@ -446,6 +455,7 @@ class ClipEditorMixin(AppBase):
         self.stop_audio(user=True)
         self._release_audio_file()
         self._restoring_original = True
+        self._replacing_song = path
         self.btn_restore_original.config(state=tk.DISABLED)
         self.set_busy(True, f"Restoring the original '{name}'...")
 
@@ -465,6 +475,7 @@ class ClipEditorMixin(AppBase):
     def _restore_finished(self, path: str, err: OSError | None, restored: bool = True) -> None:
         """Show the restored song, or say why it could not be restored."""
         self._restoring_original = False
+        self._replacing_song = None
         self.btn_restore_original.config(state=tk.NORMAL)
         self.set_busy(False)
         if err is not None:

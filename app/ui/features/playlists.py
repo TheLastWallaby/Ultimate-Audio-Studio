@@ -12,6 +12,7 @@ import pygame
 
 from app.config import PLAYLISTS_PATH, log_error, sanitize_filename
 from app.controllers.playlist_controller import PlaylistLoadResult
+from app.core.audio_engine import NoAudioDeviceError
 from app.ui import dialogs
 from app.ui.components import listbox_nearest, listbox_selection
 from app.ui.error_dialog import show_friendly_error
@@ -370,41 +371,57 @@ class PlaylistMixin(AppBase):
             self._load_pending_selection()
 
     def _play_current_pl_track(self, skipped: int = 0) -> None:
-        """Play the playlist song at ``playlist_index``; ``skipped`` counts missing songs passed on the way."""
+        """Play the playlist song at ``playlist_index``.
+
+        ``skipped`` counts the songs passed on the way because they are missing or cannot be played.
+        """
         self._pl_skip_timer = None
         if not self.playlist_files or not (0 <= self.playlist_index < len(self.playlist_files)):
             return
         path = self.playlist_files[self.playlist_index]
         if not Path(path).exists():
-            self._skip_missing_pl_track(path, skipped + 1)
+            self._skip_pl_track(path, skipped + 1)
             return
         self.stop_audio()
         if not self._load_track_ui(path):
             return
         index = self.playlist_index
 
+        def _unplayable() -> None:
+            if self.selected_file_path == path:
+                self._skip_pl_track(path, skipped + 1, unplayable=True)
+
         def _start() -> None:
             if self.selected_file_path != path:
                 return
             try:
                 self.playback_ctrl.play_track(path, 0.0, is_playlist=True)
-            except (pygame.error, OSError) as err:
-                logger.error("Could not play the playlist song %s: %s", Path(path).name, err)
+            except NoAudioDeviceError as err:
+                # Nothing can be heard at all: skipping would only run through every song in silence.
+                logger.error("No sound output for the playlist song %s: %s", Path(path).name, err)
                 show_friendly_error(self.root, err, "playback")
+                return
+            except (pygame.error, OSError) as err:
+                # One damaged song must not end a playlist that is playing unattended.
+                logger.error("Could not play the playlist song %s: %s", Path(path).name, err)
+                _unplayable()
                 return
             self._set_card_playing_state("playing")
             self.refresh_playlist_listbox()
             self.set_status(f"Playlist ({index + 1}/{len(self.playlist_files)}): {Path(path).name}", icon="▶")
 
-        self._when_playable(path, _start)
+        self._when_playable(path, _start, on_failed=_unplayable)
 
-    def _skip_missing_pl_track(self, path: str, skipped: int) -> None:
-        """Move past a playlist song whose file is gone; stop once every song has been tried.
+    def _skip_pl_track(self, path: str, skipped: int, unplayable: bool = False) -> None:
+        """Move past a playlist song that is gone or (``unplayable``) cannot be played.
 
-        With Repeat on, a playlist whose songs are all missing (a USB drive that was unplugged) used to
-        be skipped through forever, and Stop could not end it.
+        Stops once every song has been tried: with Repeat on, a playlist whose songs are all missing
+        (a USB drive that was unplugged) used to be skipped through forever, and Stop could not end it.
         """
         total = len(self.playlist_files)
+        if unplayable:
+            self._skip_unplayable_pl_track(path, skipped)
+            return
         self.set_status(f"Skipping missing song: {Path(path).name}", icon="⚠️")
         next_index = self.playlist_index + 1
         if next_index >= total and self.repeat_playlist.get():
@@ -431,6 +448,28 @@ class PlaylistMixin(AppBase):
             "Song Not Found",
             f"The song '{Path(path).name}' could not be found, so the playlist stopped.\n\n"
             f"{plug_in}\n\nOtherwise, remove it from the playlist (it is marked ⚠️).",
+        )
+
+    def _skip_unplayable_pl_track(self, path: str, skipped: int) -> None:
+        """Move past a playlist song that would not play; say so when it was the last one to try."""
+        total = len(self.playlist_files)
+        name = Path(path).name
+        next_index = self.playlist_index + 1
+        if next_index >= total and self.repeat_playlist.get():
+            next_index = 0
+        if next_index < total and skipped < total:
+            self.set_status(f"Skipping a song that could not be played: {name}", icon="⚠️")
+            self.playlist_index = next_index
+            self._pl_skip_timer = self.root.after(MISSING_SONG_SKIP_MS, self._play_current_pl_track, skipped)
+            return
+        self.stop_audio(user=True)
+        self.set_status(f"'{name}' could not be played. The playlist stopped.", icon="⚠️")
+        dialogs.show_warning(
+            self.root,
+            "Song Could Not Be Played",
+            f"The song '{name}' could not be played, so the playlist stopped.\n\n"
+            "The file may be damaged or in an unusual format.\n\n"
+            "• Remove it from the playlist, or download the song again.",
         )
 
     def _cancel_pending_skip(self) -> None:

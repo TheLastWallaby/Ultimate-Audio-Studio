@@ -228,6 +228,10 @@ def clip_audio_worker(
     wav = target.suffix.lower() == ".wav"
     tmp_ext = ".wav" if wav else ".mp3"
     tmp_save = save_dir / f".clip_tmp_{os.getpid()}_{int(time.time() * 1000)}{tmp_ext}"
+    # A backup made by this save is taken away again when the save fails: the song is then still the
+    # original, and a leftover backup would offer 'Restore Original Song' for a song that was never trimmed.
+    made_backup: Path | None = None
+    replaced = False
 
     try:
         dur = max(0.01, e_time - s_time)
@@ -253,7 +257,9 @@ def clip_audio_worker(
         if is_self_overwrite:
             time.sleep(0.05)
             # The original is the one thing that cannot be made again: no complete backup, no replace.
-            _ensure_original_backup(target)
+            had_backup = has_original_backup(str(target))
+            backup = _ensure_original_backup(target)
+            made_backup = None if had_backup else backup
         else:
             discard_orphan_backup(target)
 
@@ -261,12 +267,16 @@ def clip_audio_worker(
         fsync_file(tmp_save)
         # Resilient file replace against Windows file indexing / antivirus locks
         _replace_with_retry(str(tmp_save), str(target))
+        replaced = True
 
         if on_success:
             on_success(target.name, str(save_name), is_self_overwrite)
     except Exception as e:  # last-resort guard: a worker must always report back to the window
         with contextlib.suppress(OSError):
             tmp_save.unlink()
+        if made_backup is not None and not replaced:
+            with contextlib.suppress(OSError):
+                made_backup.unlink()
         logger.error("clip_audio_worker: %s", e)
         if on_error:
             on_error(str(e))

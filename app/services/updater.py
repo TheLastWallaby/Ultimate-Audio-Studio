@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -276,6 +277,11 @@ def download_release_asset(
 
 # --- Staged ("pending") updates -------------------------------------------------------------------
 
+# One download at a time: the background download at start-up and "Download and install now" in the
+# update window write the same file, and the one that fails or is cancelled deletes it.
+_stage_lock = threading.Lock()
+_STAGE_LOCK_POLL_SEC = 0.25
+
 
 @dataclass(slots=True, frozen=True)
 class PendingUpdate:
@@ -301,8 +307,23 @@ def stage_update(
 ) -> tuple[PendingUpdate | None, str]:
     """Download a release into the staging folder and record it as pending (worker thread only).
 
-    Returns ``(pending, "")`` or ``(None, reason)``. An already-staged copy of the same release is reused.
+    Returns ``(pending, "")`` or ``(None, reason)``. An already-staged copy of the same release is
+    reused; a second call made while the release is still downloading waits for that download and
+    then reuses it (``cancel_event`` ends the wait).
     """
+    while not _stage_lock.acquire(timeout=_STAGE_LOCK_POLL_SEC):
+        if cancel_event is not None and cancel_event.is_set():
+            return None, "Download cancelled"
+    try:
+        return _stage_update_locked(release_info, progress_callback, cancel_event)
+    finally:
+        _stage_lock.release()
+
+
+def _stage_update_locked(
+    release_info: ReleaseInfo, progress_callback: ProgressCallback | None, cancel_event: Any
+) -> tuple[PendingUpdate | None, str]:
+    """``stage_update`` once no other download is running."""
     existing = load_pending_update()
     if existing is not None and existing.tag == release_info.tag_name:
         return existing, ""
