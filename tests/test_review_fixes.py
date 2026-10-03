@@ -227,3 +227,38 @@ def test_songs_finished_by_a_playlist_download_do_not_take_the_selection(studio:
 
     callbacks["on_batch_complete"](["new song.mp3"], 1)
     assert [studio.visible_files[i] for i in studio.listbox_lib.curselection()] == ["chosen.mp3"]
+
+
+# --- Stop a download, then search at once ---------------------------------------------------------------
+
+
+class _Queued:
+    """Stand-in for task_mgr that keeps submitted work until the test runs it."""
+
+    def __init__(self) -> None:
+        self.jobs: list[Callable[[], object]] = []
+
+    def submit_task(self, fn: Callable[..., object], *args: object, **kwargs: object) -> None:
+        self.jobs.append(lambda: fn(*args, **kwargs))
+
+
+def test_a_search_right_after_stopping_a_download_does_not_leave_the_app_downloading() -> None:
+    from yt_dlp.utils import DownloadCancelled
+
+    from app.controllers.download_controller import DownloadController
+
+    controller = DownloadController(None)
+    tasks = _Queued()
+    with (
+        patch("app.controllers.download_controller.task_mgr", tasks),
+        patch("app.controllers.download_controller.cleanup_partial_downloads"),
+        patch("app.services.downloader.yt_dlp.YoutubeDL") as ydl,
+        patch("app.controllers.download_controller.search_youtube_worker"),
+    ):
+        ydl.return_value.__enter__.return_value.extract_info.side_effect = DownloadCancelled("Stopped by user")
+        controller.start_download("https://youtu.be/abc", "lib", *[lambda *_a: None] * 4)
+        controller.cancel()  # Stop, while the download is still winding down
+        controller.start_search("Moon River", 6, lambda _r: None, lambda _e: None)
+        tasks.jobs[0]()  # the stopped download finishes winding down only now
+
+    assert controller.is_downloading is False

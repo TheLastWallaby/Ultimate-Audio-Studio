@@ -47,7 +47,12 @@ class DownloadController:
         self._download_cancel.set()
 
     def reset_cancel(self) -> threading.Event:
-        """Start a new job: give it a fresh cancel event (earlier jobs keep their own, possibly set, event)."""
+        """Start a new job: give it a fresh cancel event (earlier jobs keep their own, possibly set, event).
+
+        A replaced job can no longer report back, so it cannot clear ``is_downloading`` either: left
+        set, the app would warn "still downloading" at every close and keep the PC awake for good.
+        """
+        self.is_downloading = False
         self._download_cancel = threading.Event()
         return self._download_cancel
 
@@ -121,8 +126,8 @@ class DownloadController:
         on_error: Callable[[str], None],
     ) -> None:
         """Execute audio download in background thread."""
-        self.is_downloading = True
         job = self.reset_cancel()
+        self.is_downloading = True
 
         def _worker_success(fname: str) -> None:
             self.is_downloading = False
@@ -169,8 +174,8 @@ class DownloadController:
         true (an update restart is refused) before the first track starts. Pass ``probed`` (from
         :meth:`probe_playlist`) to skip scanning again.
         """
-        self.is_downloading = True
         job = self.reset_cancel()
+        self.is_downloading = True
 
         def _cancelled() -> None:
             self.is_downloading = False
