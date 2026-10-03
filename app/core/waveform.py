@@ -8,6 +8,7 @@ import operator
 import os
 import subprocess
 import threading
+import wave
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -82,6 +83,42 @@ def _analysis_from_samples(samples: Sequence[int], n_bars: int, rate: int, chann
         peaks=_samples_to_peaks(samples, n_bars),
         loudness_db=measure_loudness_db(samples, int(rate * channels * _BLOCK_SECONDS)),
     )
+
+
+def _analysis_from_wav_file(audio_path: str, n_bars: int, cancel_event: threading.Event | None) -> AudioAnalysis | None:
+    """Analyse an uncompressed WAV file with the standard library: no FFmpeg, no audio device.
+
+    Uses the first channel, as 16-bit samples, at about ANALYSIS_RATE_HZ, read a second at a time so
+    a long recording never sits in memory. Returns None for anything ``wave`` cannot read (other
+    formats, compressed or floating-point WAV) or when cancelled.
+    """
+    samples = array.array("h")
+    try:
+        with wave.open(audio_path, "rb") as wf:
+            channels, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+            if channels < 1 or width < 1 or rate < 1:
+                return None
+            step = max(1, rate // ANALYSIS_RATE_HZ)
+            stride = channels * width * step
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    return None
+                block = wf.readframes(rate)
+                if not block:
+                    break
+                for offset in range(0, len(block) - width + 1, stride):
+                    if width == 1:  # 8-bit WAV is unsigned
+                        samples.append((block[offset] - 128) << 8)
+                    else:  # little-endian signed; the top two bytes give the 16-bit value
+                        samples.append(
+                            int.from_bytes(block[offset + width - 2 : offset + width], "little", signed=True)
+                        )
+    except (OSError, EOFError, wave.Error) as err:
+        log_error(f"analyze_audio (wav reader): {err}")
+        return None
+    if not samples:
+        return None
+    return _analysis_from_samples(samples, n_bars, rate // step)
 
 
 def analyze_audio(
@@ -160,7 +197,14 @@ def analyze_audio(
         if not (cancel_event and cancel_event.is_set()):
             log_error(f"analyze_audio (ffmpeg pipe): {e}")
 
-    # 2. In-process Pygame Sound extraction (zero external dependencies, memory safe)
+    # 2. A WAV file can be read directly; this needs no FFmpeg and no audio device (the pygame
+    #    step below fails on a PC without sound output, such as a build server).
+    if audio_path.lower().endswith((".wav", ".wave")):
+        from_wav = _analysis_from_wav_file(audio_path, n_bars, cancel_event)
+        if from_wav is not None and from_wav.peaks:
+            return from_wav
+
+    # 3. In-process Pygame Sound extraction (zero external dependencies, memory safe)
     try:
         if os.path.exists(audio_path) and os.path.getsize(audio_path) < 20 * 1024 * 1024:
             import pygame
@@ -180,9 +224,8 @@ def analyze_audio(
     except Exception as e:
         log_error(f"analyze_audio (pygame fallback): {e}")
 
-    # 3. Resilient temp WAV extraction via ffmpeg + standard library wave
+    # 4. Resilient temp WAV extraction via ffmpeg + standard library wave
     import tempfile
-    import wave
 
     tmp_wav = None
     try:
@@ -234,8 +277,8 @@ def analyze_audio(
             except Exception:
                 pass
 
-    # A pydub step used to follow here. It ran the same FFmpeg decode that just failed, without a
-    # time limit, so it could only hang; a song FFmpeg cannot read simply has no waveform.
+    # A pydub step used to follow here. It needed FFmpeg for everything except WAV, which step 2
+    # now reads directly, and it ran without a time limit; a song nothing can read has no waveform.
     return empty
 
 

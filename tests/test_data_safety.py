@@ -9,7 +9,7 @@ import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.config import DEFAULT_PLAYLIST_NAME, YT_CACHE_DIR, SettingsManager
 from app.controllers.library_controller import ImportResult, LibraryController
@@ -658,6 +658,22 @@ def test_settings_file_locked_for_a_moment_is_read(tmp_path: Path) -> None:
     assert not mgr.read_failed
 
 
+def _warnings_titled(warn: MagicMock, title: str) -> list[str]:
+    """Messages of the warnings shown with ``title``.
+
+    Other warnings are ignored: on a PC without FFmpeg (the GitHub runners) the window also shows
+    its "Missing Helper File" notice at start-up.
+    """
+    return [str(call.args[2]) for call in warn.call_args_list if call.args[1] == title]
+
+
+def _pump_until(window: UltimateAudioStudio, done: Callable[[], bool], timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not done() and time.monotonic() < deadline:
+        window.root.update()
+        time.sleep(0.01)
+
+
 def _open_window(mgr: SettingsManager, tmp_path: Path) -> UltimateAudioStudio:
     root = tk.Tk()
     root.withdraw()
@@ -673,20 +689,19 @@ def test_window_reports_damaged_settings_once(tmp_path: Path) -> None:
     settings_file.write_bytes(b"\x00\x00\x00")
     mgr = SettingsManager(settings_path=settings_file)
 
+    title = "Settings Could Not Be Opened"
     with patch("app.main.settings_mgr", mgr), patch("app.ui.dialogs.show_warning") as warn:
         window = _open_window(mgr, tmp_path)
         try:
-            deadline = time.monotonic() + 5
-            while not warn.called and time.monotonic() < deadline:
-                window.root.update()
-                time.sleep(0.01)
+            _pump_until(window, lambda: bool(_warnings_titled(warn, title)))
             window._report_settings_problem()  # a second report has nothing new to say
         finally:
             window.on_close()
 
-    warn.assert_called_once()
-    assert "Change..." in warn.call_args[0][2]
-    assert _damaged_kept(tmp_path)[0].name in warn.call_args[0][2]
+    messages = _warnings_titled(warn, title)
+    assert len(messages) == 1
+    assert "Change..." in messages[0]
+    assert _damaged_kept(tmp_path)[0].name in messages[0]
     assert [p.read_bytes() for p in _damaged_kept(tmp_path)] == [b"\x00\x00\x00"]
 
 
@@ -718,13 +733,11 @@ def test_offline_library_folder_stays_chosen(tmp_path: Path) -> None:
     settings_file.write_text(json.dumps({"library_folder": str(usb_music)}), encoding="utf-8")
     mgr = SettingsManager(settings_path=settings_file)
 
+    title = "Music Folder Not Found"
     with patch("app.main.settings_mgr", mgr), patch("app.ui.dialogs.show_warning") as warn:
         window = _open_window(mgr, tmp_path)
         try:
-            deadline = time.monotonic() + 5
-            while not warn.called and time.monotonic() < deadline:
-                window.root.update()
-                time.sleep(0.01)
+            _pump_until(window, lambda: bool(_warnings_titled(warn, title)))
             shown_folder = window.library_folder
             window._save_settings()  # e.g. after the window was moved
         finally:
@@ -732,10 +745,10 @@ def test_offline_library_folder_stays_chosen(tmp_path: Path) -> None:
 
     assert shown_folder == window.default_lib_path  # the default folder is used meanwhile
     assert _saved_library_folder(settings_file) == str(usb_music)  # ...but the choice is kept
-    warn.assert_called_once()
-    assert warn.call_args[0][1] == "Music Folder Not Found"
-    assert str(usb_music) in warn.call_args[0][2]
-    assert "Change..." in warn.call_args[0][2]
+    messages = _warnings_titled(warn, title)
+    assert len(messages) == 1
+    assert str(usb_music) in messages[0]
+    assert "Change..." in messages[0]
 
 
 def test_choosing_a_folder_replaces_the_offline_one(tmp_path: Path) -> None:
@@ -766,13 +779,10 @@ def test_available_library_folder_is_used_without_a_warning(tmp_path: Path) -> N
     with patch("app.main.settings_mgr", mgr), patch("app.ui.dialogs.show_warning") as warn:
         window = _open_window(mgr, tmp_path)
         try:
-            deadline = time.monotonic() + 1.2  # past the 800 ms the warning would wait
-            while time.monotonic() < deadline:
-                window.root.update()
-                time.sleep(0.01)
+            _pump_until(window, lambda: False, timeout=1.2)  # past the 800 ms the warning would wait
             shown_folder = window.library_folder
         finally:
             window.on_close()
 
     assert shown_folder == str(music)
-    warn.assert_not_called()
+    assert _warnings_titled(warn, "Music Folder Not Found") == []

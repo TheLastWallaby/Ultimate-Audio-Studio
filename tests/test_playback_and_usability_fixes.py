@@ -1075,3 +1075,63 @@ def test_preview_status_mentions_effects_only_when_they_are_heard(
     status = studio.status.cget("text")
     assert expected in status
     assert absent not in status
+
+
+# --- Waveforms on a PC without FFmpeg or sound output (like the GitHub runners) -----------------------
+
+
+@contextlib.contextmanager
+def _no_ffmpeg_and_no_sound_device() -> Iterator[None]:
+    import pygame
+
+    with (
+        patch("app.core.waveform.ffmpeg_path", "nonexistent_ffmpeg_binary.exe"),
+        patch("pygame.mixer.get_init", return_value=None),
+        patch("pygame.mixer.init", side_effect=pygame.error("No available audio device")),
+    ):
+        yield
+
+
+def _tone_wav(path: Path, channels: int, width: int, rate: int = 44100, seconds: float = 1.0) -> Path:
+    """A 440 Hz tone at about half of full scale, in every channel."""
+    import math
+    import wave
+
+    frames = bytearray()
+    full_scale = 2 ** (8 * width - 1) - 1
+    for i in range(int(rate * seconds)):
+        value = int(0.5 * full_scale * math.sin(2 * math.pi * 440 * i / rate))
+        sample = (value + 128).to_bytes(1, "little") if width == 1 else value.to_bytes(width, "little", signed=True)
+        frames.extend(sample * channels)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(width)
+        wf.setframerate(rate)
+        wf.writeframes(bytes(frames))
+    return path
+
+
+@pytest.mark.parametrize(("channels", "width"), [(1, 2), (2, 2), (2, 3), (1, 1)])
+def test_wav_waveform_needs_neither_ffmpeg_nor_a_sound_device(tmp_path: Path, channels: int, width: int) -> None:
+    from app.core.waveform import analyze_audio
+
+    song = _tone_wav(tmp_path / "tone.wav", channels, width)
+
+    with _no_ffmpeg_and_no_sound_device():
+        result = analyze_audio(str(song), n_bars=20)
+
+    assert len(result.peaks) == 20
+    assert min(result.peaks) > 0.5  # a steady tone: every bar is loud
+    assert result.loudness_db is not None and -12.0 < result.loudness_db < -6.0  # half scale, about -9 dBFS
+
+
+def test_unreadable_wav_gives_no_waveform_without_an_error(tmp_path: Path) -> None:
+    from app.core.waveform import analyze_audio
+
+    song = tmp_path / "broken.wav"
+    song.write_bytes(b"RIFF\x00\x00\x00\x00not really a wave file")
+
+    with _no_ffmpeg_and_no_sound_device():
+        result = analyze_audio(str(song), n_bars=20)
+
+    assert result.peaks == []
