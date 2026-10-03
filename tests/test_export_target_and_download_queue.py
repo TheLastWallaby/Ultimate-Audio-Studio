@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import io
 import os
 import time
 import tkinter as tk
+import urllib.request
 from collections.abc import Callable, Iterator
+from http.client import HTTPMessage
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from app.controllers.library_controller import LibraryController
+from app.controllers.playback_controller import PlaybackController
+from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
+from app.core.errors import ErrorContext, friendly_error
 from app.main import UltimateAudioStudio
-from app.services import clipper
+from app.services import clipper, exporter
+from app.services.exporter import ExportReport
+from app.services.updater import _GitHubAssetRedirectHandler
 from app.ui import dialogs, error_dialog
 from app.ui.theme import init_fonts
 
@@ -242,3 +250,24 @@ def test_a_dialog_that_fits_keeps_its_plain_message(root: tk.Tk) -> None:
 
     assert not seen["scrolls"]
     assert seen["text"] == ""
+
+
+# --- 4. A song with a very long name keeps its extension on the USB drive ---------------------------
+
+
+def test_usb_export_keeps_the_extension_of_a_song_with_a_very_long_name(tmp_path: Path) -> None:
+    name = "Beethoven - Symphony No 9 in D minor Op 125 Choral - IV Presto Allegro assai - " + "x" * 50 + ".mp3"
+    song = tmp_path / "lib" / name
+    song.parent.mkdir()
+    song.write_bytes(b"ID3" + bytes(64))
+    drive_folder = tmp_path / "usb" / "Car"
+    reports: list[ExportReport] = []
+
+    exporter.usb_export_worker(str(drive_folder), "Car", [str(song)], normalize=False, on_success=reports.append)
+
+    tracks = [p.name for p in drive_folder.iterdir() if not p.name.startswith("00_")]
+    assert reports[0].exported == 1
+    assert len(tracks) == 1 and tracks[0].startswith("01 - Beethoven") and tracks[0].endswith(".mp3")
+    # The next export of this playlist finds it, so "Replace the old songs" can remove it.
+    assert str(drive_folder / tracks[0]) in exporter.find_previous_export(str(drive_folder))
+    assert tracks[0] in (drive_folder / "00_Car.m3u8").read_text(encoding="utf-8")

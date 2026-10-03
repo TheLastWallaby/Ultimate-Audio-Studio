@@ -341,8 +341,10 @@ def usb_export_worker(
                 skipped.append((source.name if source else f"Track {idx}") + " (file not found)")
                 continue
 
-            clean_base = sanitize_filename(source.name)
             clean_stem = sanitize_filename(source.stem)
+            # The extension is put back after the name is shortened: cut off with a long name, the
+            # song was on the drive under a name no player (and no later export) takes for a song.
+            clean_base = f"{clean_stem}{source.suffix}"
             is_mp3 = source.suffix.lower() == ".mp3"
             track_normalize = normalize
 
