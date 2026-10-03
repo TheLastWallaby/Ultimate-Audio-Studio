@@ -35,13 +35,15 @@ if TYPE_CHECKING:
     from app.ui.components import ScrollableFrame
     from app.ui.waveform_view import WaveformView
 
-__all__ = ["UNDO_SECONDS", "AppBase", "ControllerState", "UiCallback"]
+__all__ = ["NEW_SONG_ROW_BG", "UNDO_SECONDS", "AppBase", "ControllerState", "UiCallback"]
 
 T = TypeVar("T")
 UiCallback = Callable[..., object]
 # How long Undo stays in the status bar. Long enough to read the message, find the button and click
 # it without hurry; the deleted song waits in the undo area meanwhile.
 UNDO_SECONDS = 30.0
+# Background of a Library row that was just added, or pointed out, without being selected.
+NEW_SONG_ROW_BG = "#dcfce7"
 
 
 class ControllerState(Generic[T]):
@@ -147,6 +149,7 @@ class AppBase:
         _exporting: bool
         _saving_clip: bool
         _importing: bool
+        _restoring_original: bool
         _is_shutting_down: bool
         _is_checking_updates_manual: bool
         _available_update: ReleaseInfo | None
@@ -194,6 +197,7 @@ class AppBase:
         prog_download: ttk.Progressbar
         lbl_dl_metrics: tk.Label
         listbox_lib: tk.Listbox
+        lbl_lib_empty: tk.Label
         f_track_card: tk.Frame
         canvas_cover: tk.Canvas
         canvas_vu: tk.Canvas
@@ -255,7 +259,9 @@ class AppBase:
         def _load_album_art(self, filepath: str) -> None: ...
         def _draw_vu_meter(self, level: int = 0) -> None: ...
         def _load_track_ui(self, path: str, title: str | None = None) -> bool: ...
-        def _reveal_new_song(self, filename: str) -> bool: ...
+        def _reveal_new_song(self, filename: str, keep_trim_work: bool = False) -> bool: ...
+        def _has_trim_work(self) -> bool: ...
+        def clear_search(self) -> None: ...
         def _load_pending_selection(self) -> bool: ...
         def _check_for_updates_on_launch(self) -> None: ...
         def _open_update_dialog(self) -> None: ...

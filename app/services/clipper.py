@@ -14,6 +14,7 @@ from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
 from app.core.file_utils import copy_file_atomic, fsync_file
 from app.core.file_utils import replace_with_retry as _replace_with_retry
 from app.core.process_utils import ffmpeg_timed_out
+from app.platform_utils import has_recycle_bin
 from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, mp3_audio_only_args, mp3_output_args
 
 try:
@@ -26,6 +27,8 @@ __all__ = [
     "ORIGINAL_BACKUP_SUFFIX",
     "clip_audio_worker",
     "create_audition_slice",
+    "discard_orphan_backup",
+    "find_orphan_backups",
     "has_original_backup",
     "original_backup_path",
     "restore_original",
@@ -46,6 +49,41 @@ def original_backup_path(song_path: str) -> str:
 def has_original_backup(song_path: str | None) -> bool:
     """True when a clip replaced this song and its original can still be restored."""
     return bool(song_path) and os.path.isfile(original_backup_path(str(song_path)))
+
+
+def discard_orphan_backup(song: str | Path) -> bool:
+    """Set aside a backup that is left under ``song``'s name although that song is gone; True when one was.
+
+    Call this before a new song takes the name. The backup belongs to a song that was deleted
+    outside the app. Left in place it would pass for the new song's original: 'Restore Original
+    Song' would put the old recording over the new song, and a clip saved over the new song would
+    find "a backup" and keep none of the new song. The backup goes to the Recycle Bin; on a drive
+    without one it is only renamed, so nothing is deleted for good. Raises OSError when it could
+    not be moved out of the way.
+    """
+    song = Path(song)
+    backup = Path(original_backup_path(str(song)))
+    if song.exists() or not backup.is_file():
+        return False
+    if _send2trash is not None and has_recycle_bin(backup):
+        try:
+            _send2trash(str(backup))
+            return True
+        except OSError as err:
+            logger.warning("Could not recycle the leftover backup %s: %s", backup.name, err)
+    kept = backup.with_name(f"{backup.name}.orphaned-{time.strftime('%Y%m%d-%H%M%S')}")
+    _replace_with_retry(backup, kept)
+    return True
+
+
+def find_orphan_backups(folder: Path) -> list[Path]:
+    """The songs in ``folder`` that are gone while their trim backup is still there."""
+    try:
+        names = [entry.name for entry in folder.iterdir() if entry.name.endswith(ORIGINAL_BACKUP_SUFFIX)]
+    except OSError:
+        return []
+    songs = [folder / name[: -len(ORIGINAL_BACKUP_SUFFIX)] for name in sorted(names)]
+    return [song for song in songs if not song.exists()]
 
 
 def _ensure_original_backup(song: Path) -> Path:
@@ -216,6 +254,8 @@ def clip_audio_worker(
             time.sleep(0.05)
             # The original is the one thing that cannot be made again: no complete backup, no replace.
             _ensure_original_backup(target)
+        else:
+            discard_orphan_backup(target)
 
         # On disk before the swap: a power cut must not leave an empty song where the clip should be.
         fsync_file(tmp_save)

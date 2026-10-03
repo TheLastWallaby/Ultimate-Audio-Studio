@@ -35,6 +35,9 @@ def _free_clip_path(wanted: Path) -> Path:
 class ClipEditorMixin(AppBase):
     """Step 2 clipping: start/end markers, nudges, gain, fades, Test Clip and Save Clip."""
 
+    # True while 'Restore Original Song' is copying the original back on a worker.
+    _restoring_original = False
+
     def on_gain_change(self, val: str | float) -> None:
         v = float(val)
         sign = "+" if v > 0 else ""
@@ -74,6 +77,14 @@ class ClipEditorMixin(AppBase):
         self._update_clip_length_label()
         self._render_waveform()
         self.set_status(f"Clip end set to {format_time(new_val, include_fractional=is_frac)}.")
+
+    def _has_trim_work(self) -> bool:
+        """True when the loaded song has clip marks or a Volume Boost that loading another song would lose."""
+        if not self.selected_file_path:
+            return False
+        start_moved = self.clip_start_sec > 0.05
+        end_moved = self.track_duration > 0 and self.clip_end_sec < self.track_duration - 0.05
+        return start_moved or end_moved or abs(float(self.scale_gain.get())) > 0.05
 
     def _update_clip_length_label(self) -> None:
         dur = max(0.0, self.clip_end_sec - self.clip_start_sec)
@@ -414,7 +425,7 @@ class ClipEditorMixin(AppBase):
     def restore_original_song(self) -> None:
         """Put the untrimmed song back (the trimmed version goes to the Recycle Bin)."""
         path = self.selected_file_path
-        if not path or not has_original_backup(path):
+        if self._restoring_original or not path or not has_original_backup(path):
             self._update_restore_original_button()
             return
         name = Path(path).name
@@ -434,15 +445,40 @@ class ClipEditorMixin(AppBase):
             return
         self.stop_audio(user=True)
         self._release_audio_file()
-        try:
-            restore_original(path)
-        except OSError as err:
-            logger.error("Could not restore the original of %s: %s", name, err)
+        self._restoring_original = True
+        self.btn_restore_original.config(state=tk.DISABLED)
+        self.set_busy(True, f"Restoring the original '{name}'...")
+
+        def _worker() -> None:
+            # The whole song is copied and written through to the disk: not for the window's thread.
+            try:
+                restore_original(path)
+            except OSError as err:
+                logger.error("Could not restore the original of %s: %s", name, err)
+                self._safe_after(0, self._restore_finished, path, err)
+                return
+            self._safe_after(0, self._restore_finished, path, None)
+
+        if task_mgr.submit_task(_worker) is None:  # the app is closing: nothing was changed
+            self._restore_finished(path, None, restored=False)
+
+    def _restore_finished(self, path: str, err: OSError | None, restored: bool = True) -> None:
+        """Show the restored song, or say why it could not be restored."""
+        self._restoring_original = False
+        self.btn_restore_original.config(state=tk.NORMAL)
+        self.set_busy(False)
+        if err is not None:
+            self.set_status("The original song could not be restored.", icon="⚠️")
             show_friendly_error(self.root, err, "generic")
             return
+        if not restored:
+            return
+        name = Path(path).name
         cache_mgr.invalidate(path)
         self.library_ctrl.invalidate_search_index(path)
         self._art_cache.pop(path, None)
-        self.refresh_library(select_name=name)
-        self._load_track_ui(path, name)
+        still_loaded = self.selected_file_path == path
+        self.refresh_library(select_name=name if still_loaded else None, preserve_view=not still_loaded)
+        if still_loaded:
+            self._load_track_ui(path, name)
         self.notify_success(f"The original '{name}' is back in your Library.", icon="↩️")

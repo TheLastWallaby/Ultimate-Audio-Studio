@@ -18,7 +18,7 @@ from typing import Any
 from app.config import AUDIO_EXTS, log_error
 from app.core.file_utils import copy_file_atomic, replace_with_retry, unused_path
 from app.core.task_manager import task_mgr
-from app.services.clipper import original_backup_path
+from app.services.clipper import discard_orphan_backup, find_orphan_backups, original_backup_path
 
 try:
     from send2trash import send2trash as _send2trash
@@ -131,6 +131,17 @@ def _trash_staged_file(staging_path: str, orig_path: str | None) -> None:
         os.rmdir(os.path.dirname(staging_path))
 
 
+# One staged delete: (original path, staging path, file name, [(playlist name, [positions])]).
+PendingDelete = tuple[str, str, str, list[tuple[str, list[int]]]]
+
+
+def _trash_pending(pending: Sequence[PendingDelete]) -> None:
+    """Send staged deletes (and the trim backups staged with them) to the Recycle Bin."""
+    for orig_path, staging_path, _name, _playlists in pending:
+        _trash_staged_file(original_backup_path(staging_path), original_backup_path(orig_path))
+        _trash_staged_file(staging_path, orig_path)
+
+
 def _replace_song(src: Path, dest: Path) -> None:
     """Put ``src`` in place of the Library song ``dest``; the old song goes to the Recycle Bin.
 
@@ -173,8 +184,7 @@ class LibraryController:
 
     def __init__(self, app: object) -> None:
         self.app = app
-        # Each entry: (orig_path, staging_path, filename, [(playlist_name, [indices])])
-        self._pending_deletes: list[tuple[str, str, str, list[tuple[str, list[int]]]]] = []
+        self._pending_deletes: list[PendingDelete] = []
         self._search_index: dict[str, str] = {}
 
     def scan_files(self, folder: str) -> list[str]:
@@ -280,26 +290,30 @@ class LibraryController:
         return matches
 
     def rename_file(self, old_path: str, new_name: str, playlists: dict[str, list[str]]) -> str:
-        """Rename file on disk and update all playlists referencing it."""
-        folder = os.path.dirname(old_path)
-        new_path = os.path.join(folder, new_name)
-        if os.path.exists(new_path) and new_path.lower() != old_path.lower():
+        """Rename a song on disk and in every playlist; returns its new path. Raises OSError."""
+        old = Path(old_path)
+        # Same folder spelling as before (these paths are compared as text); only the name changes.
+        new_path = old_path[: len(old_path) - len(old.name)] + new_name
+        new = Path(new_path)
+        old_key = _path_key(old)
+        if new.exists() and _path_key(new) != old_key:
             raise FileExistsError(f"A file named '{new_name}' already exists.")
 
-        os.replace(old_path, new_path)
+        discard_orphan_backup(new)
+        os.replace(old, new)
         # A trimmed song's untrimmed backup follows the song, so "Restore Original Song" keeps working.
-        old_backup = original_backup_path(old_path)
-        if os.path.isfile(old_backup):
+        old_backup = Path(original_backup_path(old_path))
+        if old_backup.is_file():
             try:
                 os.replace(old_backup, original_backup_path(new_path))
-            except OSError as e:
-                log_error(f"rename backup {old_backup}: {e}")
+            except OSError as err:
+                # The song itself is renamed; only 'Restore Original Song' is lost for it.
+                logger.warning("The trim backup %s could not follow its song: %s", old_backup.name, err)
         self.invalidate_search_index(old_path)
         self.invalidate_search_index(new_path)
-        # Update references in playlists
-        for _pl_name, tracks in playlists.items():
-            for idx, t in enumerate(tracks):
-                if os.path.abspath(t).lower() == os.path.abspath(old_path).lower():
+        for tracks in playlists.values():
+            for idx, track in enumerate(tracks):
+                if _path_key(Path(track)) == old_key:
                     tracks[idx] = new_path
         return new_path
 
@@ -316,7 +330,7 @@ class LibraryController:
         Returns the staged file names and ``(file name, error)`` for files that could not be moved
         (for example because another program has them open); those stay in the Library untouched.
         """
-        self.flush_pending_trash()
+        self.flush_pending_trash(background=True)
         staged: list[str] = []
         failed: list[tuple[str, OSError]] = []
         for filepath in filepaths:
@@ -392,6 +406,7 @@ class LibraryController:
                         # Same folder spelling as before; only the file name changes.
                         target = orig_path[: len(orig_path) - len(Path(orig_path).name)] + free.name
                         renamed.append(free.name)
+                    discard_orphan_backup(target)
                     replace_with_retry(staged, target)
                     staged_backup = Path(original_backup_path(staging_path))
                     if staged_backup.exists():
@@ -414,24 +429,37 @@ class LibraryController:
         self._pending_deletes = list(reversed(still_staged))
         return UndoResult(tuple(restored), tuple(renamed))
 
-    def flush_pending_trash(self) -> None:
-        """Commit pending staged deletes to the Windows Recycle Bin."""
+    def flush_pending_trash(self, background: bool = False) -> None:
+        """Commit pending staged deletes to the Windows Recycle Bin.
+
+        ``background`` does the moving on a worker, for calls from the window's thread: the Recycle
+        Bin can take seconds for a big file or a slow drive. Without it (closing, restarting) the
+        files are in the Recycle Bin when this returns.
+        """
         pending, self._pending_deletes = self._pending_deletes, []
-        for orig_path, staging_path, _fname, _aff in pending:
-            _trash_staged_file(original_backup_path(staging_path), original_backup_path(orig_path))
-            _trash_staged_file(staging_path, orig_path)
+        if not pending:
+            return
+        if background and task_mgr.submit_task(_trash_pending, pending) is not None:
+            return
+        _trash_pending(pending)
 
     @staticmethod
     def recover_stranded_deletes(folder: str | Path | None) -> int:
         """Tidy the Library folder after a crash or forced exit; returns the number of files handled.
 
-        Files left in the undo area go to the Recycle Bin (legacy '<name>.undo' files too), and the
-        app's own unfinished temporary files are removed (``remove_stale_work_files``).
+        Files left in the undo area go to the Recycle Bin (legacy '<name>.undo' files too), the
+        app's own unfinished temporary files are removed (``remove_stale_work_files``), and trim
+        backups whose song is gone are set aside (``discard_orphan_backup``).
         """
         if not folder:
             return 0
         library = Path(folder)
         handled = remove_stale_work_files(library)
+        for song in find_orphan_backups(library):
+            try:
+                handled += discard_orphan_backup(song)
+            except OSError as err:
+                logger.warning("Could not set the leftover backup of %s aside: %s", song.name, err)
         undo_root = library / UNDO_DIR_NAME
         if not undo_root.is_dir():
             return handled
@@ -473,6 +501,7 @@ class LibraryController:
                     if replacing:
                         _replace_song(src_path, dest_path)
                     else:
+                        discard_orphan_backup(dest_path)
                         copy_file_atomic(src_path, dest_path)
                 except OSError as err:
                     logger.error("Import of %s failed: %s", src_path, err)

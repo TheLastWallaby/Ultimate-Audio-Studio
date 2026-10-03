@@ -240,6 +240,16 @@ class AudioEngine:
         pygame.mixer.music.play(start=start_sec)
         self.start_clock(start_sec)
 
+    def play_preview(self, filepath: str) -> None:
+        """Play a short preview file from its start; raises NoAudioDeviceError when nothing can be heard.
+
+        The song clock is left alone: a paused song must still know where it was paused when the
+        preview has ended. The caller keeps its own time for the preview.
+        """
+        self.ensure_mixer()
+        pygame.mixer.music.load(filepath)
+        pygame.mixer.music.play()
+
     def pause(self) -> None:
         """Pause playback."""
         self.pause_clock()

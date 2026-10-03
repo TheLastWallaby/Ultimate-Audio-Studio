@@ -6,6 +6,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from collections.abc import Callable
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import pygame
 
 from app.config import format_time, log_error
+from app.core.task_manager import task_mgr
 from app.models import SearchResult
 from app.services.downloader import fetch_preview_worker
 from app.ui.components import create_button
@@ -80,6 +82,8 @@ class SearchChoiceDialog:
         # True while the shared mixer holds a preview started by this dialog (see _stop_preview).
         self._owns_mixer = False
         self._preview_active_url: str | None = None
+        # When the playing preview started (time.monotonic()); the song clock is not used for it.
+        self._preview_started = 0.0
         self._preview_poll_job: str | None = None
         self._preview_duration = 30.0
         self._closed = False
@@ -385,20 +389,20 @@ class SearchChoiceDialog:
             pass
 
     def _start_preview(self, item: SearchResult) -> None:
+        """Fetch the 30-second preview of ``item`` on a worker and play it when it arrives."""
         url = item.get("url")
         if not url:
             return
 
         if self.on_preview_play:
-            try:
-                self.on_preview_play()
-            except Exception:
-                pass
+            self.on_preview_play()
 
         self._stop_preview(reset_status=False)
         self._is_loading_preview = True
         self._preview_active_url = url
-        self._preview_cancel_event.clear()
+        # A new event for each preview: clearing the old one would let a preview that was stopped
+        # carry on downloading.
+        cancel_event = self._preview_cancel_event = threading.Event()
         self._preview_request_id += 1
         req_id = self._preview_request_id
 
@@ -415,11 +419,7 @@ class SearchChoiceDialog:
         def _on_err(err: str) -> None:
             self._safe_dispatch(self._on_preview_failed, req_id, err)
 
-        threading.Thread(
-            target=fetch_preview_worker,
-            args=(url, int(self._preview_duration), self._preview_cancel_event, _on_succ, _on_err),
-            daemon=True,
-        ).start()
+        task_mgr.submit_task(fetch_preview_worker, url, int(self._preview_duration), cancel_event, _on_succ, _on_err)
 
     def _style_play_button(
         self, text: str, bg: str, hover_bg: str, state: Literal["normal", "active", "disabled"] = "normal"
@@ -447,7 +447,7 @@ class SearchChoiceDialog:
         self._owns_mixer = True
         try:
             if self.audio_engine:
-                self.audio_engine.load_and_play(filepath, start_sec=0.0)
+                self.audio_engine.play_preview(filepath)
             else:
                 if not pygame.mixer.get_init():
                     pygame.mixer.init()
@@ -458,6 +458,7 @@ class SearchChoiceDialog:
             self._on_preview_failed(req_id, str(err))
             return
 
+        self._preview_started = time.monotonic()
         self._start_timeline_poll()
 
     def _on_preview_failed(self, req_id: int, err: str) -> None:
@@ -489,16 +490,11 @@ class SearchChoiceDialog:
         if self._closed or not self._is_previewing:
             return
 
-        elapsed = 0.0
-        is_busy = False
+        elapsed = time.monotonic() - self._preview_started
         try:
-            if self.audio_engine:
-                elapsed = self.audio_engine.current_play_seconds()
-                is_busy = self.audio_engine.is_busy()
-            else:
-                is_busy = pygame.mixer.music.get_busy()
-        except Exception:
-            pass
+            is_busy = self.audio_engine.is_busy() if self.audio_engine else bool(pygame.mixer.music.get_busy())
+        except pygame.error:
+            is_busy = False
 
         if not is_busy or elapsed >= self._preview_duration:
             self._stop_preview(reset_status=False)
@@ -531,7 +527,8 @@ class SearchChoiceDialog:
         owns_mixer, self._owns_mixer = self._owns_mixer, False
         if owns_mixer:
             if self.audio_engine:
-                self.audio_engine.stop()
+                # Not stop(): that belongs to the song player and resets its clock.
+                self.audio_engine.release_audio_file()
             elif pygame.mixer.get_init():
                 with contextlib.suppress(pygame.error):
                     pygame.mixer.music.stop()
