@@ -451,3 +451,43 @@ def test_restore_original_puts_the_original_back_and_recycles_the_trim(tmp_path:
     trash.assert_called_once_with(str(song))
     assert song.read_bytes() == b"original"
     assert [p.name for p in tmp_path.iterdir()] == ["song.mp3"]
+
+
+# --- Undo after a delete --------------------------------------------------------------------------------
+
+
+def test_undo_does_not_overwrite_a_newer_song_with_the_same_name(tmp_path: Path) -> None:
+    from app.controllers.library_controller import LibraryController
+
+    song = tmp_path / "Song.mp3"
+    song.write_bytes(b"old song")
+    playlists = {"Car": [str(song)]}
+    library = LibraryController(None)
+    library.stage_delete_many([str(song)], playlists)
+    song.write_bytes(b"new download")  # the same title was downloaded before Undo was pressed
+
+    result = library.undo_delete(playlists)
+
+    assert song.read_bytes() == b"new download"
+    assert (tmp_path / "Song (2).mp3").read_bytes() == b"old song"
+    assert result.restored == ("Song (2).mp3",) and result.renamed == ("Song (2).mp3",)
+    assert [Path(p).name for p in playlists["Car"]] == ["Song (2).mp3"]
+
+
+def test_a_song_undo_could_not_put_back_stays_staged_for_another_try(tmp_path: Path) -> None:
+    from app.controllers import library_controller
+    from app.controllers.library_controller import LibraryController
+
+    song = tmp_path / "Song.mp3"
+    song.write_bytes(b"song")
+    playlists: dict[str, list[str]] = {"Car": [str(song)]}
+    library = LibraryController(None)
+    library.stage_delete_many([str(song)], playlists)
+
+    with patch.object(library_controller, "replace_with_retry", side_effect=PermissionError(13, "in use")):
+        assert not library.undo_delete(playlists)
+    assert playlists["Car"] == []
+
+    assert library.undo_delete(playlists)  # the file is free again
+    assert song.read_bytes() == b"song"
+    assert playlists["Car"] == [str(song)]
