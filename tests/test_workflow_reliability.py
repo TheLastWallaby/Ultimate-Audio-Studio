@@ -8,8 +8,10 @@ import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+from app import platform_utils
 from app.config import ERROR_LOG_PATH, MUSIC_DIR, PLAYLISTS_PATH, SETTINGS_PATH
 from app.controllers.library_controller import ImportResult, LibraryController
 from app.core import audio_engine
@@ -706,3 +708,29 @@ def test_conversion_timeout_grows_with_the_song() -> None:
     assert _timeout(0) == 600  # length unknown
     assert _timeout(30) == 75
     assert _timeout(2 * 3600) == 1800
+
+
+# --- Listing USB drives -------------------------------------------------------------------------------
+
+
+def test_empty_card_reader_slot_is_not_listed() -> None:
+    kernel32 = MagicMock()
+    kernel32.GetLogicalDrives.return_value = (1 << 4) | (1 << 5)  # E: and F:
+    kernel32.GetDriveTypeW.return_value = 2  # both removable
+
+    def _volume(root: str, label_buf: Any, _n: int, _a: None, _b: None, _c: None, fs_buf: Any, _m: int) -> int:
+        if root != "F:\\":
+            return 0  # E: is a card-reader slot with no card in it
+        label_buf.value = "MUSIC"
+        fs_buf.value = "exFAT"
+        return 1
+
+    kernel32.GetVolumeInformationW.side_effect = _volume
+    with patch("app.platform_utils.ctypes.windll", SimpleNamespace(kernel32=kernel32)):
+        drives = platform_utils.list_removable_drives()
+
+    assert [(d.root, d.display_label, d.fs_type) for d in drives] == [
+        ("F:\\", "USB Drive: MUSIC (F:\\) [exFAT]", "exFAT")
+    ]
+    # Windows' "There is no disk in the drive" box is held back while checking, then allowed again.
+    assert kernel32.SetThreadErrorMode.call_count == 2
