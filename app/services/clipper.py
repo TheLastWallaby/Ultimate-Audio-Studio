@@ -65,18 +65,33 @@ def _ensure_original_backup(song: Path) -> Path:
     return backup
 
 
-def restore_original(song_path: str) -> None:
+def restore_original(song_path: str | Path) -> None:
     """Put the untrimmed original back in place of the trimmed song.
 
     The trimmed version goes to the Recycle Bin (under its own name, so it can be recovered).
+    A complete copy of the original is made ready first, so a backup that cannot be read (held by
+    an antivirus scan, a failing drive) is found out while the trimmed song is still in the Library.
     Raises OSError when the backup is missing or a file is locked.
     """
-    backup = original_backup_path(song_path)
-    if not os.path.isfile(backup):
-        raise FileNotFoundError(f"No original backup found for {os.path.basename(song_path)}")
-    if os.path.exists(song_path) and _send2trash is not None:
-        _send2trash(song_path)
-    _replace_with_retry(backup, song_path)
+    song = Path(song_path)
+    backup = Path(original_backup_path(str(song)))
+    if not backup.is_file():
+        raise FileNotFoundError(f"No original backup found for {song.name}")
+    # Not an audio file name, so the Library list never shows it.
+    ready = song.with_name(f"{song.name}.{os.getpid()}.restoring")
+    try:
+        copy_file_atomic(backup, ready)
+        if song.exists() and _send2trash is not None:
+            _send2trash(str(song))
+        _replace_with_retry(ready, song)
+    finally:
+        with contextlib.suppress(OSError):  # gone after a successful swap; the backup still holds the original
+            ready.unlink()
+    try:
+        backup.unlink()
+    except OSError as err:
+        # The song is restored; a leftover backup only keeps the 'Restore Original Song' button showing.
+        logger.warning("Could not remove the used backup %s: %s", backup.name, err)
 
 
 def create_audition_slice(

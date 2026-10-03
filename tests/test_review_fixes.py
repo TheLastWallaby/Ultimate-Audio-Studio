@@ -414,3 +414,40 @@ def test_a_clip_is_on_the_disk_before_it_replaces_the_song(tmp_path: Path) -> No
 
     assert events == ["fsync .mp3", "replace"]
     assert done == ["ok"]
+
+
+# --- Restore Original never loses the song --------------------------------------------------------------
+
+
+def test_restore_original_leaves_the_trimmed_song_when_the_backup_cannot_be_read(tmp_path: Path) -> None:
+    from app.services import clipper
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"trimmed")
+    backup = Path(clipper.original_backup_path(str(song)))
+    backup.write_bytes(b"original")
+    with (
+        patch.object(clipper, "copy_file_atomic", side_effect=PermissionError(13, "locked by a virus scan")),
+        patch.object(clipper, "_send2trash") as trash,
+        pytest.raises(OSError),
+    ):
+        clipper.restore_original(str(song))
+
+    trash.assert_not_called()
+    assert song.read_bytes() == b"trimmed"
+    assert backup.read_bytes() == b"original"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["song.mp3", "song.mp3.original.bak"]
+
+
+def test_restore_original_puts_the_original_back_and_recycles_the_trim(tmp_path: Path) -> None:
+    from app.services import clipper
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"trimmed")
+    Path(clipper.original_backup_path(str(song))).write_bytes(b"original")
+    with patch.object(clipper, "_send2trash", side_effect=lambda p: Path(p).unlink()) as trash:
+        clipper.restore_original(song)
+
+    trash.assert_called_once_with(str(song))
+    assert song.read_bytes() == b"original"
+    assert [p.name for p in tmp_path.iterdir()] == ["song.mp3"]
