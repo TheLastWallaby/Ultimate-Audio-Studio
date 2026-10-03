@@ -214,7 +214,7 @@ class LibraryMixin(AppBase):
             self.stop_audio()
             return self._load_track_ui(path, filename)
         self._fresh_songs.add(filename)
-        self.refresh_library()
+        self.refresh_library(preserve_view=True)
         if filename in self.visible_files:
             self.listbox_lib.see(self.visible_files.index(filename))
         return False
@@ -398,7 +398,7 @@ class LibraryMixin(AppBase):
             cache_mgr.invalidate(path)
             self.library_ctrl.invalidate_search_index(path)
             self._art_cache.pop(path, None)
-        self.refresh_library()
+        self.refresh_library(preserve_view=True)
         reloaded = next(
             (n for n in result.replaced if _same_song(self._library_row_path(n), self.selected_file_path)), None
         )
@@ -572,7 +572,9 @@ class LibraryMixin(AppBase):
         self._resync_playlist_index()
         self.save_playlists()
         self.refresh_playlist_listbox()
-        self.refresh_library()
+        # The list stays where it was scrolled to: deleting several songs one by one from the middle
+        # of a long Library must not mean scrolling back down after each.
+        self.refresh_library(preserve_view=True)
         if staged:
             what = f"'{staged[0]}'" if len(staged) == 1 else f"{len(staged)} songs"
             them = "it" if len(staged) == 1 else "them"
@@ -599,7 +601,7 @@ class LibraryMixin(AppBase):
         self._resync_playlist_index()
         self.save_playlists()
         self.refresh_playlist_listbox()
-        self.refresh_library()
+        self.refresh_library(preserve_view=True)
         message = "Restored deleted song(s)."
         if result.renamed:
             message += (
