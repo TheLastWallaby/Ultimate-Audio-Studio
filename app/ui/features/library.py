@@ -722,6 +722,11 @@ class LibraryMixin(AppBase):
         loaded when PLAY or STOP is pressed or the music ends (double-click plays it at once).
         """
         sel = listbox_selection(self.listbox_lib)
+        if len(sel) > 1:
+            # Several songs are being picked (Ctrl or Shift) to add to a playlist or to delete. The
+            # player keeps its song: loading the topmost one would throw away the clip marks.
+            self._cancel_selection_debounce()
+            return
         if not sel or sel[0] >= len(self.visible_files):
             return
         filename = self.visible_files[sel[0]]

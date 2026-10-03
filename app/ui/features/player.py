@@ -17,7 +17,7 @@ import pygame
 
 from app.config import COVER_CACHE_DIR, format_time, log_error
 from app.core.cache_manager import cache_mgr
-from app.core.metadata import extract_album_art, read_track_metadata
+from app.core.metadata import extract_album_art, probe_audio_duration, read_track_metadata
 from app.core.task_manager import task_mgr
 from app.core.waveform import analyze_audio
 from app.ui import dialogs
@@ -40,6 +40,11 @@ REPLAY_FROM_START_SEC = 0.5
 
 class PlayerMixin(AppBase):
     """Step 2 transport: track loading, waveform/art workers, play/pause/stop, seeking."""
+
+    # The song whose real length was measured after the clock ran past the length in its header
+    # (see ``_check_length_before_finishing``), and whether that measurement is running now.
+    _length_measured_for: str | None = None
+    _length_check_running = False
 
     def _release_audio_file(self) -> None:
         """Safely stops and unloads pygame mixer handles to prevent Windows file locking."""
@@ -86,6 +91,8 @@ class PlayerMixin(AppBase):
 
                 if peaks and any(val > 0.001 for val in peaks):
                     cache_mgr.set_peaks(filepath, peaks)
+                else:
+                    cache_mgr.set_no_waveform(filepath)
                 if loudness is not None:
                     cache_mgr.set_loudness(filepath, loudness)
                 if req_id == self._waveform_req_id and not getattr(self, "_is_shutting_down", False):
@@ -207,9 +214,12 @@ class PlayerMixin(AppBase):
         self._current_loudness = None
         if hasattr(self, "playback_ctrl"):
             self.playback_ctrl.update_auto_level(None)
-        self._waveform_loading = True
+        # A song that gave no waveform a moment ago gives none now: analysing it again at every
+        # click would run FFmpeg to its time limit each time.
+        self._waveform_loading = not cache_mgr.has_no_waveform(filepath)
         self._render_waveform(full_redraw=True)
-        self._waveform_queue.put((filepath, current_req, self._active_waveform_cancel))
+        if self._waveform_loading:
+            self._waveform_queue.put((filepath, current_req, self._active_waveform_cancel))
 
     def toggle_waveform_zoom(self) -> None:
         if hasattr(self, "waveform_view"):
@@ -355,6 +365,16 @@ class PlayerMixin(AppBase):
     def _load_track_ui(self, path: str, title: str | None = None) -> bool:
         """Put a song in the player (title, timeline, waveform, cover); False when its file is gone."""
         song = Path(path)
+        # Checked before anything changes: the player then still holds the song it shows, and PLAY
+        # does not go to a file that is not there.
+        if not song.exists():
+            dialogs.show_warning(
+                self.root,
+                "Song Not Found",
+                f"This song could not be found:\n{path}\n\n"
+                "It may have been moved, renamed or deleted, or it is on a drive that is not connected.",
+            )
+            return False
         is_another_song = self.selected_file_path is None or song.absolute() != Path(self.selected_file_path).absolute()
         self.selected_file_path = path
         base_name = title or song.name
@@ -374,16 +394,8 @@ class PlayerMixin(AppBase):
         if meta.get("artist"):
             artist_name = meta["artist"]
 
-        if not song.exists():
-            dialogs.show_warning(
-                self.root,
-                "Song Not Found",
-                f"This song could not be found:\n{path}\n\n"
-                "It may have been moved, renamed or deleted, or it is on a drive that is not connected.",
-            )
-            return False
-
         if is_another_song:
+            self._length_measured_for = None
             # Volume Boost belongs to the song it was set for: left on, the next Save Clip would
             # boost a different song without anyone having asked for it.
             self.reset_gain()
@@ -637,6 +649,48 @@ class PlayerMixin(AppBase):
             else:
                 self.set_status("Playback finished. Press PLAY to hear it again.")
 
+    def _check_length_before_finishing(self) -> None:
+        """The clock is past the song's known length while the mixer still plays: measure, then decide.
+
+        The length comes from the file's header, and for some MP3s (variable bit rate, no length
+        table) that is an estimate. An estimate that is too short used to cut the song off. The
+        real length is measured once per song, on a worker; a song that really is over ends on the
+        next tick after that.
+        """
+        path = self.selected_file_path
+        if path is None or self._length_measured_for == path:
+            self._song_finished()
+            return
+        if self._length_check_running:
+            return
+        self._length_check_running = True
+
+        def _worker() -> None:
+            self._safe_after(0, self._real_length_measured, path, probe_audio_duration(path))
+
+        if task_mgr.submit_task(_worker) is None:  # the app is closing
+            self._length_check_running = False
+
+    def _real_length_measured(self, path: str, seconds: float) -> None:
+        """Use the measured length when the song is longer than its header said."""
+        self._length_check_running = False
+        self._length_measured_for = path
+        if self.selected_file_path != path or seconds <= self.track_duration + END_OF_SONG_GRACE_SEC:
+            return
+        logger.info("%s is %.1f s long, not the %.1f s its header says", Path(path).name, seconds, self.track_duration)
+        clip_ended_with_song = self.clip_end_sec >= self.track_duration - 0.05
+        self.track_duration = seconds
+        cache_mgr.set_duration(path, seconds)
+        if clip_ended_with_song:
+            self.clip_end_sec = seconds
+        self._updating_ui = True
+        self.scale_progress.config(to=seconds)
+        self.lbl_prog_time.config(text=self._prog_label(self._current_play_seconds()))
+        self.lbl_end_time.config(text=f"End: {format_time(self.clip_end_sec)}")
+        self._updating_ui = False
+        self._update_clip_length_label()
+        self._render_waveform(full_redraw=True)
+
     def _clock_passed_end(self) -> bool:
         """True when the clock is well past the end of a song whose length is known (see END_OF_SONG_GRACE_SEC)."""
         if self.track_duration <= 0:
@@ -660,8 +714,10 @@ class PlayerMixin(AppBase):
             self._finish_clip_preview()
         elif time.monotonic() < self.play_guard_until:
             return  # just loaded or moved: the mixer does not report busy yet
-        elif not self.audio_engine.is_busy() or self._clock_passed_end():
+        elif not self.audio_engine.is_busy():
             self._song_finished()
+        elif self._clock_passed_end():
+            self._check_length_before_finishing()
 
     def monitor_audio(self) -> None:
         """Run the playback monitor every 40 ms for as long as the window is open."""

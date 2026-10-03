@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import tkinter as tk
+from collections.abc import Sequence
 from pathlib import Path
 
 import pygame
@@ -13,14 +15,48 @@ import pygame
 from app.config import PLAYLISTS_PATH, log_error, sanitize_filename
 from app.controllers.playlist_controller import PlaylistLoadResult
 from app.core.audio_engine import NoAudioDeviceError
+from app.core.task_manager import task_mgr
+from app.models import SongRow
 from app.ui import dialogs
 from app.ui.components import listbox_nearest, listbox_selection
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
+from app.ui.theme import COLOR_DANGER_TEXT, TEXT_MUTED
 
 logger = logging.getLogger(__name__)
+# What one audio CD holds; the line under the playlist measures a CD export against it.
+CD_SECONDS = 80 * 60
 # Pause before moving past a playlist song whose file is gone, so the status message can be read.
 MISSING_SONG_SKIP_MS = 350
+
+
+def _length_text(seconds: float) -> str:
+    """A playlist's length the way it is said: "52 min", "1 h 35 min" (part minutes count as one)."""
+    hours, minutes = divmod(math.ceil(seconds / 60), 60)
+    return f"{hours} h {minutes} min" if hours else f"{minutes} min"
+
+
+def playlist_length_text(rows: Sequence[SongRow], for_cd: bool) -> tuple[str, bool]:
+    """What the line under the playlist says, and whether the playlist is too long for one CD.
+
+    Songs whose length is not known (not read yet, or the file is missing) are not in the total, and
+    the line says how many there are.
+    """
+    if not rows:
+        return "", False
+    seconds = sum(row.seconds for row in rows if not row.missing)
+    unknown = sum(1 for row in rows if row.missing or row.seconds <= 0)
+    songs = "1 song" if len(rows) == 1 else f"{len(rows)} songs"
+    too_long = for_cd and seconds > CD_SECONDS
+    if too_long:
+        text = f"⚠️ {songs} · {_length_text(seconds)}: more than the {CD_SECONDS // 60} min one CD holds"
+    elif for_cd:
+        text = f"{songs} · {_length_text(seconds)} of the {CD_SECONDS // 60} min one CD holds"
+    else:
+        text = f"{songs} · {_length_text(seconds)}"
+    if unknown:
+        text += f" ({unknown} not counted: length not known)"
+    return text, too_long
 
 
 class PlaylistMixin(AppBase):
@@ -124,6 +160,18 @@ class PlaylistMixin(AppBase):
             prefix = "▶ " if (self.is_playing_playlist and idx - 1 == self.playlist_index) else f"{idx:02d}. "
             text = f"⚠️ [Missing] {Path(path).name}" if row.missing else row.text
             self.listbox_pl.insert(tk.END, f"{prefix}{text}")
+        self._show_playlist_length()
+
+    def _show_playlist_length(self) -> None:
+        """Show the playlist's number of songs and total length under the list (from memory, no disk access).
+
+        The 80 minutes of a CD are otherwise only mentioned when the export has been started.
+        """
+        if not hasattr(self, "lbl_pl_total"):
+            return
+        for_cd = hasattr(self, "export_var") and self.export_var.get() == "CD"
+        text, too_long = playlist_length_text(self._song_rows_for(self.playlist_files), for_cd)
+        self.lbl_pl_total.config(text=text, fg=COLOR_DANGER_TEXT if too_long else TEXT_MUTED)
 
     def on_playlist_selected(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         name = self.playlist_var.get()
@@ -409,8 +457,24 @@ class PlaylistMixin(AppBase):
             self._set_card_playing_state("playing")
             self.refresh_playlist_listbox()
             self.set_status(f"Playlist ({index + 1}/{len(self.playlist_files)}): {Path(path).name}", icon="▶")
+            self._prepare_next_pl_track()
 
         self._when_playable(path, _start, on_failed=_unplayable)
+
+    def _prepare_next_pl_track(self) -> None:
+        """Make the song after this one playable while this one plays (WMA, M4A and the like).
+
+        Such a song is converted before it can be played. Converted only when its turn came, every
+        one of them began with seconds of silence in a playlist that is meant to play through.
+        """
+        next_index = self.playlist_ctrl.get_next_index(
+            self.active_playlist_name, self.playlist_index, repeat=bool(self.repeat_playlist.get())
+        )
+        if next_index is None or next_index >= len(self.playlist_files):
+            return
+        upcoming = self.playlist_files[next_index]
+        if Path(upcoming).suffix.lower() not in self.audio_engine.NATIVE_EXTS:
+            task_mgr.submit_task(self.audio_engine.get_playable_audio_path, upcoming)
 
     def _skip_pl_track(self, path: str, skipped: int, unplayable: bool = False) -> None:
         """Move past a playlist song that is gone or (``unplayable``) cannot be played.

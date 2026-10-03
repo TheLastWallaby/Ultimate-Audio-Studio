@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import pygame
 
 from app.config import format_time, log_error
-from app.core.task_manager import task_mgr
+from app.core.task_manager import network_task_mgr as task_mgr
 from app.models import SearchResult
 from app.services.downloader import fetch_preview_worker
 from app.ui.components import create_button

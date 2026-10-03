@@ -44,6 +44,9 @@ class CacheManager:
         self._write_lock = threading.Lock()
         self._meta_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._peaks_cache: OrderedDict[str, list[float]] = OrderedDict()
+        # Songs whose waveform could not be made in this session. Not saved: the cause may be gone
+        # at the next start (a busy PC, a drive that was slow to answer).
+        self._no_waveform: set[str] = set()
         self._dirty = False
         self._last_save_time = 0.0
         self._save_timer: threading.Timer | None = None
@@ -201,6 +204,18 @@ class CacheManager:
             self._peaks_cache[key] = list(peaks)
         self._schedule_save()
 
+    def set_no_waveform(self, filepath: str) -> None:
+        """Remember, until the app closes or the file changes, that no waveform could be made of it."""
+        with self._lock:
+            key = self._make_key(filepath)
+            if key:
+                self._no_waveform.add(key)
+
+    def has_no_waveform(self, filepath: str) -> bool:
+        """True when making this file's waveform already failed in this session."""
+        with self._lock:
+            return self._make_key(filepath) in self._no_waveform
+
     def invalidate(self, filepath: str) -> None:
         """Remove any entries associated with filepath regardless of mtime."""
         if not filepath:
@@ -217,6 +232,7 @@ class CacheManager:
             for k in peaks_keys:
                 del self._peaks_cache[k]
                 removed = True
+            self._no_waveform = {k for k in self._no_waveform if not k.startswith(prefix)}
         if removed:
             self._schedule_save()
 
