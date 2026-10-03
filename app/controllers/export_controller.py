@@ -6,6 +6,7 @@ import os
 import shutil
 import threading
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from app.config import log_error, sanitize_filename
 from app.core.task_manager import task_mgr
@@ -13,6 +14,8 @@ from app.platform_utils import get_desktop_dir, safely_eject_usb_drive
 from app.services.exporter import ExportReport, cd_export_worker, find_previous_export, usb_export_worker
 
 DurationFn = Callable[[str], float]
+# Generous for the VBR V2 MP3s the export encodes (about 190 kbit/s on average, so about 24 000).
+_MP3_EXPORT_BYTES_PER_SEC = 30_000
 
 
 class ExportController:
@@ -55,15 +58,32 @@ class ExportController:
         """Check if filesystem type is NTFS."""
         return (fs_type or "").upper() == "NTFS"
 
-    def estimate_playlist_bytes(self, playlist_files: Sequence[str], duration_fn: DurationFn | None = None) -> int:
-        """Estimate total disk bytes needed for playlist export with 15MB safety overhead."""
-        est_bytes = 0
-        for f in playlist_files:
-            if os.path.exists(f):
-                est_bytes += max(os.path.getsize(f), int((duration_fn(f) if duration_fn else 0.0) * 40000))
+    def estimate_playlist_bytes(
+        self, playlist_files: Sequence[str], duration_fn: DurationFn | None = None, normalize: bool = False
+    ) -> int:
+        """Estimate the bytes a USB export needs on the drive, with 15 MB to spare.
+
+        A song that is copied counts with its size. One that is converted to MP3 (anything that is not
+        an MP3, and every song when the volume is evened out) counts by its length: a FLAC or WAV is
+        several times the size of the MP3 made from it, and counting the file refused exports that
+        would have fitted. Songs that are missing are skipped by the export and count for nothing.
+        """
+        total = 0
+        for name in playlist_files:
+            song = Path(name)
+            try:
+                size = song.stat().st_size
+            except OSError:
+                continue
+            seconds = duration_fn(name) if duration_fn else 0.0
+            encoded = int(seconds * _MP3_EXPORT_BYTES_PER_SEC)
+            if song.suffix.lower() != ".mp3":
+                total += encoded if seconds > 0 else size
+            elif normalize:
+                total += max(size, encoded)  # re-encoded, or copied as it is when already level
             else:
-                est_bytes += int((duration_fn(f) if duration_fn else 0.0) * 40000)
-        return max(est_bytes + 15 * 1024 * 1024, 20 * 1024 * 1024)
+                total += size
+        return max(total + 15 * 1024 * 1024, 20 * 1024 * 1024)
 
     def check_usb_space(self, dest_folder: str, required_bytes: int, freed_bytes: int = 0) -> tuple[bool, int]:
         """Check if destination has room, counting ``freed_bytes`` that will be deleted first."""

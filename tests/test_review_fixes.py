@@ -738,3 +738,31 @@ def test_an_open_window_looks_for_updates_again_later_until_one_is_found(studio:
         studio._check_for_updates_on_launch()
     check.assert_called_once()
     assert studio._timer_update_check is None
+
+
+# --- Room needed on the USB drive -----------------------------------------------------------------------
+
+
+def test_songs_that_are_converted_count_by_their_length_not_their_file_size(tmp_path: Path) -> None:
+    from app.controllers.export_controller import ExportController
+
+    mb = 1024 * 1024
+    flac = tmp_path / "album track.flac"
+    flac.write_bytes(bytes(40 * mb))  # four minutes of FLAC
+    mp3 = tmp_path / "song.mp3"
+    mp3.write_bytes(bytes(5 * mb))
+    exports = ExportController(None)
+
+    def four_minutes(_path: str) -> float:
+        return 240.0
+
+    needed = exports.estimate_playlist_bytes([str(flac), str(mp3), str(tmp_path / "gone.mp3")], four_minutes)
+
+    as_mp3 = 240 * 30_000
+    assert needed == as_mp3 + 5 * mb + 15 * mb  # not the 40 MB of the FLAC, and nothing for the missing song
+    # A length that is not known yet falls back to the file's size, the safe side.
+    assert exports.estimate_playlist_bytes([str(flac)], lambda _p: 0.0) == 40 * mb + 15 * mb
+    # With "even volume" every MP3 may be re-encoded, which can make a low-bitrate one larger.
+    small = tmp_path / "talk.mp3"
+    small.write_bytes(bytes(1 * mb))
+    assert exports.estimate_playlist_bytes([str(small)], four_minutes, normalize=True) == as_mp3 + 15 * mb
