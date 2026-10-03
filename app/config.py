@@ -247,19 +247,21 @@ def save_update_token(token: str) -> bool:
     return settings_mgr.save_token(token)
 
 
-def cleanup_old_executables() -> None:
-    """Clean up leftover .old executable from previous in-place auto-update on startup."""
+def cleanup_old_executables() -> bool:
+    """Delete the previous version's executable that an update left next to the app; True when none is left.
+
+    Right after an update the previous version is still running from that file (it waits to see
+    the new one start), and Windows will not delete it until that process has ended: False then.
+    """
     if not getattr(sys, "frozen", False):
-        return
+        return True
+    old_exe = Path(sys.executable + ".old")
     try:
-        old_exe = sys.executable + ".old"
-        if os.path.exists(old_exe):
-            try:
-                os.remove(old_exe)
-            except Exception:
-                pass
-    except Exception:
-        pass
+        old_exe.unlink(missing_ok=True)
+    except OSError as err:
+        logger.debug("The previous version %s is still in use: %s", old_exe.name, err)
+        return False
+    return True
 
 
 def cleanup_temp_caches() -> None:
