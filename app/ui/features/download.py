@@ -187,7 +187,7 @@ class DownloadMixin(AppBase):
             self._safe_after(0, _ui)
 
         def _on_fin(_idx: int, _tot: int, fname: str) -> None:
-            self._safe_after(0, self.refresh_library, fname)
+            self._safe_after(0, self._show_downloaded_track, fname)
 
         def _on_failed(_idx: int, _tot: int, track_title: str, err: str) -> None:
             failures.append((track_title, err))
@@ -208,6 +208,15 @@ class DownloadMixin(AppBase):
             probed=probed,
         )
 
+    def _show_downloaded_track(self, filename: str) -> None:
+        """Add one finished playlist song to the Library list, tinted green, leaving the user's view alone.
+
+        Selecting it would take the selection away from a song the user had clicked, so Add to
+        Playlist or Delete could act on the new song instead.
+        """
+        self._fresh_songs.add(filename)
+        self.refresh_library(preserve_view=True)
+
     def _playlist_download_success(
         self, downloaded_files: list[str], total: int, failures: list[tuple[str, str]] | None = None
     ) -> None:
@@ -215,10 +224,12 @@ class DownloadMixin(AppBase):
         self.entry_url.delete(0, tk.END)
         self._reset_download_ui()
         self.set_busy(False)
-        self.refresh_library()
+        self.refresh_library(preserve_view=True)
         count = len(downloaded_files)
         if not failures:
-            self.notify_success(f"Playlist download complete: all {count} songs are now in your Library.")
+            self.notify_success(
+                f"Playlist download complete: all {count} songs are now in your Library, marked in green."
+            )
             return
         self.set_status(f"Playlist download finished: {count} of {total} songs saved to Library.", icon="⚠️")
         self._look_for_update_after_failure([err for _title, err in failures])

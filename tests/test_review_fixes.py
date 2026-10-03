@@ -15,6 +15,7 @@ import pytest
 from app.core.audio_engine import AudioEngine, NoAudioDeviceError
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
+from app.ui.features.library import NEW_SONG_ROW_BG
 
 
 def _pump(window: Any, until: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -200,3 +201,29 @@ def test_deleting_on_a_normal_disk_still_mentions_the_recycle_bin(studio: Any, t
     assert "moved safely to your Windows Recycle Bin" in ask.call_args[0][2]
     assert studio.status.cget("text") == "Moved 'song.mp3' to Recycle Bin."
     studio.hide_undo(flush=False)
+
+
+# --- A playlist download leaves the Library selection alone ---------------------------------------------
+
+
+def test_songs_finished_by_a_playlist_download_do_not_take_the_selection(studio: Any, tmp_path: Path) -> None:
+    lib = tmp_path / "lib"
+    _library(studio, lib, "chosen.mp3", "other.mp3")
+    _select_row(studio, "chosen.mp3")
+    with patch.object(studio.download_ctrl, "start_playlist") as start:
+        studio._start_playlist_download("https://www.youtube.com/playlist?list=PL1")
+    callbacks = start.call_args.kwargs
+    (lib / "new song.mp3").write_bytes(b"ID3" + bytes(64))
+
+    callbacks["on_track_finished"](1, 2, "new song.mp3")
+
+    selected = [studio.visible_files[i] for i in studio.listbox_lib.curselection()]
+    assert selected == ["chosen.mp3"]
+    row = studio.visible_files.index("new song.mp3")
+    assert studio.listbox_lib.itemcget(row, "background") == NEW_SONG_ROW_BG
+
+    studio.add_to_playlist()
+    assert [Path(p).name for p in studio.playlist_files] == ["chosen.mp3"]
+
+    callbacks["on_batch_complete"](["new song.mp3"], 1)
+    assert [studio.visible_files[i] for i in studio.listbox_lib.curselection()] == ["chosen.mp3"]
