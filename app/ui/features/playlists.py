@@ -232,6 +232,7 @@ class PlaylistMixin(AppBase):
         self.set_status(f"Renamed playlist to: {name}")
 
     def delete_playlist(self) -> None:
+        """Delete the playlist that is showing (after a question), with Undo in the status bar."""
         current = self.active_playlist_name
         if len(self.playlists) <= 1:
             dialogs.show_warning(self.root, "Cannot Delete", "You must keep at least one playlist.")
@@ -257,7 +258,24 @@ class PlaylistMixin(AppBase):
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
         self._schedule_settings_save()
-        self.set_status(f"Deleted playlist '{current}'.")
+        self.show_undo(
+            f"Deleted playlist '{current}'. Press Undo to bring it back.", callback=self._undo_delete_playlist
+        )
+
+    def _undo_delete_playlist(self) -> None:
+        """Undo button after a playlist was deleted: bring it back and show it."""
+        if self.is_playing_playlist:
+            # The restored playlist becomes the one that is showing: the music of another playlist
+            # would otherwise go on under its name, and Next would play one of its songs.
+            self.stop_audio(user=True)
+        restored = self.playlist_ctrl.undo_delete_playlist()
+        if restored is None:
+            return
+        self.save_playlists()
+        self.refresh_playlist_dropdown()
+        self.refresh_playlist_listbox()
+        self._schedule_settings_save()
+        self.set_status(f"The playlist '{restored}' is back.", icon="↩️")
 
     def add_to_playlist(self) -> None:
         sel = listbox_selection(self.listbox_lib) if hasattr(self, "listbox_lib") else ()

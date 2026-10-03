@@ -214,6 +214,8 @@ class ExportMixin(AppBase):
             dialogs.show_warning(self.root, "Empty Playlist", "Add some songs to this playlist before exporting.")
             return
         files = list(self.playlist_files)
+        # Fixed now: the check below takes a moment, and another playlist may be chosen meanwhile.
+        playlist = self.active_playlist_name
         self.btn_export.config(text="Checking songs...", state=tk.DISABLED)
         self.set_busy(True, f"Checking {len(files)} song(s) before exporting...")
 
@@ -225,17 +227,18 @@ class ExportMixin(AppBase):
                 if Path(path).exists():
                     present.append(path)
                     self._cached_duration(path)  # the disk-space and 80-minute checks need the lengths
-            self._safe_after(0, self._export_songs_checked, files, present)
+            self._safe_after(0, self._export_songs_checked, files, present, playlist)
 
         if task_mgr.submit_task(_worker) is None:  # the app is closing
             self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
             self.set_busy(False)
 
-    def _export_songs_checked(self, files: list[str], present: list[str]) -> None:
+    def _export_songs_checked(self, files: list[str], present: list[str], playlist: str) -> None:
         """Say which songs cannot be found before anything is asked about, or done to, the drive.
 
         An export of songs that are all missing would otherwise remove the previous export from the
-        drive and put nothing in its place. Only the songs that were found are exported.
+        drive and put nothing in its place. Only the songs that were found are exported, as
+        ``playlist``: the one that was showing when Export was clicked.
         """
         self.btn_export.config(text=EXPORT_BUTTON_TEXT, state=tk.NORMAL)
         self.set_busy(False)
@@ -245,7 +248,7 @@ class ExportMixin(AppBase):
             dialogs.show_warning(
                 self.root,
                 "Songs Not Found",
-                f"None of the songs in the playlist '{self.active_playlist_name}' could be found, so nothing "
+                f"None of the songs in the playlist '{playlist}' could be found, so nothing "
                 f"was exported.\n\n{plug_in}\n\nOtherwise, remove the missing songs (marked ⚠️) from the playlist.",
             )
             return
@@ -263,20 +266,26 @@ class ExportMixin(AppBase):
         ):
             self.set_status("Nothing was exported.")
             return
-        self._export_after_preflight(present)
+        self._export_after_preflight(present, playlist)
 
     def _cached_duration_only(self, path: str) -> float:
         return self._cached_duration(path, probe=False)
 
-    def _export_after_preflight(self, files: list[str]) -> None:
+    def _export_after_preflight(self, files: list[str], playlist: str | None = None) -> None:
+        """Export ``files`` as ``playlist`` (the playlist that is showing when none is named)."""
         normalize = bool(self.even_volume.get())
         if self.export_var.get() == "USB":
-            self._export_to_usb(files, normalize)
+            self._export_to_usb(files, normalize, playlist or self.active_playlist_name)
         else:
             self._export_to_cd(files, normalize)
 
-    def _export_to_usb(self, files: list[str], normalize: bool) -> None:
-        """Check the chosen drive on a worker, then ask the export questions (``_usb_target_checked``)."""
+    def _export_to_usb(self, files: list[str], normalize: bool, playlist: str | None = None) -> None:
+        """Check the chosen drive on a worker, then ask the export questions (``_usb_target_checked``).
+
+        ``playlist`` names the folder and the M3U the songs go into; without it, the playlist that
+        is showing. A caller that has waited for a worker passes the name it started with: the
+        songs of one playlist must never land in (or replace) the export of another.
+        """
         choice = self.usb_choice.get()
         if not choice or choice not in self._usb_map:
             dialogs.show_warning(
@@ -307,7 +316,7 @@ class ExportMixin(AppBase):
 
         # Reading the drive (is it there, what is on it, how much room is left) can take seconds on
         # a drive that has gone to sleep, so it is not done on the window's thread.
-        playlist = self.active_playlist_name
+        playlist = playlist or self.active_playlist_name
         self.btn_export.config(text="Checking the drive...", state=tk.DISABLED)
         self.set_busy(True, "Checking the USB drive...")
 

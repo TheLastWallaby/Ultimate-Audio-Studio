@@ -10,6 +10,7 @@ import tkinter as tk
 from app.config import ERROR_LOG_PATH
 from app.core.errors import ErrorContext, friendly_error
 from app.ui.components import create_button
+from app.ui.dialogs import center_over, fit_to_screen, wrap_width
 from app.ui.theme import (
     BG_CARD,
     COLOR_ACCENT,
@@ -30,24 +31,29 @@ __all__ = ["show_error", "show_friendly_error"]
 
 
 def show_error(parent: tk.Misc, title: str, message: str, details: str = "") -> None:
-    """Show a modal error dialog with 'Open Error Log' and (when details exist) 'Copy Details' buttons."""
+    """Show a modal error dialog with 'Open Error Log' and (when details exist) 'Copy Details' buttons.
+
+    A message too long for the screen scrolls, so the buttons are always in reach (``fit_to_screen``).
+    """
     if details:
         logger.error("%s: %s", title, details)
+    top = parent.winfo_toplevel()
     win = tk.Toplevel(parent)
     win.title(title)
     win.configure(bg=BG_CARD)
     win.resizable(False, False)
     with contextlib.suppress(tk.TclError):
-        win.transient(parent.winfo_toplevel())
+        win.transient(top)
 
     body = tk.Frame(win, bg=BG_CARD, padx=20, pady=16)
     body.pack(fill=tk.BOTH, expand=True)
     tk.Label(body, text=f"⚠️  {title}", font=FONT_APP_TITLE, fg=COLOR_STOP, bg=BG_CARD, anchor="w").pack(
         fill=tk.X, pady=(0, 10)
     )
-    tk.Label(body, text=message, font=FONT_BODY, fg=TEXT_DARK, bg=BG_CARD, justify="left", wraplength=480).pack(
-        anchor="w", pady=(0, 14)
+    message_label = tk.Label(
+        body, text=message, font=FONT_BODY, fg=TEXT_DARK, bg=BG_CARD, justify="left", wraplength=wrap_width(win)
     )
+    message_label.pack(anchor="w", pady=(0, 14))
 
     btns = tk.Frame(body, bg=BG_CARD)
     btns.pack(fill=tk.X)
@@ -90,11 +96,8 @@ def show_error(parent: tk.Misc, title: str, message: str, details: str = "") -> 
 
     win.protocol("WM_DELETE_WINDOW", _close)
     win.bind("<Escape>", lambda _e: _close())
-    win.update_idletasks()
-    top = parent.winfo_toplevel()
-    x = top.winfo_rootx() + max(0, (top.winfo_width() - win.winfo_reqwidth()) // 2)
-    y = top.winfo_rooty() + max(0, (top.winfo_height() - win.winfo_reqheight()) // 3)
-    win.geometry(f"+{x}+{y}")
+    fit_to_screen(win, message_label)
+    center_over(win, top)
     ok_btn.focus_set()
     with contextlib.suppress(tk.TclError):
         win.grab_set()

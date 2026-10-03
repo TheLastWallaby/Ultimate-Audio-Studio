@@ -33,8 +33,11 @@ UNDO_DIR_NAME = ".undo_trash"
 # Temporary files this app makes in the Library folder while it copies, clips or restores a song. Each
 # name carries the id of the process that made it, so no file of the user's can match.
 _WORK_FILE_RE = re.compile(
-    r"^(?:\.clip_tmp_(?P<clip_pid>\d+)_\d+\.(?:mp3|wav)|.+\.(?P<pid>\d+)\.(?:partial|incoming|restoring))$"
+    r"^(?:\.clip_tmp_(?P<clip_pid>\d+)_\d+\.(?:mp3|wav)"
+    r"|(?P<song>.+)\.(?P<pid>\d+)\.(?P<kind>partial|incoming|restoring))$"
 )
+# A complete copy of a song that was about to be renamed into place ("Song.mp3.<pid>.restoring").
+_READY_COPY_KINDS = ("incoming", "restoring")
 
 
 @dataclass(slots=True, frozen=True)
@@ -73,29 +76,54 @@ def _free_name(dest: Path, taken_names: set[str]) -> Path:
         number += 1
 
 
+def _finish_interrupted_swap(ready: Path, song: Path) -> bool:
+    """Put the complete copy ``ready`` in place of ``song``, which an earlier run had already moved away.
+
+    Restoring an original and replacing a song on import both send the old song to the Recycle Bin
+    and then rename a finished copy into its place. A run that ended between the two steps left
+    the Library without the song; removing the copy as well (and then its backup, as an orphan)
+    would leave it with neither version. True when the song is back; raises OSError.
+    """
+    if song.exists():
+        return False
+    # The backup belongs to the song that is gone: left in place, it would pass for the original of
+    # the one put back here.
+    discard_orphan_backup(song)
+    replace_with_retry(ready, song)
+    return True
+
+
 def remove_stale_work_files(folder: Path) -> int:
-    """Remove the app's own unfinished temporary files that an earlier run left in ``folder``.
+    """Tidy the app's own temporary files that an earlier run left in ``folder``.
 
     A run that was ended mid-save (a crash, the power going) leaves its half-made copy or clip
-    behind; a leftover clip even shows up in the Library as a song. Files of this run are kept: one
-    of them may be in use right now. Returns the number of files removed.
+    behind; a leftover clip even shows up in the Library as a song. They are removed, except for a
+    complete copy whose song is gone: that one takes the song's place (``_finish_interrupted_swap``).
+    Files of this run are kept: one of them may be in use right now. Returns the number of files
+    handled.
     """
     try:
         entries = list(folder.iterdir())
     except OSError:
         return 0
-    removed = 0
+    handled = 0
     for entry in entries:
         match = _WORK_FILE_RE.match(entry.name)
         if match is None or int(match.group("clip_pid") or match.group("pid")) == os.getpid():
             continue
         try:
-            if entry.is_file():
+            if not entry.is_file():
+                continue
+            if match.group("kind") in _READY_COPY_KINDS and _finish_interrupted_swap(
+                entry, folder / match.group("song")
+            ):
+                logger.info("Put %s back in the Library after an interrupted save", match.group("song"))
+            else:
                 entry.unlink()
-                removed += 1
+            handled += 1
         except OSError as err:
-            logger.warning("Could not remove the leftover file %s: %s", entry.name, err)
-    return removed
+            logger.warning("Could not tidy the leftover file %s: %s", entry.name, err)
+    return handled
 
 
 def _hide_path(path: str) -> None:
