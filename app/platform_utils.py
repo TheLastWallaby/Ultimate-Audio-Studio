@@ -323,6 +323,37 @@ def kill_process_tree(proc: subprocess.Popen[bytes], timeout_sec: float = 15.0) 
         proc.wait(timeout=timeout_sec)
 
 
+_FILE_ATTRIBUTE_HIDDEN = 0x02
+_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+
+
+def set_hidden(path: str | Path, hidden: bool) -> bool:
+    """Hide a file from File Explorer, or show it again; True when Windows made the change."""
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+    kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    kernel32.SetFileAttributesW.restype = ctypes.c_int
+    kernel32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    attributes = int(kernel32.GetFileAttributesW(str(path)))
+    if attributes == _INVALID_FILE_ATTRIBUTES:
+        return False
+    wanted = attributes | _FILE_ATTRIBUTE_HIDDEN if hidden else attributes & ~_FILE_ATTRIBUTE_HIDDEN
+    return wanted == attributes or bool(kernel32.SetFileAttributesW(str(path), wanted))
+
+
+def is_hidden(path: str | Path) -> bool:
+    """True when the file exists and is hidden from File Explorer."""
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+    kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    attributes = int(kernel32.GetFileAttributesW(str(path)))
+    return attributes != _INVALID_FILE_ATTRIBUTES and bool(attributes & _FILE_ATTRIBUTE_HIDDEN)
+
+
 _DRIVE_FIXED = 3
 
 
