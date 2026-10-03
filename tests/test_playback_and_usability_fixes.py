@@ -20,6 +20,8 @@ import pytest
 
 import app.main as main_module
 from app.config import ffmpeg_path, is_valid_binary, settings_mgr
+from app.controllers.playback_controller import PlaybackController
+from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.process_utils import ProcessResult, ffmpeg_timed_out, run_ffmpeg
@@ -969,3 +971,92 @@ def test_stopping_a_process_also_stops_the_process_it_started() -> None:
             parent.kill()
         if parent.stdout is not None:
             parent.stdout.close()
+
+
+# --- Seeking while Test Clip plays a rendered slice ---------------------------------------------------
+
+
+@pytest.fixture
+def slice_preview(tmp_path: Path) -> Iterator[tuple[PlaybackController, MagicMock]]:
+    """A clip preview of 60-80 s playing from a rendered slice, with pygame's music player replaced."""
+    slice_file = tmp_path / "audition.wav"
+    slice_file.write_bytes(b"RIFF")
+    music = MagicMock()
+    with patch("app.controllers.playback_controller.pygame.mixer.music", music):
+        ctrl = PlaybackController(None, AudioEngine())
+        ctrl.start_audition(str(tmp_path / "song.mp3"), 60.0, 80.0, str(slice_file))
+        music.reset_mock()
+        yield ctrl, music
+        ctrl.cleanup_audition_slice()
+
+
+def test_seek_during_a_slice_preview_moves_within_the_slice(
+    slice_preview: tuple[PlaybackController, MagicMock],
+) -> None:
+    ctrl, music = slice_preview
+
+    landed = ctrl.seek(70.0, track_duration=200.0)
+
+    assert landed == 70.0
+    music.play.assert_called_once_with(start=10.0)  # 10 s into the slice, which starts at the clip's start
+    assert 69.9 <= ctrl.current_play_seconds() < 70.5  # the timeline still shows song time
+
+
+@pytest.mark.parametrize(("target", "landed"), [(5.0, 60.0), (150.0, 79.95)])
+def test_seek_outside_the_clip_stays_in_the_preview(
+    slice_preview: tuple[PlaybackController, MagicMock], target: float, landed: float
+) -> None:
+    ctrl, music = slice_preview
+
+    assert ctrl.seek(target, track_duration=200.0) == pytest.approx(landed)
+    assert music.play.call_args.kwargs["start"] == pytest.approx(landed - 60.0)
+
+
+def test_skip_during_a_slice_preview_reports_where_it_went(
+    slice_preview: tuple[PlaybackController, MagicMock],
+) -> None:
+    ctrl, _music = slice_preview
+    ctrl.audio_engine.start_clock(75.0)
+
+    assert ctrl.skip_by(10.0, track_duration=200.0) == pytest.approx(79.95)
+
+
+def test_resume_after_scrubbing_a_paused_slice_preview_keeps_the_slice(
+    slice_preview: tuple[PlaybackController, MagicMock],
+) -> None:
+    ctrl, music = slice_preview
+    ctrl.pause()
+    ctrl.seek(65.0, track_duration=200.0)
+
+    ctrl.unpause(current_track_path="song.mp3")
+
+    music.load.assert_called_once_with(ctrl._audition_slice_file)
+    assert music.play.call_args.kwargs["start"] == pytest.approx(5.0)
+
+
+def test_seek_in_a_plain_song_uses_the_song_position(tmp_path: Path) -> None:
+    music = MagicMock()
+    with patch("app.controllers.playback_controller.pygame.mixer.music", music):
+        ctrl = PlaybackController(None, AudioEngine())
+        ctrl.is_playing_main = True
+        assert ctrl.seek(70.0, track_duration=200.0) == 70.0
+
+    music.play.assert_called_once_with(start=70.0)
+
+
+@pytest.mark.parametrize(
+    ("slice_made", "expected", "absent"), [(True, "smooth fade", "could not"), (False, "could not", "smooth fade")]
+)
+def test_preview_status_mentions_effects_only_when_they_are_heard(
+    studio: UltimateAudioStudio, tmp_path: Path, slice_made: bool, expected: str, absent: str
+) -> None:
+    slice_file = tmp_path / "audition.wav"
+    slice_file.write_bytes(b"RIFF")
+    with patch.object(studio.playback_ctrl, "start_audition"):
+        studio._start_test_clip(
+            str(tmp_path / "song.mp3"), 10.0, 20.0, str(slice_file) if slice_made else None, 0.0, True, 1.5, False
+        )
+
+    status = studio.status.cget("text")
+    assert expected in status
+    assert absent not in status
