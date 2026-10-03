@@ -28,6 +28,18 @@ logger = logging.getLogger(__name__)
 
 # Background of a just-added library row that was not selected (music was playing at the time).
 NEW_SONG_ROW_BG = "#dcfce7"
+# An import of more songs than this, or of more data, is confirmed first: a whole Music folder dropped
+# by accident would otherwise be copied (and fill the disk) without a word.
+LARGE_IMPORT_SONGS = 200
+LARGE_IMPORT_BYTES = 2 * 1024**3
+LIBRARY_WATCH_MS = 12000
+
+
+def _size_text(size_bytes: int) -> str:
+    """A size the way people say it: "350 MB", "4.2 GB"."""
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.1f} GB"
+    return f"{max(1, round(size_bytes / 1024**2))} MB"
 
 
 def _same_song(a: str | None, b: str | None) -> bool:
@@ -46,6 +58,8 @@ class LibraryMixin(AppBase):
     # The chosen Library folder when it was offline at start-up (a USB drive, memory card or network
     # share). The window then shows the default folder, but this one is what gets saved.
     _unavailable_library_folder: str | None = None
+    # True while the Library watcher is reading the folder on a worker (one read at a time).
+    _library_scan_running = False
 
     def _library_row_path(self, filename: str) -> str:
         """Path of a Library row, in the exact form the player and the playlists keep it in.
@@ -75,8 +89,42 @@ class LibraryMixin(AppBase):
         self._import_paths(paths, source="dropped")
 
     def _import_paths(self, paths: list[str], source: str = "selected") -> None:
-        """Copy audio files/folders into the Library, asking before replacing existing songs."""
-        planned, dest_exists = self.library_ctrl.build_import_plan(paths, self.library_folder)
+        """Copy audio files/folders into the Library, asking before replacing existing songs.
+
+        A dropped folder can hold thousands of files (or sit on a CD or another computer), so it is
+        searched on a worker; the questions are asked once the songs in it are known.
+        """
+        if self._importing:
+            self.set_status("Still adding songs to your Library. Add these again when it has finished.", icon="⏳")
+            return
+        self._importing = True
+        self.set_busy(True, f"Looking for songs in the {source} files...")
+        library = self.library_folder
+
+        def _worker() -> None:
+            try:
+                planned, dest_exists = self.library_ctrl.build_import_plan(paths, library)
+                total_bytes = sum(Path(src).stat().st_size for src, _dest in planned)
+            except OSError as err:
+                logger.error("Could not read the %s files: %s", source, err)
+                self._safe_after(0, self._import_plan_failed, err)
+                return
+            self._safe_after(0, self._confirm_import, planned, dest_exists, source, total_bytes)
+
+        task_mgr.submit_task(_worker)
+
+    def _import_plan_failed(self, err: OSError) -> None:
+        """The files to import could not be read (a CD or drive removed meanwhile)."""
+        self._importing = False
+        self.set_busy(False, "No songs were added to your Library.")
+        show_friendly_error(self.root, err, "import")
+
+    def _confirm_import(
+        self, planned: list[tuple[str, str]], dest_exists: list[str], source: str, total_bytes: int
+    ) -> None:
+        """Ask the import questions (all of them before anything is copied), then start copying."""
+        self._importing = False
+        self.set_busy(False)
         if not planned and not dest_exists:
             dialogs.show_info(
                 self.root,
@@ -88,6 +136,19 @@ class LibraryMixin(AppBase):
             self.set_status(f"The {source} audio files are already in your Library.")
             return
 
+        if (len(planned) > LARGE_IMPORT_SONGS or total_bytes > LARGE_IMPORT_BYTES) and not dialogs.ask_yes_no(
+            self.root,
+            "Add All These Songs?",
+            f"The {source} files hold {len(planned)} songs ({_size_text(total_bytes)}).\n\n"
+            "They are copied into your Library; the originals stay where they are.",
+            yes=f"Add {len(planned)} songs",
+            no="Cancel",
+            default_yes=False,
+        ):
+            self.set_status("No songs were added to your Library.")
+            return
+
+        already_there = {name.casefold() for name in dest_exists}
         if dest_exists:
             gone = (
                 "go to the Recycle Bin"
@@ -104,13 +165,17 @@ class LibraryMixin(AppBase):
                 default_yes=False,
             )
             if not replace:
-                planned = [(s, d) for (s, d) in planned if not Path(d).exists()]
+                planned = [(s, d) for (s, d) in planned if Path(d).name.casefold() not in already_there]
 
         if not planned:
             return
 
         # The song in the player is held open, and Windows will not move an open file to the Recycle Bin.
-        if any(_same_song(dest, self.selected_file_path) for _src, dest in planned if Path(dest).exists()):
+        if any(
+            _same_song(dest, self.selected_file_path)
+            for _src, dest in planned
+            if Path(dest).name.casefold() in already_there
+        ):
             self.stop_audio()
             self._release_audio_file()
 
@@ -122,12 +187,15 @@ class LibraryMixin(AppBase):
             on_done=lambda result: self._safe_after(0, self._on_copy_external_done, result),
         )
 
-    def refresh_library(self, select_name: str | None = None, preserve_view: bool = False) -> None:
+    def refresh_library(
+        self, select_name: str | None = None, preserve_view: bool = False, files: list[str] | None = None
+    ) -> None:
         """Show the folder's songs immediately; tags and durations fill in from a background scan.
 
         preserve_view keeps the current selection and scroll position (for background refreshes).
+        ``files`` is the folder's song list when the caller has just read it (the Library watcher).
         """
-        self.library_files = self.library_ctrl.scan_files(self.library_folder)
+        self.library_files = self.library_ctrl.scan_files(self.library_folder) if files is None else files
         self.apply_library_filter(select_name, preserve_view=preserve_view)
         self._warm_library_metadata()
 
@@ -368,16 +436,32 @@ class LibraryMixin(AppBase):
             )
 
     def _watch_library(self) -> None:
-        if not getattr(self, "_is_shutting_down", False):
-            try:
-                # Compare names, not just the count, so renames done in File Explorer show up too.
-                on_disk = self.library_ctrl.scan_files(self.library_folder)
-                if on_disk != self.library_files:
-                    self.refresh_library(preserve_view=True)
-            except Exception:
-                pass
-            if hasattr(self, "root") and self.root and self.root.winfo_exists():
-                self._timer_watch_library = self.root.after(12000, self._watch_library)
+        """Every few seconds, notice songs added, renamed or removed in File Explorer.
+
+        The folder is read on a worker: a Library on a network folder or a sleeping USB drive can take
+        seconds to answer, and the window must not freeze meanwhile.
+        """
+        if self._is_shutting_down:
+            return
+        if not self._library_scan_running:
+            self._library_scan_running = True
+            folder = self.library_folder
+
+            def _worker() -> None:
+                on_disk = self.library_ctrl.scan_files(folder)
+                self._safe_after(0, self._library_scanned, folder, on_disk)
+
+            if task_mgr.submit_task(_worker) is None:
+                self._library_scan_running = False
+        with contextlib.suppress(tk.TclError):
+            self._timer_watch_library = self.root.after(LIBRARY_WATCH_MS, self._watch_library)
+
+    def _library_scanned(self, folder: str, on_disk: list[str]) -> None:
+        """Show what the watcher found, unless the Library folder was changed meanwhile."""
+        self._library_scan_running = False
+        # Compare names, not just the count, so renames done in File Explorer show up too.
+        if folder == self.library_folder and on_disk != self.library_files:
+            self.refresh_library(preserve_view=True, files=on_disk)
 
     def rename_library_file(self) -> None:
         """Rename the selected song; its playlist entries and its trim backup follow it."""

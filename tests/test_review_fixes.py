@@ -190,7 +190,7 @@ def test_deleting_on_a_drive_without_a_recycle_bin_says_it_is_for_good(studio: A
     assert "Recycle Bin" in question and "for good" in question and "moved safely" not in question
     assert "Recycle Bin" not in studio.status.cget("text")
     assert "Undo" in studio.status.cget("text")
-    studio.hide_undo(flush=False)
+    studio._on_undo_click()  # put the song back: closing the window would send it to the real Recycle Bin
 
 
 def test_deleting_on_a_normal_disk_still_mentions_the_recycle_bin(studio: Any, tmp_path: Path) -> None:
@@ -201,7 +201,7 @@ def test_deleting_on_a_normal_disk_still_mentions_the_recycle_bin(studio: Any, t
 
     assert "moved safely to your Windows Recycle Bin" in ask.call_args[0][2]
     assert studio.status.cget("text") == "Moved 'song.mp3' to Recycle Bin."
-    studio.hide_undo(flush=False)
+    studio._on_undo_click()  # put the song back: closing the window would send it to the real Recycle Bin
 
 
 # --- A playlist download leaves the Library selection alone ---------------------------------------------
@@ -491,3 +491,72 @@ def test_a_song_undo_could_not_put_back_stays_staged_for_another_try(tmp_path: P
     assert library.undo_delete(playlists)  # the file is free again
     assert song.read_bytes() == b"song"
     assert playlists["Car"] == [str(song)]
+
+
+# --- Reading folders off the window's thread ------------------------------------------------------------
+
+
+def test_a_dropped_folder_is_searched_on_a_worker_not_on_the_window_thread(studio: Any, tmp_path: Path) -> None:
+    import threading
+
+    _library(studio, tmp_path / "lib")
+    dropped = tmp_path / "dropped"
+    dropped.mkdir()
+    (dropped / "new.mp3").write_bytes(b"ID3" + bytes(64))
+    searched_on: list[str] = []
+    real_plan = studio.library_ctrl.build_import_plan
+
+    def _plan(paths: Any, folder: Any) -> Any:
+        searched_on.append(threading.current_thread().name)
+        return real_plan(paths, folder)
+
+    with patch.object(studio.library_ctrl, "build_import_plan", side_effect=_plan):
+        studio._handle_dropped_files([str(dropped)])
+        _pump(studio, lambda: (tmp_path / "lib" / "new.mp3").exists() and not studio._importing)
+
+    assert searched_on and searched_on[0] != threading.main_thread().name
+    assert (tmp_path / "lib" / "new.mp3").exists()
+
+
+def test_a_very_large_import_is_confirmed_and_cancel_copies_nothing(studio: Any, tmp_path: Path) -> None:
+    from app.ui.features import library as library_feature
+
+    _library(studio, tmp_path / "lib")
+    dropped = tmp_path / "dropped"
+    dropped.mkdir()
+    for i in range(3):
+        (dropped / f"song{i}.mp3").write_bytes(b"ID3" + bytes(64))
+
+    with (
+        patch.object(library_feature, "LARGE_IMPORT_SONGS", 2),
+        patch("app.ui.dialogs.ask_yes_no", return_value=False) as ask,
+    ):
+        studio._handle_dropped_files([str(dropped)])
+        _pump(studio, lambda: ask.called and not studio._importing)
+
+    ask.assert_called_once()
+    assert "3 songs" in ask.call_args[0][2]
+    assert ask.call_args.kwargs["yes"] == "Add 3 songs"
+    assert list((tmp_path / "lib").glob("*.mp3")) == []
+    assert not studio._importing and not studio._busy
+
+
+def test_the_library_watcher_reads_the_folder_on_a_worker(studio: Any, tmp_path: Path) -> None:
+    import threading
+
+    _library(studio, tmp_path / "lib", "a.mp3")
+    (tmp_path / "lib" / "b.mp3").write_bytes(b"ID3" + bytes(64))
+    cache_mgr.set_metadata(studio._library_row_path("b.mp3"), {"title": "", "artist": "", "duration": 100.0})
+    scanned_on: list[str] = []
+    real_scan = studio.library_ctrl.scan_files
+
+    def _scan(folder: str) -> list[str]:
+        scanned_on.append(threading.current_thread().name)
+        return list(real_scan(folder))
+
+    with patch.object(studio.library_ctrl, "scan_files", side_effect=_scan):
+        studio._watch_library()
+        _pump(studio, lambda: studio.library_files == ["a.mp3", "b.mp3"])
+
+    assert studio.library_files == ["a.mp3", "b.mp3"]
+    assert scanned_on == [name for name in scanned_on if name != threading.main_thread().name]
