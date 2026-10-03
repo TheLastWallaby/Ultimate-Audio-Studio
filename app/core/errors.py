@@ -26,12 +26,18 @@ class FriendlyError:
 
 @dataclass(slots=True, frozen=True)
 class _Rule:
-    """Raw error text matching ``pattern`` is explained by ``title`` and ``message``."""
+    """Raw error text matching ``pattern`` is explained by ``title`` and ``message``.
+
+    ``online`` rules explain YouTube and connection failures. They are only used for searches and
+    downloads: the text of a file error holds the song's name, and a song called "Private Video
+    Blues" or "Timeout" would otherwise turn a failed export into a message about YouTube.
+    """
 
     pattern: re.Pattern[str]
     title: str
     message: str
     suggests_update: bool = False
+    online: bool = False
 
 
 _OFFLINE_STEPS = (
@@ -48,7 +54,10 @@ _OFFLINE_RULE = _Rule(
     ),
     "No Internet Connection",
     f"The app could not reach the internet.\n\n{_OFFLINE_STEPS}",
+    online=True,
 )
+# The work that talks to YouTube; only there can an ``online`` rule be the explanation.
+_ONLINE_CONTEXTS: frozenset[ErrorContext] = frozenset({"download", "search"})
 
 # Evaluated in order; the first match wins.
 _RULES: tuple[_Rule, ...] = (
@@ -64,12 +73,14 @@ _RULES: tuple[_Rule, ...] = (
         re.compile(r"private video|video is private", re.I),
         "Private Video",
         "This video is private, so it cannot be downloaded.\n\nPlease choose a different version of the song.",
+        online=True,
     ),
     _Rule(
         re.compile(r"confirm your age|age[- ]restricted|inappropriate for some users", re.I),
         "Age-Restricted Video",
         "YouTube only allows signed-in adults to play this video, so it cannot be downloaded.\n\n"
         "Please choose a different version of the song.",
+        online=True,
     ),
     _Rule(
         re.compile(r"not a bot|sign in to confirm", re.I),
@@ -78,23 +89,27 @@ _RULES: tuple[_Rule, ...] = (
         "• Wait an hour and try again.\n"
         "• Click 'Check for Updates' at the bottom right: a newer version of this app may fix it.",
         suggests_update=True,
+        online=True,
     ),
     _Rule(
         re.compile(r"not (?:made )?available in your country|geo.?restrict|blocked it in your country", re.I),
         "Not Available in Your Country",
         "The owner of this video does not allow it to be played in your country.\n\n"
         "Please choose a different version of the song.",
+        online=True,
     ),
     _Rule(
         re.compile(r"video unavailable|has been removed|no longer available|does not exist|is not a valid url", re.I),
         "Video Not Available",
         "This video is no longer available on YouTube, or the link is not correct.\n\n"
         "• Check the link, or type the song name and artist instead.",
+        online=True,
     ),
     _Rule(
         re.compile(r"live event|premieres in|is_live|this live stream", re.I),
         "Live Video",
         "Live broadcasts cannot be downloaded.\n\nPlease choose a normal (recorded) version of the song.",
+        online=True,
     ),
     _Rule(
         # What yt-dlp reports when YouTube has changed and this version can no longer read its pages.
@@ -109,6 +124,7 @@ _RULES: tuple[_Rule, ...] = (
         "• Click 'Check for Updates' at the bottom right and install the new version.\n"
         "• If there is no update yet, please try again in a day or two.",
         suggests_update=True,
+        online=True,
     ),
     _Rule(
         re.compile(r"no space left|errno 28|disk (?:is )?full|not enough space|winerror 112", re.I),
@@ -143,6 +159,7 @@ _RULES: tuple[_Rule, ...] = (
         "• Wait a few minutes and try again.\n"
         "• Click 'Check for Updates' at the bottom right: a newer version of this app may fix it.",
         suggests_update=True,
+        online=True,
     ),
 )
 
@@ -192,7 +209,12 @@ def friendly_error(raw: object, context: ErrorContext = "generic") -> FriendlyEr
     text = str(raw or "")
     # An update check talks to GitHub: the rules about YouTube and files would misread its errors
     # ("403 Forbidden" is not YouTube refusing a download), so only the connection is explained.
-    rules = (_OFFLINE_RULE,) if context == "update" else _RULES
+    if context == "update":
+        rules: tuple[_Rule, ...] = (_OFFLINE_RULE,)
+    elif context in _ONLINE_CONTEXTS:
+        rules = _RULES
+    else:
+        rules = tuple(rule for rule in _RULES if not rule.online)
     for rule in rules:
         if rule.pattern.search(text):
             return FriendlyError(rule.title, rule.message, rule.suggests_update)

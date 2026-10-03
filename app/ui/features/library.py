@@ -113,6 +113,9 @@ class LibraryMixin(AppBase):
     _unavailable_library_folder: str | None = None
     # True while the Library watcher is reading the folder on a worker (one read at a time).
     _library_scan_running = False
+    # True when the Library folder could not be found the last time it was read (its drive was
+    # unplugged while the app was open). The empty list then says so, not "Your Library is empty".
+    _library_unreachable = False
 
     def _known_rows(self) -> dict[str, SongRow]:
         """The rows read so far, by path (as the lists spell it)."""
@@ -268,9 +271,13 @@ class LibraryMixin(AppBase):
         """Show the folder's songs immediately; tags and durations fill in from a background scan.
 
         preserve_view keeps the current selection and scroll position (for background refreshes).
-        ``files`` is the folder's song list when the caller has just read it (the Library watcher).
+        ``files`` is the folder's song list when the caller has just read it (the Library watcher,
+        which also says whether the folder was there).
         """
-        self.library_files = self.library_ctrl.scan_files(self.library_folder) if files is None else files
+        if files is None:
+            files = self.library_ctrl.scan_files(self.library_folder)
+            self._library_unreachable = not files and not Path(self.library_folder).is_dir()
+        self.library_files = files
         self.apply_library_filter(select_name, preserve_view=preserve_view)
         self._warm_library_metadata()
 
@@ -394,6 +401,12 @@ class LibraryMixin(AppBase):
         if self.library_files:
             typed = self.entry_search.get().strip()
             text = f"No songs match '{typed}'.\n\nClick ✕ next to the search box to show all your songs."
+        elif self._library_unreachable:
+            text = (
+                f"Your music folder cannot be found:\n{self.library_folder}\n\n"
+                "If it is on a USB drive or memory card, plug it in again.\n"
+                "Your songs will show here by themselves."
+            )
         else:
             text = (
                 "Your Library is empty.\n\n"
@@ -551,19 +564,36 @@ class LibraryMixin(AppBase):
 
             def _worker() -> None:
                 on_disk = self.library_ctrl.scan_files(folder)
-                self._safe_after(0, self._library_scanned, folder, on_disk)
+                # An unplugged drive reads as "no songs": only the folder itself tells the two apart.
+                reachable = bool(on_disk) or Path(folder).is_dir()
+                self._safe_after(0, self._library_scanned, folder, on_disk, reachable)
 
             if task_mgr.submit_task(_worker) is None:
                 self._library_scan_running = False
         with contextlib.suppress(tk.TclError):
             self._timer_watch_library = self.root.after(LIBRARY_WATCH_MS, self._watch_library)
 
-    def _library_scanned(self, folder: str, on_disk: list[str]) -> None:
-        """Show what the watcher found, unless the Library folder was changed meanwhile."""
+    def _library_scanned(self, folder: str, on_disk: list[str], reachable: bool = True) -> None:
+        """Show what the watcher found, unless the Library folder was changed meanwhile.
+
+        ``reachable`` is False when the folder itself was not there (its drive was unplugged): the
+        list then says that, and says so again in the status bar when the folder is back.
+        """
         self._library_scan_running = False
+        if folder != self.library_folder:
+            return
+        was_unreachable, self._library_unreachable = self._library_unreachable, not reachable
         # Compare names, not just the count, so renames done in File Explorer show up too.
-        if folder == self.library_folder and on_disk != self.library_files:
+        if on_disk != self.library_files:
             self.refresh_library(preserve_view=True, files=on_disk)
+        elif was_unreachable != self._library_unreachable:
+            self._show_library_hint()
+        if was_unreachable == self._library_unreachable or self._busy:
+            return  # nothing new, or a job's progress is showing in the status bar
+        if reachable:
+            self.set_status("Your music folder is back: your songs are showing again.")
+        else:
+            self.set_status("Your music folder cannot be found. If it is on a USB drive, plug it in again.", icon="⚠️")
 
     def rename_library_file(self) -> None:
         """Rename the selected song; its playlist entries and its trim backup follow it."""

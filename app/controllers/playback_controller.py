@@ -157,10 +157,15 @@ class PlaybackController:
             self._scrubbed_while_paused = True
 
     def skip_by(self, delta_seconds: float, track_duration: float = 0.0) -> float:
-        """Skip playback position by delta_seconds (+10s or -10s)."""
-        curr = self.current_play_seconds()
-        new_pos = max(0.0, min(track_duration, curr + delta_seconds))
-        return self.seek(new_pos, track_duration)
+        """Skip playback position by delta_seconds (+10s or -10s); returns the position it went to.
+
+        A length of 0 means "not known yet" (it is still being measured, or the file does not say),
+        not a song that ends at 0: the skip is then not held back by it.
+        """
+        target = self.current_play_seconds() + delta_seconds
+        if track_duration > 0:
+            target = min(track_duration, target)
+        return self.seek(max(0.0, target), track_duration)
 
     def current_play_seconds(self) -> float:
         """Get elapsed playback position from high-precision monotonic clock."""

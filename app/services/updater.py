@@ -84,7 +84,19 @@ _PENDING_FILE = PENDING_DIR / "pending.json"
 ProgressCallback = Callable[[float, int, int], None]
 
 
+def _is_github_host(url: str) -> bool:
+    """True when ``url`` is served by github.com itself or one of its subdomains (api.github.com)."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host == "github.com" or host.endswith(".github.com")
+
+
 class _GitHubAssetRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows the redirect to a release's file without taking the GitHub token along.
+
+    The file is served from a storage host, which must never see the token. The host is compared
+    by name: "github.com" appearing anywhere in it ("github.com.example.net") is not GitHub.
+    """
+
     def redirect_request(
         self,
         req: urllib.request.Request,
@@ -95,15 +107,11 @@ class _GitHubAssetRedirectHandler(urllib.request.HTTPRedirectHandler):
         newurl: str,
     ) -> urllib.request.Request | None:
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_req is not None:
-            parsed = urllib.parse.urlparse(newurl)
-            if "amazonaws.com" in parsed.netloc or "github.com" not in parsed.netloc:
-                if hasattr(new_req, "headers"):
-                    new_req.headers = {k: v for k, v in new_req.headers.items() if k.lower() != "authorization"}
-                if hasattr(new_req, "unredirected_hdrs"):
-                    new_req.unredirected_hdrs = {
-                        k: v for k, v in new_req.unredirected_hdrs.items() if k.lower() != "authorization"
-                    }
+        if new_req is not None and not _is_github_host(newurl):
+            new_req.headers = {k: v for k, v in new_req.headers.items() if k.lower() != "authorization"}
+            new_req.unredirected_hdrs = {
+                k: v for k, v in new_req.unredirected_hdrs.items() if k.lower() != "authorization"
+            }
         return new_req
 
 

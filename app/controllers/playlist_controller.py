@@ -92,6 +92,7 @@ class PlaylistController:
         self.active_playlist_name = DEFAULT_PLAYLIST_NAME
         self.playlist_index = 0
         self._last_removed: tuple[str, int, str] | None = None  # (playlist_name, index, track_path)
+        self._last_deleted: tuple[str, int, list[str]] | None = None  # (playlist name, its place, its songs)
 
     def load(self, filepath: str | Path) -> PlaylistLoadResult:
         """Load playlists from the JSON file, falling back to the last copy that loaded correctly.
@@ -155,13 +156,35 @@ class PlaylistController:
         return True
 
     def delete_playlist(self, name: str) -> bool:
-        """Delete playlist while retaining at least one playlist."""
+        """Delete a playlist (never the last one); ``undo_delete_playlist`` brings it back."""
         if len(self.playlists) <= 1 or name not in self.playlists:
             return False
-        del self.playlists[name]
-        self.active_playlist_name = list(self.playlists.keys())[0]
+        place = list(self.playlists).index(name)
+        self._last_deleted = (name, place, self.playlists.pop(name))
+        self.active_playlist_name = next(iter(self.playlists))
         self.playlist_index = 0
         return True
+
+    def undo_delete_playlist(self) -> str | None:
+        """Bring the playlist deleted last back, in its old place, and show it; returns its name.
+
+        When a playlist with that name was made meanwhile, it comes back as "Name (2)": putting it
+        back under its own name would replace the new one. None when there is nothing to bring back.
+        """
+        if self._last_deleted is None:
+            return None
+        name, place, tracks = self._last_deleted
+        self._last_deleted = None
+        restored, number = name, 2
+        while restored in self.playlists:
+            restored = f"{name} ({number})"
+            number += 1
+        names = list(self.playlists)
+        names.insert(min(place, len(names)), restored)
+        self.playlists = {entry: tracks if entry == restored else self.playlists[entry] for entry in names}
+        self.active_playlist_name = restored
+        self.playlist_index = 0
+        return restored
 
     def contains(self, playlist_name: str, track_path: str) -> bool:
         """True when the playlist already has this song (same file, ignoring path case)."""

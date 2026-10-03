@@ -69,7 +69,7 @@ def test_enter_twice_while_searching_opens_one_results_window(studio: Any) -> No
     assert opened == ["some song"]
 
 
-def test_enter_during_a_download_leaves_it_running_and_stoppable(studio: Any) -> None:
+def test_enter_during_a_download_searches_for_the_next_song_and_leaves_it_running(studio: Any) -> None:
     release = threading.Event()
     jobs: list[threading.Event] = []
     reported: list[str] = []
@@ -92,10 +92,10 @@ def test_enter_during_a_download_leaves_it_running_and_stoppable(studio: Any) ->
         studio.start_download()  # Enter while the first download is running
         _pump(studio.root, 0.3)
 
-        assert not search.called
+        assert search.called  # the next song is looked up while the first is being downloaded
         assert studio.download_ctrl.is_downloading
         assert studio.busy_reason() == "the current download"
-        assert "Still working" in studio.status.cget("text")
+        assert str(studio.btn_cancel_dl.cget("state")) == tk.NORMAL  # and it can still be stopped
         release.set()
         _pump(studio.root, 0.5)
 

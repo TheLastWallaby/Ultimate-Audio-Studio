@@ -869,10 +869,17 @@ class UltimateAudioStudio(
         self._timer_status_flash = self.root.after(STATUS_FLASH_MS, _restore)
 
     def set_busy(self, busy: bool, status: str | None = None) -> None:
-        self._busy = busy
-        self.root.config(cursor="watch" if busy else "")
-        # Keep Windows from sleeping mid-download/export (a finished search must not end that early).
-        set_keep_awake(busy or self.busy_reason() is not None)
+        """Show (or stop showing) that the app is working, with an optional status-bar text.
+
+        Several jobs share this one sign. A short job that ends (a search, a drive check, a song
+        made ready to play) must not switch it off while a download, export, clip save or import is
+        still running (``busy_reason``): the wait cursor would go, Windows could go to sleep, and
+        other messages would cover up that job's progress.
+        """
+        working = busy or self.busy_reason() is not None
+        self._busy = working
+        self.root.config(cursor="watch" if working else "")
+        set_keep_awake(working)
         if status:
             self.set_status(status, icon="⏳" if busy else "ℹ️")
 
@@ -920,6 +927,8 @@ class UltimateAudioStudio(
         help_text = (
             "STEP 1: GETTING MUSIC\n"
             "• Search or Paste: Type any song and artist, or paste a YouTube link, then click 'Download MP3'.\n"
+            "• More Songs: While a song is downloading you can choose the next ones; they are downloaded "
+            "one after the other.\n"
             "• Add Music from PC: Click 'Add Music from PC' or drag & drop audio files directly into the window.\n"
             "• Search Library: Use the search bar to filter songs by title or artist.\n\n"
             "STEP 2: PLAYING & CLIPPING\n"
