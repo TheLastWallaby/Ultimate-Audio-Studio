@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
-from app.core.file_utils import copy_file_atomic
+from app.core.file_utils import copy_file_atomic, fsync_file
 from app.core.file_utils import replace_with_retry as _replace_with_retry
 from app.core.process_utils import ffmpeg_timed_out
 from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, mp3_audio_only_args, mp3_output_args
@@ -202,6 +202,8 @@ def clip_audio_worker(
             # The original is the one thing that cannot be made again: no complete backup, no replace.
             _ensure_original_backup(target)
 
+        # On disk before the swap: a power cut must not leave an empty song where the clip should be.
+        fsync_file(tmp_save)
         # Resilient file replace against Windows file indexing / antivirus locks
         _replace_with_retry(str(tmp_save), str(target))
 
