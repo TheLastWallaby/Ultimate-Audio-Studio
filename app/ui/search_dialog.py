@@ -43,12 +43,17 @@ from app.ui.theme import (
     FONT_BTN_SUB,
     TEXT_DARK,
     TEXT_MUTED,
+    scaled_px,
 )
 
 if TYPE_CHECKING:
     from app.core.audio_engine import AudioEngine
 
 logger = logging.getLogger(__name__)
+
+# Window size at Normal text and 100% display scaling; it grows with both (see _fit_and_center).
+BASE_WIDTH, BASE_HEIGHT = 900, 660
+MIN_WIDTH, MIN_HEIGHT = 640, 460
 
 
 class SearchChoiceDialog:
@@ -92,29 +97,23 @@ class SearchChoiceDialog:
 
         self.win = tk.Toplevel(parent)
         self.win.title("Choose Version to Download")
-        self.win.geometry("760x560")
-        self.win.minsize(640, 460)
         self.win.configure(bg=BG_CARD)
         self.win.transient(parent.winfo_toplevel())
 
         self._drain_ui_queue()
 
-        # Center over parent
-        self._center_window()
-
         self._build_ui()
+        # After _build_ui: the window can only be sized to its contents once they exist.
+        self._fit_and_center()
         self.win.protocol("WM_DELETE_WINDOW", self._do_cancel)
 
-        # Grab focus and select first row
-        try:
+        # Tk refuses the grab while the window is not on screen yet; the dialog works without it.
+        with contextlib.suppress(tk.TclError):
             self.win.grab_set()
-            self.tree.focus_set()
-            if self.results:
-                first_id = self.tree.get_children()[0]
-                self.tree.selection_set(first_id)
-                self._on_tree_select()
-        except Exception:
-            pass
+        self.tree.focus_set()
+        if self.results:
+            self.tree.selection_set(self.tree.get_children()[0])
+            self._on_tree_select()
 
     def _safe_dispatch(self, callback: Callable[..., Any], *args: Any) -> None:
         """Safely schedule a callback on Tkinter main thread via queue."""
@@ -143,21 +142,23 @@ class SearchChoiceDialog:
             except Exception:
                 pass
 
-    def _center_window(self) -> None:
+    def _fit_and_center(self) -> None:
+        """Make the window big enough for everything in it, then centre it over the parent."""
         self.win.update_idletasks()
-        try:
-            pw = self.parent.winfo_width()
-            ph = self.parent.winfo_height()
-            px = self.parent.winfo_rootx()
-            py = self.parent.winfo_rooty()
-            # Grow with the user's text size; never smaller than the classic 760x560 layout.
-            w = min(max(760, self.win.winfo_reqwidth()), self.win.winfo_screenwidth() - 40)
-            h = min(max(560, self.win.winfo_reqheight()), self.win.winfo_screenheight() - 80)
-            x = px + max(0, (pw - w) // 2)
-            y = py + max(0, (ph - h) // 2)
-            self.win.geometry(f"{w}x{h}+{x}+{y}")
-        except Exception:
-            pass
+        max_w = self.win.winfo_screenwidth() - 40
+        max_h = self.win.winfo_screenheight() - 80
+        # Never smaller than the base size, and wider or taller when a bigger Text Size needs it:
+        # otherwise the buttons on the right of the bottom row are cut off.
+        w = min(max(scaled_px(self.win, BASE_WIDTH), self.win.winfo_reqwidth()), max_w)
+        h = min(max(scaled_px(self.win, BASE_HEIGHT), self.win.winfo_reqheight()), max_h)
+        self.win.minsize(min(scaled_px(self.win, MIN_WIDTH), w), min(scaled_px(self.win, MIN_HEIGHT), h))
+
+        x = self.parent.winfo_rootx() + (self.parent.winfo_width() - w) // 2
+        y = self.parent.winfo_rooty() + (self.parent.winfo_height() - h) // 2
+        # Keep the whole window on the screen even when the main window sits near an edge.
+        x = max(0, min(x, self.win.winfo_screenwidth() - w))
+        y = max(0, min(y, max_h - h))
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
 
     def _build_ui(self) -> None:
         container = tk.Frame(self.win, bg=BG_CARD, padx=16, pady=12)

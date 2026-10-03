@@ -149,6 +149,31 @@ def test_choosing_a_search_result_leaves_the_music_playing(root: tk.Tk) -> None:
     engine.release_audio_file.assert_not_called()
 
 
+def _window_size(window: tk.Toplevel) -> tuple[int, int]:
+    width, height = window.geometry().split("+")[0].split("x")
+    return int(width), int(height)
+
+
+@pytest.mark.parametrize("text_size", ["Normal", "Extra Large"])
+def test_search_dialog_is_big_enough_for_its_contents(root: tk.Tk, text_size: str) -> None:
+    init_fonts(root, text_size)
+    # A window only has a real size once it is on screen, and the dialog follows its parent there.
+    root.geometry("+-3000+-3000")
+    root.deiconify()
+    root.update()
+    with _search_dialog(root, _playing_engine()) as dialog:
+        win = dialog.win
+        win.update()
+        width, height = _window_size(win)
+        # Everything fits, unless the screen itself is smaller than the contents.
+        assert width >= min(win.winfo_reqwidth(), win.winfo_screenwidth() - 40)
+        assert height >= min(win.winfo_reqheight(), win.winfo_screenheight() - 80)
+        # Roomier than the old fixed 760x560, which cut off the buttons on the right.
+        assert width >= min(900, win.winfo_screenwidth() - 40)
+        assert height >= min(660, win.winfo_screenheight() - 80)
+        dialog._do_cancel()
+
+
 def test_search_dialog_stops_the_preview_it_started(root: tk.Tk) -> None:
     engine = _playing_engine()
     with _search_dialog(root, engine) as dialog:
