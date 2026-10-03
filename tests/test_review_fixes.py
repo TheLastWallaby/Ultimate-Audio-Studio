@@ -808,3 +808,90 @@ def test_startup_removes_the_apps_own_unfinished_files_and_nothing_else(tmp_path
     assert LibraryController.recover_stranded_deletes(str(tmp_path)) == len(leftovers)
 
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(kept)
+
+
+# --- Drawing the lists never waits for the disk ---------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _disk_checks_on_this_thread() -> Any:
+    """Count the file look-ups (exists, stat, size, date) made by the thread that enters this block."""
+    import os
+    import threading
+
+    me = threading.get_ident()
+    seen: list[str] = []
+    with contextlib.ExitStack() as stack:
+        for name in ("os.stat", "os.path.exists", "os.path.isfile", "os.path.getmtime", "os.path.getsize"):
+            module, _, attr = name.rpartition(".")
+            real = getattr(os.path if module == "os.path" else os, attr)
+
+            def _counted(*args: Any, _real: Any = real, _name: str = name, **kwargs: Any) -> Any:
+                if threading.get_ident() == me:
+                    seen.append(f"{_name}({args[0]})")
+                return _real(*args, **kwargs)
+
+            stack.enter_context(patch(name, _counted))
+        yield seen
+
+
+def _titled_library(window: Any, folder: Path, count: int) -> None:
+    """A Library of ``count`` songs whose titles ("Tune 0"...) are in the details cache."""
+    _library(window, folder, *[f"file{i}.mp3" for i in range(count)])
+    for i in range(count):
+        details = {"title": f"Tune {i}", "artist": "The Band", "duration": 61.0}
+        cache_mgr.set_metadata(window._library_row_path(f"file{i}.mp3"), details)
+    window._song_rows = {}
+    window.refresh_library()
+    _pump(window, lambda: len(window._known_rows()) >= count)
+
+
+def test_typing_in_the_search_box_and_redrawing_the_lists_do_not_touch_the_disk(studio: Any, tmp_path: Path) -> None:
+    _titled_library(studio, tmp_path / "lib", 30)
+    _set_playlist(studio, [studio._library_row_path("file3.mp3"), studio._library_row_path("file4.mp3")])
+    studio.entry_search.insert(0, "tune 2")
+
+    with _disk_checks_on_this_thread() as noticed:  # the counter does see what the old code did per row
+        studio._cached_duration(studio._library_row_path("file0.mp3"), probe=False)
+    assert len(noticed) >= 3
+
+    with _disk_checks_on_this_thread() as disk:
+        studio.apply_library_filter()
+        studio.refresh_playlist_listbox()
+
+    assert disk == []
+    shown = list(studio.listbox_lib.get(0, tk.END))
+    assert shown[0] == "Tune 2 — The Band [01:01]"
+    assert len(shown) == 11  # "Tune 2" and "Tune 20" to "Tune 29": found by title, not by file name
+    assert studio.listbox_pl.get(0) == "01. Tune 3 — The Band [01:01]"
+
+
+def test_a_long_library_is_drawn_from_file_names_first_and_filled_in_by_the_worker(studio: Any, tmp_path: Path) -> None:
+    from app.ui.features import library as library_feature
+
+    with patch.object(library_feature, "SYNC_ROW_LIMIT", 5):
+        _titled_library(studio, tmp_path / "lib", 12)
+        studio._song_rows = {}  # as at start-up: nothing read yet, and more rows than are looked up at once
+
+        with _disk_checks_on_this_thread() as disk:
+            studio.apply_library_filter()
+        assert disk == []
+        assert studio.listbox_lib.get(0) == "file0"
+
+        studio._warm_library_metadata()
+        _pump(studio, lambda: studio.listbox_lib.get(0) != "file0")
+    assert studio.listbox_lib.get(0) == "Tune 0 — The Band [01:01]"
+
+
+def test_a_playlist_song_whose_file_is_gone_is_marked_after_the_next_read(studio: Any, tmp_path: Path) -> None:
+    _titled_library(studio, tmp_path / "lib", 2)
+    gone = studio._library_row_path("file1.mp3")
+    _set_playlist(studio, [studio._library_row_path("file0.mp3"), gone])
+    assert "Missing" not in studio.listbox_pl.get(1)
+
+    Path(gone).unlink()
+    studio.refresh_library()
+    _pump(studio, lambda: "Missing" in studio.listbox_pl.get(1))
+
+    assert studio.listbox_pl.get(1) == "02. ⚠️ [Missing] file1.mp3"
+    assert studio.listbox_pl.get(0) == "01. Tune 0 — The Band [01:01]"

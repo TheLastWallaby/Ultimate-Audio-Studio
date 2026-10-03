@@ -7,17 +7,18 @@ import logging
 import os
 import time
 import tkinter as tk
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tkinter import filedialog
 from typing import Any
 
-from app.config import AUDIO_EXTS, format_time, log_error, sanitize_filename
+from app.config import AUDIO_EXTS, sanitize_filename
 from app.controllers.library_controller import ImportResult
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.metadata import read_track_metadata
 from app.core.task_manager import task_mgr
+from app.models import SongRow
 from app.platform_utils import has_recycle_bin
 from app.ui import dialogs
 from app.ui.components import listbox_selection
@@ -33,6 +34,60 @@ NEW_SONG_ROW_BG = "#dcfce7"
 LARGE_IMPORT_SONGS = 200
 LARGE_IMPORT_BYTES = 2 * 1024**3
 LIBRARY_WATCH_MS = 12000
+# Up to this many rows whose details are not in memory yet are looked up at once (a few disk checks
+# each, no file is opened). Above it the rows show their file names until the background reader has
+# been through them, so a long list is never drawn at the speed of the disk.
+SYNC_ROW_LIMIT = 50
+
+
+def _row_label(title: str, artist: str, filename: str) -> str:
+    """'Title — Artist' from the tags when present, else the file name without its extension."""
+    title = title.strip() or Path(filename).stem
+    artist = artist.strip()
+    if artist.endswith(" - Topic"):  # YouTube's auto-generated artist channels
+        artist = artist[: -len(" - Topic")]
+    if artist and artist.lower() not in title.lower():
+        return f"{title} — {artist}"
+    return title
+
+
+def _placeholder_row(path: str) -> SongRow:
+    """The row for a song whose details have not been read yet: its file name."""
+    song = Path(path)
+    return SongRow(label=song.stem, searchable=song.name.lower())
+
+
+def _row_from_details(path: str, details: Mapping[str, Any]) -> SongRow:
+    name = Path(path).name
+    title, artist = str(details.get("title") or ""), str(details.get("artist") or "")
+    return SongRow(
+        label=_row_label(title, artist, name),
+        seconds=float(details.get("duration") or 0.0),
+        searchable=f"{name} {title} {artist}".lower(),
+    )
+
+
+def _remembered_row(path: str) -> SongRow | None:
+    """The row for ``path`` from the details cache (a few disk checks); None when they were never read."""
+    # The cache first: it answers None for a song that is gone as well as for one never read, so a
+    # song that vanishes while this runs is reported missing and never handed on to the tag reader.
+    details = cache_mgr.get_metadata(path)
+    if details is not None:
+        return _row_from_details(path, details)
+    song = Path(path)
+    if not song.is_file():
+        return SongRow(label=song.stem, searchable=song.name.lower(), missing=True)
+    return None
+
+
+def read_song_row(path: str) -> SongRow:
+    """The row for ``path``, reading the song's tags when they are not cached yet (worker threads only)."""
+    row = _remembered_row(path)
+    if row is not None:
+        return row
+    details = read_track_metadata(path)
+    cache_mgr.set_metadata(path, details)
+    return _row_from_details(path, details.to_dict())
 
 
 def _size_text(size_bytes: int) -> str:
@@ -60,6 +115,28 @@ class LibraryMixin(AppBase):
     _unavailable_library_folder: str | None = None
     # True while the Library watcher is reading the folder on a worker (one read at a time).
     _library_scan_running = False
+
+    def _known_rows(self) -> dict[str, SongRow]:
+        """The rows read so far, by path (as the lists spell it)."""
+        rows: dict[str, SongRow] | None = vars(self).get("_song_rows")
+        if rows is None:
+            rows = self._song_rows = {}
+        return rows
+
+    def _song_rows_for(self, paths: Sequence[str]) -> list[SongRow]:
+        """Rows for drawing a list now, from memory.
+
+        A few rows that are not in memory yet are looked up at once (``SYNC_ROW_LIMIT``); when there
+        are many, they show their file names until the background reader has filled them in.
+        """
+        known = self._known_rows()
+        unknown = [path for path in paths if path not in known]
+        if len(unknown) <= SYNC_ROW_LIMIT:
+            for path in unknown:
+                row = _remembered_row(path)
+                if row is not None:
+                    known[path] = row
+        return [known.get(path) or _placeholder_row(path) for path in paths]
 
     def _library_row_path(self, filename: str) -> str:
         """Path of a Library row, in the exact form the player and the playlists keep it in.
@@ -220,81 +297,76 @@ class LibraryMixin(AppBase):
         return False
 
     def _warm_library_metadata(self) -> None:
-        """Read tags/durations for songs not yet cached on a worker thread, then refresh the lists once."""
-        paths = [os.path.join(self.library_folder, f) for f in self.library_files]
-        paths += [f for f in getattr(self, "playlist_files", []) if f not in paths]
-        missing = [p for p in paths if cache_mgr.get_metadata(p) is None]
-        if not missing:
-            return
+        """Read every listed song's details on a worker, then redraw the lists if anything changed.
+
+        This is the only place the lists' details come from the disk: tags of songs that were never
+        read, and whether each song is still there. Drawing a list uses what was read here.
+        """
+        paths = [self._library_row_path(name) for name in self.library_files]
+        listed = set(paths)
+        paths += [path for path in self.playlist_files if path not in listed]
+        known = self._known_rows()
+        unread = sum(1 for path in paths if path not in known)
         self._library_meta_gen += 1
         gen = self._library_meta_gen
-        if len(missing) > 20:
-            self.set_status(f"Reading song details for {len(missing)} songs...", icon="⏳")
+        announce = unread > 20
+        if announce:
+            self.set_status(f"Reading song details for {unread} songs...", icon="⏳")
 
         def _worker() -> None:
-            for path in missing:
-                if getattr(self, "_is_shutting_down", False) or gen != self._library_meta_gen:
+            rows: dict[str, SongRow] = {}
+            for path in paths:
+                if self._is_shutting_down or gen != self._library_meta_gen:
                     return
                 try:
-                    cache_mgr.set_metadata(path, read_track_metadata(path))
-                except Exception as e:
-                    log_error(f"metadata warm-up {path}: {e}")
-            self._safe_after(0, self._on_library_metadata_ready, gen, len(missing))
+                    rows[path] = read_song_row(path)
+                except OSError as err:  # the drive went away mid-read: the row keeps its file name
+                    logger.warning("Could not read the details of %s: %s", Path(path).name, err)
+                    rows[path] = _placeholder_row(path)
+            self._safe_after(0, self._on_library_metadata_ready, gen, rows, announce)
 
         task_mgr.submit_task(_worker)
 
-    def _on_library_metadata_ready(self, gen: int, count: int) -> None:
-        if gen != self._library_meta_gen or getattr(self, "_is_shutting_down", False):
+    def _on_library_metadata_ready(self, gen: int, rows: dict[str, SongRow], announce: bool) -> None:
+        """Keep the rows the worker read; redraw both lists when they differ from what is showing."""
+        if gen != self._library_meta_gen or self._is_shutting_down:
             return
-        self.library_ctrl.invalidate_search_index()
-        self.apply_library_filter(preserve_view=True)
-        pl_selection = listbox_selection(self.listbox_pl)
-        pl_view = self.listbox_pl.yview()[0]
-        self.refresh_playlist_listbox()
-        for idx in pl_selection:
-            self.listbox_pl.selection_set(idx)
-        self.listbox_pl.yview_moveto(pl_view)
-        if count > 20:
+        changed = rows != self._known_rows()
+        self._song_rows = rows
+        if changed:
+            self.apply_library_filter(preserve_view=True)
+            pl_selection = listbox_selection(self.listbox_pl)
+            pl_view = self.listbox_pl.yview()[0]
+            self.refresh_playlist_listbox()
+            for idx in pl_selection:
+                self.listbox_pl.selection_set(idx)
+            self.listbox_pl.yview_moveto(pl_view)
+        if announce:
             self.set_status("Ready. Select a song on the left to play or trim.")
 
     def _display_name(self, path: str, filename: str | None = None) -> str:
         """Friendly row text: 'Title — Artist' from tags when present, else the file name without extension."""
         meta = self._cached_metadata(path, probe=False)
-        stem = os.path.splitext(filename or os.path.basename(path))[0]
-        title = (meta.get("title") or "").strip() or stem
-        artist = (meta.get("artist") or "").strip()
-        if artist.endswith(" - Topic"):
-            artist = artist[: -len(" - Topic")]
-        if artist and artist.lower() not in title.lower():
-            return f"{title} — {artist}"
-        return title
+        return _row_label(str(meta.get("title") or ""), str(meta.get("artist") or ""), filename or Path(path).name)
 
     def apply_library_filter(self, select_name: str | None = None, preserve_view: bool = False) -> None:
+        """Draw the Library list for what is typed in the search box, from memory (no disk access)."""
         query = self.entry_search.get().strip().lower() if hasattr(self, "entry_search") else ""
-        prev_selected = set()
+        prev_selected: set[str] = set()
         prev_view = None
         if preserve_view:
             prev_selected = {
                 self.visible_files[i] for i in listbox_selection(self.listbox_lib) if i < len(self.visible_files)
             }
             prev_view = self.listbox_lib.yview()[0]
-        if hasattr(self, "library_ctrl"):
-            self.visible_files = self.library_ctrl.filter_files(
-                self.library_files,
-                self.library_folder,
-                query,
-                get_metadata_fn=lambda path: self._cached_metadata(path, probe=False),
-            )
-        else:
-            self.visible_files = list(self.library_files)
+        paths = [self._library_row_path(f) for f in self.library_files]
+        rows = dict(zip(self.library_files, self._song_rows_for(paths), strict=True))
+        self.visible_files = [f for f in self.library_files if query in rows[f].searchable]
 
         self.listbox_lib.delete(0, tk.END)
         select_idx = None
         for idx, f in enumerate(self.visible_files):
-            f_path = os.path.join(self.library_folder, f)
-            dur = self._cached_duration(f_path, probe=False)
-            dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
-            self.listbox_lib.insert(tk.END, f"{self._display_name(f_path, f)}{dur_str}")
+            self.listbox_lib.insert(tk.END, rows[f].text)
             if f in self._fresh_songs:
                 self.listbox_lib.itemconfig(idx, background=NEW_SONG_ROW_BG)
             if select_name and f == select_name:
