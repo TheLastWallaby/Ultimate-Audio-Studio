@@ -593,9 +593,7 @@ class LibraryMixin(AppBase):
         if reachable:
             self.set_status("Your music folder is back: your songs are showing again.")
         else:
-            self.set_status(
-                "Your music folder cannot be found. If it is on a USB drive, plug it in again.", icon="⚠️"
-            )
+            self.set_status("Your music folder cannot be found. If it is on a USB drive, plug it in again.", icon="⚠️")
 
     def rename_library_file(self) -> None:
         """Rename the selected song; its playlist entries and its trim backup follow it."""
