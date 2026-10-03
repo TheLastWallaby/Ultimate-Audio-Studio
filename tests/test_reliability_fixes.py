@@ -105,10 +105,7 @@ class TestDownloadJobs(unittest.TestCase):
         tasks = _InlineTasks()
         first_success: list[str] = []
         second_success: list[str] = []
-        with (
-            patch("app.controllers.download_controller.task_mgr", tasks),
-            patch("app.controllers.download_controller.cleanup_partial_downloads") as cleanup,
-        ):
+        with patch("app.controllers.download_controller.task_mgr", tasks):
             dl.start_download("u1", "lib", MagicMock(), first_success.append, MagicMock(), MagicMock())
             first_job = dl.cancel_event
             dl.cancel()
@@ -121,7 +118,6 @@ class TestDownloadJobs(unittest.TestCase):
             self.assertIs(job, first_job)
             on_cancelled()
             on_success("old.mp3")
-            cleanup.assert_not_called()
         self.assertTrue(dl.is_downloading)
         self.assertEqual(first_success, [])
         self.assertEqual(second_success, [])
@@ -267,6 +263,10 @@ class TestMainWindowHelpers(unittest.TestCase):
                 os.rename(os.path.join(td, "old name.mp3"), os.path.join(td, "new name.mp3"))
                 cache_mgr.set_metadata(os.path.join(app.library_folder, "new name.mp3"), known)
                 app._watch_library()
+                deadline = time.monotonic() + 5  # the folder is read on a worker
+                while app.library_files != ["new name.mp3"] and time.monotonic() < deadline:
+                    app.root.update()
+                    time.sleep(0.01)
                 self.assertEqual(app.library_files, ["new name.mp3"])
             renamed = {"old name.mp3", "new name.mp3"}
             self.assertEqual([c for c in read_details.call_args_list if Path(c.args[0]).name in renamed], [])

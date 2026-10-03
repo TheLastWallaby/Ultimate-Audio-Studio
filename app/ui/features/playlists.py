@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import tkinter as tk
 from pathlib import Path
 
-from app.config import PLAYLISTS_PATH, format_time, log_error, sanitize_filename
+import pygame
+
+from app.config import PLAYLISTS_PATH, log_error, sanitize_filename
 from app.controllers.playlist_controller import PlaylistLoadResult
 from app.ui import dialogs
 from app.ui.components import listbox_nearest, listbox_selection
 from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
+
+logger = logging.getLogger(__name__)
+# Pause before moving past a playlist song whose file is gone, so the status message can be read.
+MISSING_SONG_SKIP_MS = 350
 
 
 class PlaylistMixin(AppBase):
@@ -19,6 +27,8 @@ class PlaylistMixin(AppBase):
 
     # True while saving keeps failing, so the warning is shown once and not after every change.
     _playlist_save_failing = False
+    # Tk ``after`` id of the pending move past a missing playlist song (cancelled by any stop).
+    _pl_skip_timer: str | None = None
 
     def load_playlists(self) -> None:
         result = self.playlist_ctrl.load(PLAYLISTS_PATH)
@@ -105,17 +115,14 @@ class PlaylistMixin(AppBase):
             self.playlist_var.set(names[0])
 
     def refresh_playlist_listbox(self) -> None:
+        """Draw the active playlist from memory (no disk access: it is redrawn on every drag step)."""
         self.listbox_pl.delete(0, tk.END)
         self.playlist_files = self.playlist_ctrl.get_active_tracks(self.active_playlist_name)
-        for idx, f in enumerate(self.playlist_files, 1):
-            name = os.path.basename(f)
+        rows = self._song_rows_for(self.playlist_files)
+        for idx, (path, row) in enumerate(zip(self.playlist_files, rows, strict=True), 1):
             prefix = "▶ " if (self.is_playing_playlist and idx - 1 == self.playlist_index) else f"{idx:02d}. "
-            if not os.path.exists(f):
-                self.listbox_pl.insert(tk.END, f"{prefix}⚠️ [Missing] {name}")
-                continue
-            dur = self._cached_duration(f, probe=False)
-            dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
-            self.listbox_pl.insert(tk.END, f"{prefix}{self._display_name(f)}{dur_str}")
+            text = f"⚠️ [Missing] {Path(path).name}" if row.missing else row.text
+            self.listbox_pl.insert(tk.END, f"{prefix}{text}")
 
     def on_playlist_selected(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         name = self.playlist_var.get()
@@ -140,6 +147,10 @@ class PlaylistMixin(AppBase):
         if not self.playlist_ctrl.create_playlist(name):
             dialogs.show_warning(self.root, "Already Exists", f"A playlist named '{name}' already exists.")
             return
+        if self.is_playing_playlist:
+            # The new, empty playlist is now the active one: playback would otherwise go on showing
+            # "PLAYING" in silence after this song, or play a song of the new list by its old position.
+            self.stop_audio(user=True)
         self.save_playlists()
         self.refresh_playlist_dropdown()
         self.refresh_playlist_listbox()
@@ -358,25 +369,14 @@ class PlaylistMixin(AppBase):
             self.set_status("Finished playlist.")
             self._load_pending_selection()
 
-    def _play_current_pl_track(self) -> None:
+    def _play_current_pl_track(self, skipped: int = 0) -> None:
+        """Play the playlist song at ``playlist_index``; ``skipped`` counts missing songs passed on the way."""
+        self._pl_skip_timer = None
         if not self.playlist_files or not (0 <= self.playlist_index < len(self.playlist_files)):
             return
         path = self.playlist_files[self.playlist_index]
-        if not os.path.exists(path):
-            self.set_status(f"Skipping missing song: {os.path.basename(path)}", icon="⚠️")
-            if self.playlist_index + 1 < len(self.playlist_files):
-                self.playlist_index += 1
-                self.root.after(350, self._play_current_pl_track)
-            elif self.repeat_playlist.get() and len(self.playlist_files) > 1:
-                self.playlist_index = 0
-                self.root.after(350, self._play_current_pl_track)
-            else:
-                self.stop_audio(user=True)
-                dialogs.show_warning(
-                    self.root,
-                    "File Missing",
-                    f"Audio track not found:\n{path}\n\nPlease verify or remove it from the playlist.",
-                )
+        if not Path(path).exists():
+            self._skip_missing_pl_track(path, skipped + 1)
             return
         self.stop_audio()
         if not self._load_track_ui(path):
@@ -388,13 +388,54 @@ class PlaylistMixin(AppBase):
                 return
             try:
                 self.playback_ctrl.play_track(path, 0.0, is_playlist=True)
-                self._set_card_playing_state("playing")
-                self.refresh_playlist_listbox()
-                self.set_status(
-                    f"Playlist ({index + 1}/{len(self.playlist_files)}): {os.path.basename(path)}", icon="▶"
-                )
-            except Exception as e:
-                log_error(f"_play_current_pl_track: {e}")
-                show_friendly_error(self.root, e, "playback")
+            except (pygame.error, OSError) as err:
+                logger.error("Could not play the playlist song %s: %s", Path(path).name, err)
+                show_friendly_error(self.root, err, "playback")
+                return
+            self._set_card_playing_state("playing")
+            self.refresh_playlist_listbox()
+            self.set_status(f"Playlist ({index + 1}/{len(self.playlist_files)}): {Path(path).name}", icon="▶")
 
         self._when_playable(path, _start)
+
+    def _skip_missing_pl_track(self, path: str, skipped: int) -> None:
+        """Move past a playlist song whose file is gone; stop once every song has been tried.
+
+        With Repeat on, a playlist whose songs are all missing (a USB drive that was unplugged) used to
+        be skipped through forever, and Stop could not end it.
+        """
+        total = len(self.playlist_files)
+        self.set_status(f"Skipping missing song: {Path(path).name}", icon="⚠️")
+        next_index = self.playlist_index + 1
+        if next_index >= total and self.repeat_playlist.get():
+            next_index = 0
+        if next_index < total and skipped < total:
+            self.playlist_index = next_index
+            self._pl_skip_timer = self.root.after(MISSING_SONG_SKIP_MS, self._play_current_pl_track, skipped)
+            return
+        self.stop_audio(user=True)
+        self._warm_library_metadata()  # the lists learn on a worker which songs are gone, and mark them
+        plug_in = "If your music is on a USB drive or memory card, plug it in and try again."
+        if skipped >= total:
+            self.set_status("None of the songs in this playlist could be found.", icon="⚠️")
+            dialogs.show_warning(
+                self.root,
+                "Songs Not Found",
+                f"None of the songs in the playlist '{self.active_playlist_name}' could be found.\n\n"
+                f"{plug_in}\n\nOtherwise, remove the missing songs (marked ⚠️) from the playlist.",
+            )
+            return
+        self.set_status(f"Song not found: {Path(path).name}. The playlist stopped.", icon="⚠️")
+        dialogs.show_warning(
+            self.root,
+            "Song Not Found",
+            f"The song '{Path(path).name}' could not be found, so the playlist stopped.\n\n"
+            f"{plug_in}\n\nOtherwise, remove it from the playlist (it is marked ⚠️).",
+        )
+
+    def _cancel_pending_skip(self) -> None:
+        """Forget a pending move past a missing song, so it cannot start the playlist after a stop."""
+        timer, self._pl_skip_timer = self._pl_skip_timer, None
+        if timer is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(timer)

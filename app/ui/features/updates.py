@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import tkinter as tk
 
 from app.config import APP_VERSION
 from app.models import ReleaseInfo
 from app.services.updater import PendingUpdate
 from app.ui import dialogs
+from app.ui.error_dialog import show_friendly_error
 from app.ui.features.base import AppBase
+
+# How often a window that stays open looks for a new release again.
+UPDATE_RECHECK_MS = 6 * 60 * 60 * 1000
 
 
 class UpdatesMixin(AppBase):
@@ -18,13 +23,27 @@ class UpdatesMixin(AppBase):
     the only visible sign is the status-bar badge, so nothing pops up while someone is starting work.
     """
 
+    # True after a download failed in a way an update fixes: the update is then wanted now, not "next time".
+    _update_wanted_now = False
+
     def _check_for_updates_on_launch(self) -> None:
-        """Silently check for updates in a background thread after launch."""
-        if getattr(self, "_is_shutting_down", False):
+        """Silently check for updates on a worker: after launch, and again every few hours.
+
+        The app is often left open for days (the PC only sleeps). A check that failed because the
+        PC was offline at start-up, or a release published since, would otherwise never be seen.
+        """
+        if self._is_shutting_down:
             return
+        timer, self._timer_update_check = self._timer_update_check, None
+        if timer is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(timer)
+        if self._available_update is not None:
+            return  # already found: nothing more to look for in this session
         self.update_ctrl.check_on_launch(
             on_update_found=lambda rel: self._safe_after(0, self._handle_update_found, rel)
         )
+        self._timer_update_check = self.root.after(UPDATE_RECHECK_MS, self._check_for_updates_on_launch)
 
     def _show_update_badge(self, text: str) -> None:
         if hasattr(self, "btn_update_badge") and self.btn_update_badge.winfo_exists():
@@ -45,6 +64,13 @@ class UpdatesMixin(AppBase):
         if getattr(self, "_is_shutting_down", False) or pending is None:
             return
         self._show_update_badge(f"⭐ {pending.tag} ready: installs next time you open the app")
+        if self._update_wanted_now:
+            self.set_status(
+                f"A new version ({pending.tag}) that may fix downloads is ready. Click the ⭐ button at the "
+                "bottom right to restart and install it now.",
+                icon="⭐",
+            )
+            return
         self.set_status(
             f"A new version ({pending.tag}) has been downloaded. It will be installed the next time you open the app.",
             icon="⭐",
@@ -84,11 +110,7 @@ class UpdatesMixin(AppBase):
             self._open_update_dialog()
         elif err:
             self.set_status("Update check failed.", icon="⚠️")
-            dialogs.show_warning(
-                self.root,
-                "Could Not Check for Updates",
-                f"{err}\n\nCheck your internet connection and try again later.",
-            )
+            show_friendly_error(self.root, err, "update")  # the raw text stays under "Copy Details"
         else:
             self.set_status(f"Ultimate Audio Studio is up to date (v{APP_VERSION}).", icon="✅")
             dialogs.show_info(

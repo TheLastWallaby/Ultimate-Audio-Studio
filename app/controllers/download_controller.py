@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -9,7 +10,6 @@ from typing import Any
 from app.core.task_manager import task_mgr
 from app.models import SearchResult
 from app.services.downloader import (
-    cleanup_partial_downloads,
     download_audio_worker,
     download_playlist_worker,
     has_video_id,
@@ -18,6 +18,8 @@ from app.services.downloader import (
     resolve_download_query,
     search_youtube_worker,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DownloadController:
@@ -44,7 +46,12 @@ class DownloadController:
         self._download_cancel.set()
 
     def reset_cancel(self) -> threading.Event:
-        """Start a new job: give it a fresh cancel event (earlier jobs keep their own, possibly set, event)."""
+        """Start a new job: give it a fresh cancel event (earlier jobs keep their own, possibly set, event).
+
+        A replaced job can no longer report back, so it cannot clear ``is_downloading`` either: left
+        set, the app would warn "still downloading" at every close and keep the PC awake for good.
+        """
+        self.is_downloading = False
         self._download_cancel = threading.Event()
         return self._download_cancel
 
@@ -72,23 +79,26 @@ class DownloadController:
         """Check if URL names a single video (so "just this song" can be offered)."""
         return has_video_id(url)
 
-    def probe_playlist(self, url: str, on_done: Callable[[dict[str, Any] | None], None]) -> None:
+    def probe_playlist(self, url: str, on_done: Callable[[dict[str, Any] | None, str | None], None]) -> None:
         """Read a playlist's title and songs in the background, as a job Stop can cancel.
 
-        ``on_done(info)`` gets ``{"title", "count", "entries"}`` or None when it could not be read.
+        ``on_done(info, error)`` gets ``{"title", "count", "entries"}`` (None when the playlist has no
+        songs), or None and the reason when YouTube could not be reached or read.
         """
         job = self.reset_cancel()
 
         def _worker() -> None:
-            info = probe_playlist_info(url)
+            info: dict[str, Any] | None = None
+            error: str | None = None
+            try:
+                info = probe_playlist_info(url)
+            except Exception as err:  # last-resort guard: yt-dlp raises many kinds; the window must hear back
+                logger.warning("Reading the playlist %s failed: %s", url, err)
+                error = str(err)
             if not job.is_set():
-                self._for_job(job, on_done)(info)
+                self._for_job(job, on_done)(info, error)
 
         task_mgr.submit_task(_worker)
-
-    def cleanup_partial(self, library_folder: str) -> None:
-        """Clean up incomplete or temporary download artifacts."""
-        cleanup_partial_downloads(library_folder)
 
     def start_search(
         self,
@@ -111,21 +121,21 @@ class DownloadController:
         on_error: Callable[[str], None],
     ) -> None:
         """Execute audio download in background thread."""
-        self.is_downloading = True
         job = self.reset_cancel()
+        self.is_downloading = True
 
         def _worker_success(fname: str) -> None:
             self.is_downloading = False
             on_success(fname)
 
+        # A download works in a folder of its own, which its worker removes: nothing is left in the
+        # Library to clean up after a stop or a failure.
         def _worker_cancelled() -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_cancelled()
 
         def _worker_error(err: str) -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_error(err)
 
         task_mgr.submit_task(
@@ -159,17 +169,15 @@ class DownloadController:
         true (an update restart is refused) before the first track starts. Pass ``probed`` (from
         :meth:`probe_playlist`) to skip scanning again.
         """
-        self.is_downloading = True
         job = self.reset_cancel()
+        self.is_downloading = True
 
         def _cancelled() -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_cancelled()
 
         def _error(err: str) -> None:
             self.is_downloading = False
-            cleanup_partial_downloads(library_folder)
             on_error(err)
 
         def _batch_complete(downloaded_files: list[str], total: int) -> None:
@@ -177,7 +185,12 @@ class DownloadController:
             on_batch_complete(downloaded_files, total)
 
         def _worker() -> None:
-            info = probed if probed is not None else probe_playlist_info(url)
+            try:
+                info = probed if probed is not None else probe_playlist_info(url)
+            except Exception as err:  # last-resort guard: yt-dlp raises many kinds; the window must hear back
+                logger.warning("Reading the playlist %s failed: %s", url, err)
+                self._for_job(job, _error)(str(err))
+                return
             if job.is_set():
                 self._for_job(job, _cancelled)()
                 return

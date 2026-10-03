@@ -261,6 +261,24 @@ def draw_placeholder_cover(canvas: tk.Canvas) -> None:
     _oval(28, 32, fill="#0f172a", outline="")
 
 
+def jump_to_click(scale: tk.Scale) -> None:
+    """Make a click on a slider's bar move the handle to that spot (it can then be dragged on).
+
+    Tk answers a click beside the handle with one tiny step (0.1 s on the timeline, 1% of the
+    volume), which looks as if nothing happened. Call this after the slider's other press bindings:
+    it ends the event, so that Tk's own step does not follow.
+    """
+
+    def _press(event: tk.Event[tk.Scale]) -> str | None:
+        if scale.identify(event.x, event.y) not in ("trough1", "trough2"):
+            return None  # on the handle: Tk's normal drag
+        # Tk's middle-button handler does exactly this: set the value under the pointer, start a drag.
+        scale.tk.call("tk::ScaleButton2Down", str(scale), event.x, event.y)
+        return "break"
+
+    scale.bind("<ButtonPress-1>", _press, add="+")
+
+
 # Typed adapters: typeshed leaves Listbox.curselection/nearest unannotated, which --strict rejects.
 def listbox_selection(listbox: tk.Listbox) -> tuple[int, ...]:
     """Indices of the selected rows."""

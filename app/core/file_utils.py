@@ -24,12 +24,23 @@ def replace_with_retry(src: str | Path, dest: str | Path) -> None:
     os.replace(src, dest)
 
 
+def fsync_file(path: str | Path) -> None:
+    """Write a file's cached data through to the disk; raises OSError.
+
+    Windows records a rename on disk before the data of the renamed file, so after a power cut a
+    file swapped into place without this can be empty, with the file it replaced already gone.
+    """
+    with open(path, "rb+") as f:
+        os.fsync(f.fileno())
+
+
 def copy_file_atomic(src: str | Path, dest: str | Path) -> None:
     """Copy ``src`` to ``dest`` so that ``dest`` ends up either complete or exactly as it was.
 
     The copy is written next to ``dest`` under a temporary name, checked against the size of the
-    source, and only then renamed into place. A source that disappears halfway (an unplugged drive,
-    a full disk) therefore never leaves a cut-off file under the real name. Raises OSError.
+    source, written through to the disk, and only then renamed into place. A source that disappears
+    halfway (an unplugged drive, a full disk) or a power cut therefore never leaves a cut-off file
+    under the real name. Raises OSError.
     """
     src, dest = Path(src), Path(dest)
     partial = dest.with_name(f"{dest.name}.{os.getpid()}.partial")
@@ -37,6 +48,7 @@ def copy_file_atomic(src: str | Path, dest: str | Path) -> None:
         shutil.copy2(src, partial)
         if partial.stat().st_size != src.stat().st_size:
             raise OSError(f"the copy of {src.name} is incomplete")
+        fsync_file(partial)
         replace_with_retry(partial, dest)
     except OSError:
         with contextlib.suppress(OSError):
@@ -55,13 +67,15 @@ def unused_path(dest: str | Path) -> Path:
 
 
 def atomic_save_json(filepath: str | Path, data: Any) -> None:
-    """Atomically write JSON data to avoid corruption during crashes or power cuts."""
+    """Atomically write JSON data to avoid corruption during crashes or power cuts (see ``fsync_file``)."""
     p = Path(filepath).resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = p.with_name(f"{p.name}.{os.getpid()}_{int(time.time() * 1000)}.tmp")
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp_path.replace(p)
     except Exception:
         with contextlib.suppress(FileNotFoundError):
