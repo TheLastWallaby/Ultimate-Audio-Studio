@@ -8,7 +8,7 @@ from typing import Literal
 
 __all__ = ["FriendlyError", "friendly_error", "is_recognised"]
 
-ErrorContext = Literal["download", "search", "export", "save_clip", "playback", "import", "generic"]
+ErrorContext = Literal["download", "search", "export", "save_clip", "playback", "import", "update", "generic"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -38,6 +38,16 @@ _OFFLINE_STEPS = (
     "• Check that your computer is connected to the internet.\n"
     "• Open a web page to confirm the connection works.\n"
     "• Then try again."
+)
+
+_OFFLINE_RULE = _Rule(
+    re.compile(
+        r"getaddrinfo|name resolution|failed to resolve|timed out|timeout|connection (?:refused|reset|aborted)"
+        r"|network is unreachable|unable to download (?:webpage|api page)|urlopen error|no internet",
+        re.I,
+    ),
+    "No Internet Connection",
+    f"The app could not reach the internet.\n\n{_OFFLINE_STEPS}",
 )
 
 # Evaluated in order; the first match wins.
@@ -125,15 +135,7 @@ _RULES: tuple[_Rule, ...] = (
         "The built-in audio tool could not process this song.\n\n"
         "• The file may be damaged. Try a different song or download it again.",
     ),
-    _Rule(
-        re.compile(
-            r"getaddrinfo|name resolution|failed to resolve|timed out|timeout|connection (?:refused|reset|aborted)"
-            r"|network is unreachable|unable to download (?:webpage|api page)|urlopen error|no internet",
-            re.I,
-        ),
-        "No Internet Connection",
-        f"The app could not reach the internet.\n\n{_OFFLINE_STEPS}",
-    ),
+    _OFFLINE_RULE,
     _Rule(
         re.compile(r"http error 403|forbidden|http error 429|too many requests", re.I),
         "YouTube Refused the Download",
@@ -168,6 +170,13 @@ _GENERIC: dict[ErrorContext, FriendlyError] = {
         "• Try another song, or download this one again.",
     ),
     "import": FriendlyError("Could Not Add Songs", "Some songs could not be copied into your Library."),
+    "update": FriendlyError(
+        "Could Not Check for Updates",
+        "The app could not find out whether a newer version is available.\n\n"
+        "• Check that your computer is connected to the internet.\n"
+        "• Try again later: the update service may be busy.\n\n"
+        "You can keep using the app as it is.",
+    ),
     "generic": FriendlyError("Something Went Wrong", "The app hit an unexpected problem."),
 }
 
@@ -181,7 +190,10 @@ def is_recognised(raw: object) -> bool:
 def friendly_error(raw: object, context: ErrorContext = "generic") -> FriendlyError:
     """Map a raw exception or error string to a plain-language title and recovery message."""
     text = str(raw or "")
-    for rule in _RULES:
+    # An update check talks to GitHub: the rules about YouTube and files would misread its errors
+    # ("403 Forbidden" is not YouTube refusing a download), so only the connection is explained.
+    rules = (_OFFLINE_RULE,) if context == "update" else _RULES
+    for rule in rules:
         if rule.pattern.search(text):
             return FriendlyError(rule.title, rule.message, rule.suggests_update)
     return _GENERIC.get(context, _GENERIC["generic"])
