@@ -1,5 +1,6 @@
 """Automated unit tests verifying TaskManager, platform security, and models."""
 
+import sys
 import time
 import unittest
 
@@ -118,3 +119,11 @@ class TestModels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_app_does_not_use_pydub() -> None:
+    """pydub ran FFmpeg with no time limit and no way to stop it, and was removed in favour of run_ffmpeg."""
+    import app.main  # noqa: F401
+
+    assert "pydub" not in sys.modules
+    assert "audioop_lts" not in sys.modules
