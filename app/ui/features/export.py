@@ -29,9 +29,23 @@ def _listed(names: Sequence[str], limit: int = 6) -> str:
     return lines + (f"\n... and {len(names) - limit} more." if len(names) > limit else "")
 
 
-def export_problems(report: ExportReport) -> str:
-    """Plain-language list of everything an export did not do as asked; empty when it did it all."""
+def export_problems(report: ExportReport, drive: str = "The USB drive") -> str:
+    """Plain-language list of everything an export did not do as asked; empty when it did it all.
+
+    ``drive`` names where the songs went, for the message about a drive that gave out.
+    """
     parts = []
+    if report.stopped == "removed":
+        parts.append(
+            f"{drive} was unplugged or stopped working, so the export stopped after "
+            f"{report.exported} of {report.total} song(s).\n\n"
+            "• Plug the drive in again, then export the playlist again."
+        )
+    elif report.stopped == "full":
+        parts.append(
+            f"{drive} is full, so the export stopped after {report.exported} of {report.total} song(s).\n\n"
+            "• Delete files you no longer need from it, or use a bigger drive, then export the playlist again."
+        )
     if report.skipped:
         parts.append(f"{len(report.skipped)} song(s) could not be processed:\n{_listed(report.skipped)}")
     if report.not_leveled:
@@ -343,9 +357,16 @@ class ExportMixin(AppBase):
 
     def _usb_export_success(self, report: ExportReport, drive_label: str, drive_root: str) -> None:
         """Report a finished USB export and offer to eject the drive it was written to."""
-        self._end_export("USB export finished. Eject the drive before unplugging it.")
-        clean_pl = sanitize_filename(self.active_playlist_name or "Playlist")
         problems = export_problems(report)
+        if report.stopped == "removed":
+            self._end_export("USB export stopped: the drive was unplugged.")
+            dialogs.show_warning(self.root, "Export Stopped", problems)  # there is nothing left to eject
+            return
+        if report.stopped == "full":
+            self._end_export("USB export stopped: the drive is full. Eject the drive before unplugging it.")
+        else:
+            self._end_export("USB export finished. Eject the drive before unplugging it.")
+        clean_pl = sanitize_filename(self.active_playlist_name or "Playlist")
         if problems:
             msg = (
                 f"Exported {report.exported} of {report.total} song(s) to the USB flash drive (with "
@@ -366,7 +387,7 @@ class ExportMixin(AppBase):
     def _cd_export_success(self, cd_folder: str, report: ExportReport) -> None:
         """Report the prepared CD tracks and hand over to Windows Media Player for burning."""
         self._end_export("CD files are ready on your Desktop in 'My_CD_Burn_Folder'.")
-        problems = export_problems(report)
+        problems = export_problems(report, drive="This computer's disk")
         warn_text = f"\n\nNote: {problems}" if problems else ""
 
         # File Explorer's 'Send to / Burn to disc' makes a DATA disc that most CD players and car

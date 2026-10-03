@@ -100,7 +100,7 @@ class TestEdgeCasesAndFailureScenarios(unittest.TestCase):
             os.makedirs(dest_folder, exist_ok=True)
 
             status_messages: list[str] = []
-            completed_results: list[tuple[int, int, list[str]]] = []
+            completed_results: list[tuple[int, int, list[str], str]] = []
 
             with patch("shutil.copy2", side_effect=OSError(errno.ENOSPC, "No space left on device")):
                 usb_export_worker(
@@ -109,15 +109,11 @@ class TestEdgeCasesAndFailureScenarios(unittest.TestCase):
                     files_to_export=[src_file],
                     normalize=False,
                     on_status=lambda s: status_messages.append(s),
-                    on_success=lambda r: completed_results.append((r.exported, r.total, list(r.skipped))),
+                    on_success=lambda r: completed_results.append((r.exported, r.total, list(r.skipped), r.stopped)),
                 )
 
-            self.assertEqual(len(completed_results), 1)
-            success_count, total_count, skipped = completed_results[0]
-            self.assertEqual(success_count, 0)
-            self.assertEqual(total_count, 1)
-            self.assertEqual(len(skipped), 1)
-            self.assertIn("No space left on device", skipped[0])
+            # A full drive stops the export with one plain message, not a raw error per song.
+            self.assertEqual(completed_results, [(0, 1, [], "full")])
 
     def test_process_utils_ffmpeg_nonzero_exit(self) -> None:
         """Verify run_ffmpeg captures non-zero return codes and stderr without crashing."""

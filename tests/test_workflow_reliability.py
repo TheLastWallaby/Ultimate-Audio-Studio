@@ -475,3 +475,150 @@ def test_finished_usb_export_shows_the_songs_left_at_their_original_volume(studi
     assert warn.call_args[0][1] == "Export Finished with Some Problems"
     assert "Exported 2 of 2 song(s)" in warn.call_args[0][2]
     assert "quiet.mp3" in warn.call_args[0][2]
+
+
+# --- A USB drive that fills up or is pulled out during an export ------------------------------------
+
+
+def _three_songs(tmp_path: Path) -> list[str]:
+    return [str(_make_song(tmp_path / "library", f"song{i}.mp3")) for i in range(3)]
+
+
+def _copy_failing_on_second(fail: Callable[[Path], OSError]) -> tuple[Callable[..., None], list[str]]:
+    """copy_file_atomic that copies the first song, then fails with ``fail(dest)``; records each attempt."""
+    attempts: list[str] = []
+
+    def _copy(src: str | Path, dest: str | Path) -> None:
+        attempts.append(Path(dest).name)
+        if len(attempts) == 2:
+            raise fail(Path(dest))
+        copy_file_atomic(src, dest)
+
+    return _copy, attempts
+
+
+def test_full_usb_drive_stops_the_export_at_the_first_song_that_does_not_fit(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    copy, attempts = _copy_failing_on_second(lambda _dest: OSError(28, "No space left on device"))
+    done: list[ExportReport] = []
+
+    with patch("app.services.exporter.copy_file_atomic", side_effect=copy):
+        exporter.usb_export_worker(str(drive), "Trip", _three_songs(tmp_path), on_success=done.append)
+
+    assert done == [ExportReport(total=3, exported=1, stopped="full")]
+    assert len(attempts) == 2  # the third song was not tried
+    assert "01 - song0.mp3" in [p.name for p in drive.iterdir()]
+
+
+def test_unplugged_usb_drive_stops_the_export(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+
+    def _unplugged(_dest: Path) -> OSError:
+        for entry in drive.iterdir():
+            entry.unlink()
+        drive.rmdir()
+        return OSError(21, "The device is not ready")
+
+    copy, attempts = _copy_failing_on_second(_unplugged)
+    done: list[ExportReport] = []
+
+    with patch("app.services.exporter.copy_file_atomic", side_effect=copy):
+        exporter.usb_export_worker(str(drive), "Trip", _three_songs(tmp_path), on_success=done.append)
+
+    assert done == [ExportReport(total=3, exported=1, stopped="removed")]
+    assert len(attempts) == 2
+
+
+def test_full_drive_is_not_tried_again_after_ffmpeg_fails(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    done: list[ExportReport] = []
+    ffmpeg = MagicMock(return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
+
+    def _free_space(_folder: object) -> SimpleNamespace:
+        # Room on the drive until FFmpeg has filled it while encoding the first song.
+        return SimpleNamespace(total=1, used=1, free=0 if ffmpeg.called else 10**9)
+
+    with (
+        patch("app.services.exporter.measure_loudnorm", return_value=None),
+        patch("app.services.exporter.run_ffmpeg", ffmpeg),
+        patch("app.services.exporter.shutil.disk_usage", side_effect=_free_space),
+        patch("app.services.exporter.copy_file_atomic") as copy,
+    ):
+        exporter.usb_export_worker(str(drive), "Trip", _three_songs(tmp_path), normalize=True, on_success=done.append)
+
+    assert done == [ExportReport(total=3, exported=0, stopped="full")]
+    copy.assert_not_called()  # no fallback copy onto a full drive
+    assert ffmpeg.call_count == 2  # the first song's two encoding attempts; the others were not tried
+
+
+def test_song_that_fails_is_skipped_with_a_plain_reason(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    copy, _attempts = _copy_failing_on_second(lambda _dest: PermissionError(13, "Permission denied"))
+    done: list[ExportReport] = []
+
+    with patch("app.services.exporter.copy_file_atomic", side_effect=copy):
+        exporter.usb_export_worker(str(drive), "Trip", _three_songs(tmp_path), on_success=done.append)
+
+    assert done == [ExportReport(total=3, exported=2, skipped=("song1.mp3 (file is in use)",))]
+
+
+def test_encoded_track_appears_only_when_complete(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    written: list[str] = []
+
+    def _ffmpeg(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        written.append(Path(args[-1]).name)
+        Path(args[-1]).write_bytes(b"encoded")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("app.services.exporter.measure_loudnorm", return_value=None),
+        patch("app.services.exporter.run_ffmpeg", side_effect=_ffmpeg),
+    ):
+        exporter.usb_export_worker(str(drive), "Trip", [_three_songs(tmp_path)[0]], normalize=True)
+
+    assert written == ["01 - song0.mp3.partial"]
+    assert (drive / "01 - song0.mp3").read_bytes() == b"encoded"
+    assert not any(p.name.endswith(".partial") for p in drive.iterdir())
+
+
+def test_track_left_half_written_is_removed_by_the_next_export(tmp_path: Path) -> None:
+    (tmp_path / "01 - Song.mp3.partial").write_bytes(b"cut off")
+    (tmp_path / "notes.partial").write_bytes(b"not ours")
+
+    assert [Path(p).name for p in exporter.find_previous_export(str(tmp_path))] == ["01 - Song.mp3.partial"]
+
+
+def test_full_cd_folder_stops_the_cd_export(tmp_path: Path) -> None:
+    cd = tmp_path / "cd"
+    cd.mkdir()
+    done: list[ExportReport] = []
+
+    with patch("app.services.exporter.run_ffmpeg", side_effect=OSError(28, "No space left on device")) as ffmpeg:
+        exporter.cd_export_worker(str(cd), _three_songs(tmp_path), on_success=done.append)
+
+    assert done == [ExportReport(total=3, exported=0, stopped="full")]
+    assert ffmpeg.call_count == 1
+
+
+def test_stopped_export_is_explained_in_plain_words() -> None:
+    full = export_problems(ExportReport(total=5, exported=2, stopped="full"))
+    removed = export_problems(ExportReport(total=5, exported=2, stopped="removed"))
+
+    assert full.startswith("The USB drive is full, so the export stopped after 2 of 5 song(s).")
+    assert removed.startswith("The USB drive was unplugged or stopped working")
+    assert "Errno" not in full + removed
+
+
+def test_unplugged_drive_is_not_offered_for_eject(studio: UltimateAudioStudio) -> None:
+    with patch("app.ui.dialogs.show_warning") as warn, patch("app.ui.dialogs.ask_yes_no") as ask:
+        studio._usb_export_success(ExportReport(total=3, exported=1, stopped="removed"), "USB E", "E:\\")
+
+    assert warn.call_args[0][1] == "Export Stopped"
+    ask.assert_not_called()
+    assert "unplugged" in studio.status.cget("text")
