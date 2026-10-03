@@ -38,7 +38,19 @@ from app.ui.theme import (
     TEXT_DARK,
 )
 
-__all__ = ["TEXT_OK", "DialogButton", "TextAnswer", "ask_choice", "ask_text", "ask_yes_no", "show_info", "show_warning"]
+__all__ = [
+    "TEXT_OK",
+    "DialogButton",
+    "TextAnswer",
+    "ask_choice",
+    "ask_text",
+    "ask_yes_no",
+    "center_over",
+    "fit_to_screen",
+    "show_info",
+    "show_warning",
+    "wrap_width",
+]
 
 ButtonKind = Literal["primary", "neutral", "danger"]
 
@@ -53,6 +65,10 @@ _BUTTON_COLORS: dict[ButtonKind, tuple[str, str, str]] = {
 }
 # Wrap the message after roughly this many average characters (scales with the Text Size fonts).
 _WRAP_CHARS = 52
+# Height of the screen a dialog leaves free for its own title bar and the taskbar (at 100% scaling).
+_SCREEN_MARGIN_PX = 110
+# A message that has to scroll still shows at least this many lines.
+_MIN_MESSAGE_LINES = 4
 
 
 @dataclass(slots=True, frozen=True)
@@ -92,7 +108,7 @@ def ask_choice(
     (the first button when not given). Two buttons sit side by side; three or more are stacked
     full-width so every label stays readable at large text sizes.
     """
-    win, top, body = _open_dialog(parent, title, message, icon)
+    win, top, body, message_label = _open_dialog(parent, title, message, icon)
     result: list[str | None] = [cancel_value]
     done = [False]
 
@@ -114,7 +130,7 @@ def ask_choice(
     win.bind("<Escape>", lambda _e: _finish(cancel_value))
     win.bind("<Return>", lambda _e: _finish(default_value))
 
-    _run_modal(win, top, focus_button)
+    _run_modal(win, top, focus_button, message_label)
     return result[0]
 
 
@@ -170,7 +186,7 @@ def ask_text(
     (for example "Replace the original song"); the answer's ``value`` says which button was clicked.
     Enter clicks ``ok``; Escape or closing the window cancels.
     """
-    win, top, body = _open_dialog(parent, title, message, icon)
+    win, top, body, message_label = _open_dialog(parent, title, message, icon)
     result: list[TextAnswer | None] = [None]
     done = [False]
 
@@ -220,12 +236,22 @@ def ask_text(
     win.bind("<Escape>", lambda _e: _finish(None))
     win.bind("<Return>", lambda _e: _submit(TEXT_OK))
 
-    _run_modal(win, top, entry)
+    _run_modal(win, top, entry, message_label)
     return result[0]
 
 
-def _open_dialog(parent: tk.Misc, title: str, message: str, icon: str) -> tuple[tk.Toplevel, tk.Misc, tk.Frame]:
-    """Create a dialog window with its heading and message; returns (window, app window, content frame)."""
+def wrap_width(win: tk.Misc) -> int:
+    """Pixels after which a dialog's message wraps: it grows with Text Size and display scaling."""
+    return tkfont.nametofont(FONT_BODY, root=win).measure("0") * _WRAP_CHARS
+
+
+def _open_dialog(
+    parent: tk.Misc, title: str, message: str, icon: str
+) -> tuple[tk.Toplevel, tk.Misc, tk.Frame, tk.Label]:
+    """Create a dialog window with its heading and message.
+
+    Returns (window, app window, content frame, message label).
+    """
     top = parent.winfo_toplevel()
     win = tk.Toplevel(top)
     win.title(title)
@@ -241,11 +267,11 @@ def _open_dialog(parent: tk.Misc, title: str, message: str, icon: str) -> tuple[
     tk.Label(body, text=f"{icon}  {title}", font=FONT_APP_TITLE, fg=TEXT_DARK, bg=BG_CARD, anchor="w").pack(
         fill=tk.X, pady=(0, 10)
     )
-    wrap = tkfont.nametofont(FONT_BODY, root=win).measure("0") * _WRAP_CHARS
-    tk.Label(body, text=message, font=FONT_BODY, fg=TEXT_DARK, bg=BG_CARD, justify="left", wraplength=wrap).pack(
-        anchor="w", pady=(0, 16)
+    message_label = tk.Label(
+        body, text=message, font=FONT_BODY, fg=TEXT_DARK, bg=BG_CARD, justify="left", wraplength=wrap_width(win)
     )
-    return win, top, body
+    message_label.pack(anchor="w", pady=(0, 16))
+    return win, top, body, message_label
 
 
 def _place_buttons(body: tk.Frame, actions: Sequence[tuple[DialogButton, Callable[[], None]]]) -> list[tk.Button]:
@@ -269,9 +295,56 @@ def _place_buttons(body: tk.Frame, actions: Sequence[tuple[DialogButton, Callabl
     return placed
 
 
-def _run_modal(win: tk.Toplevel, top: tk.Misc, focus: tk.Misc | None) -> None:
+def fit_to_screen(win: tk.Toplevel, message: tk.Label) -> None:
+    """Make a dialog that is taller than the screen scroll its message, so its buttons stay in reach.
+
+    A long list of songs, a big Text Size and a small screen together made a dialog taller than
+    the screen: its buttons were below the bottom edge, where they cannot be clicked. The message
+    is then shown in a box of its own with a scroll bar, as tall as the screen has room for.
+    """
+    win.update_idletasks()
+    scale = max(1.0, win.winfo_fpixels("1i") / 96.0)
+    available = win.winfo_screenheight() - round(_SCREEN_MARGIN_PX * scale)
+    excess = win.winfo_reqheight() - available
+    if excess <= 0:
+        return
+    line_px = max(1, tkfont.nametofont(FONT_BODY, root=win).metrics("linespace"))
+    lines = max(_MIN_MESSAGE_LINES, (message.winfo_reqheight() - excess) // line_px)
+    frame = tk.Frame(message.master, bg=BG_CARD)
+    scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL)
+    box = tk.Text(
+        frame,
+        font=FONT_BODY,
+        fg=TEXT_DARK,
+        bg=BG_CARD,
+        wrap=tk.WORD,
+        width=_WRAP_CHARS,
+        height=lines,
+        relief=tk.FLAT,
+        borderwidth=0,
+        highlightthickness=0,
+        cursor="arrow",
+        yscrollcommand=scrollbar.set,
+    )
+    box.insert("1.0", str(message.cget("text")))
+    box.config(state=tk.DISABLED)  # read-only; it still scrolls with the wheel and the bar
+    scrollbar.config(command=box.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    frame.pack(fill=tk.X, pady=(0, 16), before=message)
+    message.destroy()
+    # The box has a few pixels of its own around the text: take lines off until everything fits.
+    win.update_idletasks()
+    while win.winfo_reqheight() > available and lines > _MIN_MESSAGE_LINES:
+        lines -= 1
+        box.config(height=lines)
+        win.update_idletasks()
+
+
+def _run_modal(win: tk.Toplevel, top: tk.Misc, focus: tk.Misc | None, message: tk.Label) -> None:
     """Show the dialog over the app window and wait until it is closed."""
-    _center_over(win, top)
+    fit_to_screen(win, message)
+    center_over(win, top)
     if focus is not None:
         focus.focus_set()
     with contextlib.suppress(tk.TclError):
@@ -280,7 +353,7 @@ def _run_modal(win: tk.Toplevel, top: tk.Misc, focus: tk.Misc | None) -> None:
     win.wait_window()
 
 
-def _center_over(win: tk.Toplevel, top: tk.Misc) -> None:
+def center_over(win: tk.Toplevel, top: tk.Misc) -> None:
     """Place the dialog over the app window (a third of the way down), kept fully on screen."""
     win.update_idletasks()
     w, h = win.winfo_reqwidth(), win.winfo_reqheight()
