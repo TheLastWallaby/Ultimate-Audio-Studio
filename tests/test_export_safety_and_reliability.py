@@ -145,7 +145,7 @@ def test_export_names_the_missing_songs_and_exports_only_the_ones_found(
         _pump(studio, lambda: export.called)
 
     assert "gone.mp3" in ask.call_args.args[2]
-    export.assert_called_once_with([found])
+    export.assert_called_once_with([found], studio.active_playlist_name)
 
 
 def test_export_with_missing_songs_can_be_cancelled_before_anything_happens(
