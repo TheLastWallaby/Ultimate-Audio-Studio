@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import math
@@ -12,11 +13,14 @@ import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pydub import AudioSegment
 
 from app.config import AUDIO_EXTS, log_error, run_ffmpeg, sanitize_filename
 from app.core.cache_manager import cache_mgr
+from app.core.errors import friendly_error
+from app.core.file_utils import copy_file_atomic, replace_with_retry
 from app.core.process_utils import CancelToken
 from app.services.ffmpeg_args import mp3_output_args
 
@@ -35,6 +39,13 @@ _ENCODE_TIMEOUT_SEC = 900
 
 # Files this app writes into an export folder: "07 - Song.mp3" / "107 - Song.mp3" and "00_Playlist.m3u(8)".
 _EXPORTED_TRACK_RE = re.compile(r"^\d{2,3} - .+$")
+# A track still being written ("07 - Song.mp3.partial"); one is left behind when a drive is pulled.
+_PARTIAL_SUFFIX = ".partial"
+# With less free space than this, no song fits on the drive any more.
+_MIN_FREE_BYTES = 1024 * 1024
+
+# Why an export stopped before the end: its drive was removed, or it is full ("" when it did not stop).
+DriveProblem = Literal["", "removed", "full"]
 _EXPORTED_PLAYLIST_RE = re.compile(r"^00_.+\.m3u8?$", re.IGNORECASE)
 
 ProgressFn = Callable[[float], None]
@@ -50,6 +61,7 @@ class ExportReport:
     exported: int  # songs now in the export folder
     skipped: tuple[str, ...] = ()  # not exported (or an old file not removed), each with its reason
     not_leveled: tuple[str, ...] = ()  # exported, but without the volume levelling that was asked for
+    stopped: DriveProblem = ""  # set when the drive gave out, and the remaining songs were not tried
 
 
 ReportFn = Callable[[ExportReport], None]
@@ -77,7 +89,7 @@ def find_previous_export(folder: str) -> list[str]:
         full = os.path.join(folder, name)
         if not os.path.isfile(full):
             continue
-        is_track = _EXPORTED_TRACK_RE.match(name) and name.lower().endswith(AUDIO_EXTS)
+        is_track = _EXPORTED_TRACK_RE.match(name) and name.lower().endswith((*AUDIO_EXTS, _PARTIAL_SUFFIX))
         if is_track or _EXPORTED_PLAYLIST_RE.match(name):
             found.append(full)
     return sorted(found)
@@ -162,22 +174,59 @@ def _fsync_file(path: str) -> None:
 
 
 def _encode_mp3(
-    filepath: str, dest_file: str, stats: dict[str, str] | None, normalize: bool, cancel_event: CancelToken | None
+    filepath: str | Path,
+    dest_file: str | Path,
+    stats: dict[str, str] | None,
+    normalize: bool,
+    cancel_event: CancelToken | None,
 ) -> bool:
-    """Encode to MP3 with FFmpeg, retrying with a re-encoded cover picture; True when a file was made."""
+    """Encode to MP3 with FFmpeg, retrying with a re-encoded cover picture; True when a file was made.
+
+    FFmpeg writes under a ``.partial`` name that is renamed when complete, so a drive pulled out
+    mid-song never leaves a cut-off track that a car stereo would play.
+    """
+    dest_file = Path(dest_file)
+    partial = dest_file.with_name(dest_file.name + _PARTIAL_SUFFIX)
     for cover in ("copy", "mjpeg"):
-        args = ["-y", "-i", filepath]
+        args = ["-y", "-i", str(filepath)]
         if normalize:
             args += ["-af", loudnorm_filter(stats)]
-        args += mp3_output_args("copy" if cover == "copy" else "mjpeg", resample_44k=True) + [dest_file]
+        args += mp3_output_args("copy" if cover == "copy" else "mjpeg", resample_44k=True)
+        args += ["-f", "mp3", str(partial)]  # the format is named because ".partial" does not tell FFmpeg
         result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
-        if result.returncode == 0 and os.path.exists(dest_file) and os.path.getsize(dest_file) > 0:
-            return True
+        try:
+            if result.returncode == 0 and partial.stat().st_size > 0:
+                replace_with_retry(partial, dest_file)
+                return True
+        except OSError as err:
+            logger.warning("Encoded track %s could not be put in place: %s", dest_file.name, err)
         with contextlib.suppress(OSError):
-            os.remove(dest_file)
+            partial.unlink()
         if cancel_event is not None and cancel_event.is_set():
             return False
     return False
+
+
+def _drive_problem(folder: Path, err: BaseException | None = None) -> DriveProblem:
+    """Why nothing more can be written to ``folder``: its drive was removed or is full ("" if neither).
+
+    Checked after a song fails, so one unplugged or full drive ends the export with one plain
+    message instead of every remaining song being measured, encoded and failed in turn.
+    """
+    if isinstance(err, OSError) and err.errno == errno.ENOSPC:
+        return "full"
+    try:
+        if not folder.is_dir():
+            return "removed"
+        free = shutil.disk_usage(folder).free
+    except OSError:
+        return "removed"
+    return "full" if free < _MIN_FREE_BYTES else ""
+
+
+def _skip_reason(err: BaseException) -> str:
+    """A short plain-language reason for the export report ("disk is full"), never raw error text."""
+    return friendly_error(err, "export").title.lower()
 
 
 def _write_m3u(dest_folder: str, playlist_name: str, tracks: list[tuple[str, str, float]]) -> None:
@@ -228,6 +277,7 @@ def usb_export_worker(
     skipped: list[str] = []
     not_leveled: list[str] = []
     exported_tracks: list[tuple[str, str, float]] = []
+    stopped: DriveProblem = ""
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -249,6 +299,9 @@ def usb_export_worker(
 
         for idx, filepath in enumerate(files_to_export, 1):
             if _stopping():
+                break
+            stopped = _drive_problem(dest_dir)
+            if stopped:
                 break
             if on_progress:
                 on_progress(((idx - 1) / total) * 100)
@@ -280,24 +333,29 @@ def usb_export_worker(
                     action_desc = "Normalizing & converting" if track_normalize else "Converting to MP3 for"
                     if on_status:
                         on_status(f"{action_desc} USB track {idx} of {total}...")
-                    encoded = _encode_mp3(filepath, str(dest_file), stats, track_normalize, cancel_event)
+                    encoded = _encode_mp3(filepath, dest_file, stats, track_normalize, cancel_event)
                     if _stopping():
                         with contextlib.suppress(OSError):
                             dest_file.unlink()
                         break
                     if not encoded:
+                        stopped = _drive_problem(dest_dir)
+                        if stopped:
+                            break
                         # FFmpeg failed: still deliver the song, but never call that a levelled export.
                         if is_mp3:
-                            shutil.copy2(source, dest_file)
+                            copy_file_atomic(source, dest_file)
                         else:
-                            AudioSegment.from_file(filepath).export(str(dest_file), format="mp3")
+                            partial = dest_file.with_name(dest_file.name + _PARTIAL_SUFFIX)
+                            AudioSegment.from_file(filepath).export(str(partial), format="mp3")
+                            replace_with_retry(partial, dest_file)
                         if track_normalize:
                             not_leveled.append(source.name)
                 else:
                     dest_file = dest_dir / f"{idx:0{width}d} - {clean_base}"
                     if on_status:
                         on_status(f"Copying USB track {idx} of {total}...")
-                    shutil.copy2(source, dest_file)
+                    copy_file_atomic(source, dest_file)
 
                 _fsync_file(str(dest_file))
                 success_count += 1
@@ -306,11 +364,14 @@ def usb_export_worker(
                 exported_tracks.append((dest_file.name, track_title, dur))
             except Exception as track_err:  # one bad song must not end the whole export
                 logger.error("usb export track %s: %s", filepath, track_err)
-                skipped.append(f"{source.name} ({track_err})")
+                stopped = _drive_problem(dest_dir, track_err)
+                if stopped:
+                    break
+                skipped.append(f"{source.name} ({_skip_reason(track_err)})")
 
         shutting_down = bool(is_shutting_down_fn and is_shutting_down_fn())
         # Even after Stop, list the songs that were copied so the drive plays them in order.
-        if exported_tracks and not shutting_down:
+        if exported_tracks and not shutting_down and stopped != "removed":
             _write_m3u(dest_folder, playlist_name, exported_tracks)
 
         if _cancelled():
@@ -320,7 +381,7 @@ def usb_export_worker(
         if on_progress:
             on_progress(100.0)
         if on_success:
-            on_success(ExportReport(total, success_count, tuple(skipped), tuple(not_leveled)))
+            on_success(ExportReport(total, success_count, tuple(skipped), tuple(not_leveled), stopped))
     except Exception as e:  # last-resort guard: a worker must always report back to the window
         logger.error("usb_export_worker: %s", e)
         if on_error:
@@ -359,6 +420,7 @@ def cd_export_worker(
     success_count = 0
     skipped: list[str] = []
     not_leveled: list[str] = []
+    stopped: DriveProblem = ""
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -411,7 +473,10 @@ def cd_export_worker(
                 success_count += 1
             except Exception as track_err:  # one bad song must not end the whole export
                 logger.error("cd export track %s: %s", filepath, track_err)
-                skipped.append(f"{source.stem} ({track_err})")
+                stopped = _drive_problem(cd_dir, track_err)
+                if stopped:
+                    break
+                skipped.append(f"{source.stem} ({_skip_reason(track_err)})")
 
         if _cancelled():
             if on_cancelled:
@@ -420,7 +485,7 @@ def cd_export_worker(
         if on_progress:
             on_progress(100.0)
         if on_success:
-            on_success(ExportReport(total, success_count, tuple(skipped), tuple(not_leveled)))
+            on_success(ExportReport(total, success_count, tuple(skipped), tuple(not_leveled), stopped))
     except Exception as e:  # last-resort guard: a worker must always report back to the window
         logger.error("cd_export_worker: %s", e)
         if on_error:
