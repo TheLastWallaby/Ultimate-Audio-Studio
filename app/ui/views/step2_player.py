@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING
 
-from app.ui.components import ToolTip, create_button
+from app.ui.components import ToolTip, create_button, jump_to_click
 from app.ui.theme import (
     BG_CARD,
     BG_SUB_CARD,
@@ -196,6 +196,7 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     register_scaled(app.scale_volume, width=22, sliderlength=32)
     vol_init = getattr(app, "_saved_volume", 80)
     app.scale_volume.set(vol_init)
+    jump_to_click(app.scale_volume)
     app.scale_volume.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
     app.lbl_vol_pct = tk.Label(
@@ -281,6 +282,7 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     app.scale_progress.pack(fill=tk.X)
     app.scale_progress.bind("<ButtonPress-1>", lambda e: app._mark_progress_drag(True))
     app.scale_progress.bind("<ButtonRelease-1>", app._on_progress_release)
+    jump_to_click(app.scale_progress)
 
     # Trimming Section
     f_trim_boxes = tk.Frame(parent, bg=BG_CARD)
@@ -504,6 +506,7 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
         command=app.on_gain_change,
     )
     register_scaled(app.scale_gain, width=20, sliderlength=30)
+    jump_to_click(app.scale_gain)
     app.scale_gain.set(0.0)
     app.scale_gain.pack(fill=tk.X)
 
