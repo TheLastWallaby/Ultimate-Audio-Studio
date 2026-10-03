@@ -585,3 +585,71 @@ def test_the_link_that_was_downloaded_is_cleared_from_the_box(
     _pump(studio, lambda: not studio._download_kind)
 
     assert studio.entry_url.get() == ""
+
+
+# --- 10. A music folder that has gone is not called an empty Library --------------------------------
+
+
+def _library_hint(window: UltimateAudioStudio) -> str:
+    """The text shown over the Library list ("" when the list shows songs instead)."""
+    return str(window.lbl_lib_empty.cget("text")) if window.lbl_lib_empty.winfo_manager() else ""
+
+
+def test_an_unplugged_music_folder_is_not_called_an_empty_library(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    folder = tmp_path / "drive" / "Music"
+    _song(folder, "One.mp3")
+    studio.library_folder = str(folder)
+    studio.refresh_library()
+    assert _library_hint(studio) == ""
+
+    studio._library_scanned(str(folder), [], False)  # what the watcher finds once the drive is pulled out
+
+    hint = _library_hint(studio)
+    assert "cannot be found" in hint and str(folder) in hint and "plug it in again" in hint
+    assert "Library is empty" not in hint
+    assert "cannot be found" in studio.status.cget("text")
+
+    studio._library_scanned(str(folder), ["One.mp3"], True)  # plugged in again
+
+    assert _library_hint(studio) == ""
+    assert studio.library_files == ["One.mp3"]
+    assert "is back" in studio.status.cget("text")
+
+
+def test_the_watcher_tells_a_missing_folder_from_an_empty_one(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    not_a_folder = tmp_path / "file.txt"
+    not_a_folder.write_text("x", encoding="utf-8")
+    studio.library_folder = str(not_a_folder / "Music")  # cannot be made or read, like an unplugged drive
+
+    studio._watch_library()
+    _pump(studio, lambda: studio._library_unreachable)
+
+    assert studio._library_unreachable
+    assert "cannot be found" in _library_hint(studio)
+
+
+def test_an_empty_music_folder_still_says_how_to_get_songs(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    folder = tmp_path / "Music"
+    folder.mkdir()
+    studio.library_folder = str(folder)
+
+    studio.refresh_library()
+    studio._library_scanned(str(folder), [], True)
+
+    assert "Your Library is empty" in _library_hint(studio)
+
+
+def test_a_missing_folder_does_not_cover_up_a_running_job(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    folder = tmp_path / "Music"
+    folder.mkdir()
+    studio.library_folder = str(folder)
+    studio.refresh_library()
+    studio._exporting = True
+    studio.set_busy(True, "Exporting song 3 of 12...")
+
+    studio._library_scanned(str(folder), [], False)
+
+    assert studio.status.cget("text") == "Exporting song 3 of 12..."
+    assert "cannot be found" in _library_hint(studio)
+    studio._exporting = False
+    studio.set_busy(False)
