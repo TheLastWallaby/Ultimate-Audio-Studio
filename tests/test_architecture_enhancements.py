@@ -122,6 +122,16 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def test_each_test_starts_from_the_default_settings() -> None:
+    """conftest clears what a previous test's window saved (e.g. a deleted temporary Library)."""
+    from app.config import PLAYLISTS_PATH, SETTINGS_PATH, settings_mgr
+
+    assert not os.path.exists(SETTINGS_PATH)
+    assert not os.path.exists(PLAYLISTS_PATH)
+    assert settings_mgr.get_settings().library_folder == ""
+    assert settings_mgr.damaged_copy is None and not settings_mgr.read_failed
+
+
 def test_app_does_not_use_pydub() -> None:
     """pydub ran FFmpeg with no time limit and no way to stop it, and was removed in favour of run_ffmpeg."""
     import app.main  # noqa: F401

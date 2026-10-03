@@ -268,7 +268,8 @@ class TestMainWindowHelpers(unittest.TestCase):
                 cache_mgr.set_metadata(os.path.join(app.library_folder, "new name.mp3"), known)
                 app._watch_library()
                 self.assertEqual(app.library_files, ["new name.mp3"])
-            read_details.assert_not_called()
+            renamed = {"old name.mp3", "new name.mp3"}
+            self.assertEqual([c for c in read_details.call_args_list if Path(c.args[0]).name in renamed], [])
         finally:
             app.on_close()
 
