@@ -296,7 +296,7 @@ class ExportMixin(AppBase):
                 freed_bytes = sum(Path(p).stat().st_size for p in previous if Path(p).is_file())
 
         # Pre-flight disk space validation
-        est_bytes = self.export_ctrl.estimate_playlist_bytes(files, self._cached_duration_only)
+        est_bytes = self.export_ctrl.estimate_playlist_bytes(files, self._cached_duration_only, normalize)
         has_space, free_bytes = self.export_ctrl.check_usb_space(drive_root, est_bytes, freed_bytes)
         if not has_space:
             free_mb = free_bytes / (1024 * 1024)
