@@ -896,3 +896,92 @@ def test_a_playlist_song_whose_file_is_gone_is_marked_after_the_next_read(studio
 
     assert studio.listbox_pl.get(1) == "02. ⚠️ [Missing] file1.mp3"
     assert studio.listbox_pl.get(0) == "01. Tune 0 — The Band [01:01]"
+
+
+# --- The previous version's file after an update --------------------------------------------------------
+
+
+def test_the_previous_version_is_hidden_while_it_is_kept_as_a_backup(tmp_path: Path) -> None:
+    from app.platform_utils import is_hidden
+    from app.services import updater
+
+    current = tmp_path / "Ultimate Audio Studio.exe"
+    current.write_bytes(b"OLD")
+    new = tmp_path / "download.exe"
+    new.write_bytes(b"NEW")
+    old = tmp_path / "Ultimate Audio Studio.exe.old"
+
+    updater._swap_in(new, current, old)
+
+    assert current.read_bytes() == b"NEW" and not is_hidden(current)
+    assert old.read_bytes() == b"OLD" and is_hidden(old)
+
+
+def test_a_rolled_back_version_is_visible_again(tmp_path: Path) -> None:
+    from app.platform_utils import is_hidden
+    from app.services import updater
+
+    current = tmp_path / "Ultimate Audio Studio.exe"
+    current.write_bytes(b"OLD")
+    new = tmp_path / "download.exe"
+    new.write_bytes(b"NEW")
+    old = tmp_path / "Ultimate Audio Studio.exe.old"
+    updater._swap_in(new, current, old)
+
+    assert updater._restore_previous(current, old)
+
+    assert current.read_bytes() == b"OLD"
+    assert not is_hidden(current)  # a hidden app would have vanished from the Desktop
+    assert not old.exists()
+
+
+def test_a_swap_that_fails_leaves_the_app_in_place_and_visible(tmp_path: Path) -> None:
+    from app.platform_utils import is_hidden
+    from app.services import updater
+
+    current = tmp_path / "Ultimate Audio Studio.exe"
+    current.write_bytes(b"OLD")
+    old = tmp_path / "Ultimate Audio Studio.exe.old"
+    with (
+        patch.object(updater.shutil, "move", side_effect=PermissionError(13, "the folder cannot be changed")),
+        pytest.raises(OSError),
+    ):
+        updater._swap_in(tmp_path / "download.exe", current, old)
+
+    assert current.read_bytes() == b"OLD" and not is_hidden(current)
+    assert not old.exists()
+
+
+def test_the_previous_version_is_deleted_as_soon_as_it_has_stopped_running(tmp_path: Path) -> None:
+    import sys
+
+    import app.main as main_module
+    from app import config
+
+    exe = tmp_path / "Ultimate Audio Studio.exe"
+    exe.write_bytes(b"NEW")
+    old = tmp_path / "Ultimate Audio Studio.exe.old"
+    old.write_bytes(b"OLD")
+    real_unlink = Path.unlink
+    tries: list[int] = []
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == old:
+            tries.append(1)
+            if len(tries) < 3:  # the previous version is still running from it
+                raise PermissionError(13, "The process cannot access the file", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    with (
+        patch.object(sys, "frozen", True, create=True),
+        patch.object(sys, "executable", str(exe)),
+        patch.object(Path, "unlink", _unlink),
+        patch.object(main_module.time, "sleep") as waited,
+    ):
+        assert config.cleanup_old_executables() is False
+        tries.clear()
+        main_module._remove_previous_version()
+
+    assert not old.exists()
+    assert exe.read_bytes() == b"NEW"
+    assert len(tries) == 3 and waited.call_count == 2
