@@ -241,6 +241,11 @@ def _drive_problem(folder: Path, err: BaseException | None = None) -> DriveProbl
     return "full" if free < _MIN_FREE_BYTES else ""
 
 
+def _any_song_present(files: Sequence[str]) -> bool:
+    """True when at least one of the songs to export can be found right now."""
+    return any(Path(name).exists() for name in files if name)
+
+
 class _NotConvertible(Exception):
     """FFmpeg could not turn this song into a playable track, even without levelling or its picture."""
 
@@ -288,7 +293,9 @@ def usb_export_worker(
     """Export playlist tracks to USB with numbering, FAT32-safe filenames, optional loudnorm, and M3U playlist file.
 
     ``clear_existing`` first removes the files of an earlier export, so songs that were removed or
-    reordered since do not linger on the drive; an export stopped before it began removes nothing.
+    reordered since do not linger on the drive. An export stopped before it began removes nothing,
+    and neither does one that has no song to put in their place (a Library on an unplugged drive):
+    the drive would be left empty.
     When ``cancel_event`` is set, the current FFmpeg run is stopped, its half-written file removed,
     and ``on_cancelled(done, total)`` is called. A song whose volume could not be levelled is still
     exported, at its original volume, and listed in the report's ``not_leveled``.
@@ -314,7 +321,7 @@ def usb_export_worker(
             # The folder is made here and not by the window, so that a locked or unplugged drive ends
             # as a reported error instead of an exception that leaves the window stuck on "Exporting...".
             dest_dir.mkdir(parents=True, exist_ok=True)
-        if clear_existing and not _stopping():
+        if clear_existing and not _stopping() and _any_song_present(files_to_export):
             if on_status:
                 on_status("Removing the songs from the previous export...")
             for name in remove_previous_export(dest_folder):
@@ -439,7 +446,8 @@ def cd_export_worker(
     """Export tracks to Desktop burn folder as standard Red Book 44.1kHz 16-bit stereo PCM WAV files.
 
     ``clear_existing`` first removes the tracks of an earlier export (and nothing else in the
-    folder); an export stopped before it began removes nothing. A song whose volume could not be
+    folder); an export stopped before it began, or one that finds none of its songs, removes
+    nothing. A song whose volume could not be
     levelled is still exported, at its original volume, and listed in the report's ``not_leveled``.
     """
     total = len(files_to_export)
@@ -458,7 +466,7 @@ def cd_export_worker(
 
     try:
         # Checked first: a job stopped while it was still queued must leave the folder as it was.
-        if clear_existing and not _stopping():
+        if clear_existing and not _stopping() and _any_song_present(files_to_export):
             if on_status:
                 on_status("Removing the tracks from the previous CD export...")
             for name in remove_previous_export(cd_folder):

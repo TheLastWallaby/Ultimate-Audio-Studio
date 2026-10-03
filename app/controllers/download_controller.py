@@ -7,7 +7,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from app.core.task_manager import task_mgr
+from app.core.task_manager import network_task_mgr as task_mgr
 from app.models import SearchResult
 from app.services.downloader import (
     download_audio_worker,
