@@ -552,6 +552,8 @@ class PlayerMixin(AppBase):
         self.set_status("Paused. Press PLAY to continue.", icon="⏸")
 
     def stop_audio(self, user: bool = False) -> None:
+        """Stop playback (``user``: the STOP button, which also returns the slider to the start)."""
+        self._cancel_pending_skip()
         if self._pending_play_token is not None:
             self._pending_play_token = None
             self.set_busy(False)

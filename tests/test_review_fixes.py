@@ -262,3 +262,37 @@ def test_a_search_right_after_stopping_a_download_does_not_leave_the_app_downloa
         tasks.jobs[0]()  # the stopped download finishes winding down only now
 
     assert controller.is_downloading is False
+
+
+# --- A playlist whose songs are missing -----------------------------------------------------------------
+
+
+def _set_playlist(window: Any, paths: list[str]) -> None:
+    window.playlist_ctrl.playlists[window.active_playlist_name] = list(paths)
+    window.refresh_playlist_listbox()
+
+
+def test_a_playlist_with_every_song_missing_stops_even_with_repeat_on(studio: Any, tmp_path: Path) -> None:
+    _set_playlist(studio, [str(tmp_path / f"gone{i}.mp3") for i in range(3)])
+    studio.repeat_playlist.set(True)
+    with patch("app.ui.dialogs.show_warning") as warned:
+        studio.play_playlist()
+        _pump(studio, lambda: False, timeout=2.0)  # long enough for the three songs to be passed twice
+
+    warned.assert_called_once()
+    assert warned.call_args[0][1] == "Songs Not Found"
+    assert studio._pl_skip_timer is None
+    assert not studio.is_playing_playlist
+
+
+def test_stop_cancels_a_pending_skip_past_a_missing_song(studio: Any, tmp_path: Path) -> None:
+    (song,) = _library(studio, tmp_path / "lib", "real.mp3")
+    _set_playlist(studio, [str(tmp_path / "gone.mp3"), song])
+    with patch.object(studio.playback_ctrl, "play_track") as play:
+        studio.play_playlist()
+        assert studio._pl_skip_timer is not None
+        studio.stop_pressed()
+        _pump(studio, lambda: False, timeout=0.8)
+
+    play.assert_not_called()
+    assert studio.selected_file_path != song
