@@ -49,6 +49,7 @@ from app.platform_utils import (
     kill_process_tree,
     launch_update_process,
     release_instance_mutex,
+    set_hidden,
     wait_for_event_or_exit,
 )
 
@@ -373,9 +374,13 @@ def _restore_previous(current_exe: Path, old_exe: Path) -> bool:
         try:
             current_exe.unlink(missing_ok=True)
             old_exe.rename(current_exe)
-            return True
         except OSError:
             time.sleep(0.25)
+            continue
+        # It was hidden as a backup (see _swap_in); as the app again, it must show on the Desktop.
+        if not set_hidden(current_exe, False):
+            logger.warning("Could not make the restored %s visible again", current_exe.name)
+        return True
     logger.error("Could not restore the previous version from %s", old_exe)
     return False
 
@@ -391,10 +396,15 @@ def _remember_failed_update(tag: str) -> None:
 def _swap_in(new_exe: Path, current_exe: Path, old_exe: Path) -> None:
     """Rename the running executable to ``old_exe`` and move the new one into its place.
 
-    Raises OSError with the running executable back under its own name when either step fails.
+    The app usually sits on the Desktop, so the renamed previous version is hidden: until it is
+    deleted (shortly after the new version has started) it would show there as a second,
+    puzzling file. Raises OSError with the running executable back under its own name, and
+    visible, when either step fails.
     """
     _remove_quietly(old_exe)
     current_exe.rename(old_exe)
+    if not set_hidden(old_exe, True):  # only cosmetic: the update goes on
+        logger.info("Could not hide %s", old_exe.name)
     try:
         shutil.move(new_exe, current_exe)
     except OSError:

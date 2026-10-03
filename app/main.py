@@ -11,6 +11,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 import traceback
 from collections import OrderedDict
@@ -1028,6 +1029,26 @@ def _exit_process() -> None:
     os._exit(0)
 
 
+# The previous version ends within moments of this one signalling that it started; until then
+# Windows keeps its file locked. A few tries, a few seconds apart, are plenty.
+_PREVIOUS_VERSION_FIRST_TRY_MS = 3000
+_PREVIOUS_VERSION_TRIES = 10
+_PREVIOUS_VERSION_WAIT_SEC = 3.0
+
+
+def _remove_previous_version() -> None:
+    """Delete the previous version's executable once it has stopped running (worker thread).
+
+    Without this it stayed next to the app, usually on the Desktop, until the next start.
+    """
+    for attempt in range(_PREVIOUS_VERSION_TRIES):
+        if cleanup_old_executables():
+            return
+        if attempt < _PREVIOUS_VERSION_TRIES - 1:
+            time.sleep(_PREVIOUS_VERSION_WAIT_SEC)
+    logging.getLogger(__name__).info("The previous version is still in use; it is removed at the next start")
+
+
 def main() -> None:
     """Application entry point."""
     setup_logging()  # before anything logs: module loggers only reach the error log through this handler
@@ -1046,6 +1067,7 @@ def main() -> None:
     _app = UltimateAudioStudio(root)  # keep a reference for the lifetime of the main loop
     # Tell a previous version waiting in install_update() that this one started properly.
     signal_named_event(UPDATE_OK_EVENT_NAME)
+    root.after(_PREVIOUS_VERSION_FIRST_TRY_MS, lambda: task_mgr.submit_task(_remove_previous_version))
     root.after_idle(_close_splash)  # once the window is drawn, so there is no blank gap
     if rollback_message:
         root.after(800, lambda: dialogs.show_warning(root, "Update Not Installed", rollback_message))
