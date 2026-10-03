@@ -1,6 +1,7 @@
 """Automated unit tests verifying TaskManager, platform security, and models."""
 
 import os
+import sys
 import time
 import unittest
 
@@ -129,6 +130,14 @@ def test_each_test_starts_from_the_default_settings() -> None:
     assert not os.path.exists(PLAYLISTS_PATH)
     assert settings_mgr.get_settings().library_folder == ""
     assert settings_mgr.damaged_copy is None and not settings_mgr.read_failed
+
+
+def test_app_does_not_use_pydub() -> None:
+    """pydub ran FFmpeg with no time limit and no way to stop it, and was removed in favour of run_ffmpeg."""
+    import app.main  # noqa: F401
+
+    assert "pydub" not in sys.modules
+    assert "audioop_lts" not in sys.modules
 
 
 def test_tests_use_the_silent_audio_driver() -> None:

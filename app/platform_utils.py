@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _orig_popen: Any = subprocess.Popen
 
 # Every child process the app starts (FFmpeg for clips/exports/waveforms, and the FFmpeg that yt-dlp
-# and pydub launch through subprocess.Popen), so they can be stopped when the app exits.
+# launches through subprocess.Popen), so they can be stopped when the app exits.
 _children: weakref.WeakSet[subprocess.Popen[Any]] = weakref.WeakSet()
 _children_lock = threading.Lock()
 _spawning_blocked = False

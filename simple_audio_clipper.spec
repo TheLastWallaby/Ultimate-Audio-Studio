@@ -7,7 +7,7 @@ datas = []
 # deno.exe is the JavaScript runtime yt-dlp needs for YouTube (installed by the yt-dlp[deno] extra).
 binaries = [('ffmpeg.exe', '.'), ('ffprobe.exe', '.'), (deno.find_deno_bin(), '.')]
 hiddenimports = [
-    'audioop', 'audioop_lts', 'certifi', 'pydub', 'tinytag', 'pygame', 'send2trash',
+    'certifi', 'tinytag', 'pygame', 'send2trash',
     'app.services.updater', 'app.ui.update_dialog', 'app.core.cache_manager',
     'app.controllers', 'app.controllers.library_controller', 'app.controllers.playback_controller',
     'app.controllers.playlist_controller', 'app.controllers.export_controller',
