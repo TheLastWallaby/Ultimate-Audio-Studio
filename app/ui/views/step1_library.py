@@ -172,6 +172,14 @@ def build_step1_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     lib_wrap.pack(fill=tk.BOTH, expand=True, pady=3)
     app.listbox_lib.bind("<<ListboxSelect>>", app.on_library_select)
     app.listbox_lib.bind("<Double-Button-1>", app._on_library_double_click)
+    # Shown over the list while it is empty, so a first start or a search without matches is not
+    # just a blank box (see LibraryMixin._show_library_hint).
+    app.lbl_lib_empty = tk.Label(
+        app.listbox_lib, text="", font=FONT_BODY, fg=TEXT_MUTED, bg=app.listbox_lib.cget("bg"), justify="center"
+    )
+    app.listbox_lib.bind(
+        "<Configure>", lambda event: app.lbl_lib_empty.config(wraplength=max(120, event.width - 24)), add="+"
+    )
 
     # Song Tools
     f_lib_edit = tk.Frame(parent, bg=BG_CARD)

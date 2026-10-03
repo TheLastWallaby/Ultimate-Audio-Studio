@@ -137,6 +137,7 @@ def test_cancelling_the_search_dialog_leaves_the_music_playing(root: tk.Tk) -> N
         dialog._do_cancel()
 
     engine.stop.assert_not_called()
+    engine.release_audio_file.assert_not_called()
 
 
 def test_choosing_a_search_result_leaves_the_music_playing(root: tk.Tk) -> None:
@@ -145,17 +146,21 @@ def test_choosing_a_search_result_leaves_the_music_playing(root: tk.Tk) -> None:
         dialog._do_select()
 
     engine.stop.assert_not_called()
+    engine.release_audio_file.assert_not_called()
 
 
 def test_search_dialog_stops_the_preview_it_started(root: tk.Tk) -> None:
     engine = _playing_engine()
     with _search_dialog(root, engine) as dialog:
         dialog._on_preview_ready(dialog._preview_request_id, dialog.results[0], "preview.mp3")
-        engine.load_and_play.assert_called_once()
+        engine.play_preview.assert_called_once_with("preview.mp3")
 
         dialog._do_cancel()
 
-    engine.stop.assert_called_once()
+    engine.release_audio_file.assert_called_once()
+    # The song player's own clock and stop are left alone: a paused song keeps its position.
+    engine.load_and_play.assert_not_called()
+    engine.stop.assert_not_called()
 
 
 def test_deleting_another_song_leaves_the_music_playing(studio: UltimateAudioStudio, tmp_path: Path) -> None:
@@ -348,7 +353,7 @@ def test_window_recovers_when_the_usb_drive_cannot_be_written(studio: UltimateAu
     studio.usb_choice.set(label)
 
     studio._export_to_usb([song], False)
-    _pump(studio, lambda: not studio._exporting)
+    _pump(studio, lambda: "failed" in studio.status.cget("text"))  # the drive is read on a worker first
 
     assert not studio._exporting
     assert studio.busy_reason() is None

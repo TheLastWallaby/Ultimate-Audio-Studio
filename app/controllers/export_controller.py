@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import log_error, sanitize_filename
@@ -13,9 +15,24 @@ from app.core.task_manager import task_mgr
 from app.platform_utils import get_desktop_dir, safely_eject_usb_drive
 from app.services.exporter import ExportReport, cd_export_worker, find_previous_export, usb_export_worker
 
+logger = logging.getLogger(__name__)
+
 DurationFn = Callable[[str], float]
 # Generous for the VBR V2 MP3s the export encodes (about 190 kbit/s on average, so about 24 000).
 _MP3_EXPORT_BYTES_PER_SEC = 30_000
+# CD audio: 44 100 samples a second, two channels, two bytes each.
+_CD_BYTES_PER_SEC = 176_400
+_SPARE_BYTES = 15 * 1024 * 1024
+
+
+@dataclass(slots=True, frozen=True)
+class UsbTarget:
+    """What is on a USB drive before an export, read on a worker (a drive can take seconds to answer)."""
+
+    connected: bool  # the drive is still there
+    previous: tuple[str, ...] = ()  # files an earlier export of this playlist left on it
+    previous_bytes: int = 0  # the space those files take
+    free_bytes: int | None = None  # None when the drive would not say
 
 
 class ExportController:
@@ -52,6 +69,28 @@ class ExportController:
     def previous_export_files(folder: str) -> list[str]:
         """Songs and playlist files an earlier export left in ``folder``."""
         return find_previous_export(folder)
+
+    def inspect_usb_target(self, drive_root: str, playlist_name: str) -> UsbTarget:
+        """Read what an export needs to know about the drive (worker threads only)."""
+        root = Path(drive_root)
+        try:
+            if not root.exists():
+                return UsbTarget(connected=False)
+            previous = find_previous_export(self.usb_playlist_folder(drive_root, playlist_name))
+            previous_bytes = sum(Path(name).stat().st_size for name in previous)
+        except OSError as err:  # pulled out while it was being read
+            logger.warning("The USB drive %s could not be read: %s", drive_root, err)
+            return UsbTarget(connected=False)
+        try:
+            free: int | None = shutil.disk_usage(root).free
+        except OSError as err:
+            logger.warning("The free space on %s could not be read: %s", drive_root, err)
+            free = None
+        return UsbTarget(True, tuple(previous), previous_bytes, free)
+
+    def estimate_cd_bytes(self, playlist_files: Sequence[str], duration_fn: DurationFn | None) -> int:
+        """Bytes the CD tracks (uncompressed audio) of these songs need, with 15 MB to spare."""
+        return int(self.get_playlist_duration(playlist_files, duration_fn) * _CD_BYTES_PER_SEC) + _SPARE_BYTES
 
     @staticmethod
     def is_ntfs(fs_type: str | None) -> bool:
