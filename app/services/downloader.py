@@ -21,7 +21,9 @@ from yt_dlp.utils import DownloadCancelled
 
 from app.config import BASE_PATH, PREVIEW_CACHE_DIR, YOUTUBE_RE, YT_CACHE_DIR, ffmpeg_path, format_time, log_error
 from app.core.file_utils import copy_file_atomic, unused_path
+from app.core.metadata import read_track_metadata
 from app.models import SearchResult
+from app.services.clipper import discard_orphan_backup
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +366,30 @@ def fetch_preview_worker(
             on_error(str(e))
 
 
+# Two files with the same name whose lengths differ by less than this are taken to be the same song.
+_SAME_SONG_TOLERANCE_SEC = 1.5
+
+
+def find_same_song(library: Path, song: Path) -> Path | None:
+    """The Library song that ``song`` is another copy of, or None.
+
+    A song is the same when it has the same name ("Song.mp3", or the "Song (2).mp3" a clash was
+    given) and the same length. A different recording under the same title differs in length and is
+    kept as a new song.
+    """
+    length = read_track_metadata(str(song), probe_fallback=False).duration
+    if length <= 0:
+        return None
+    candidate, number = library / song.name, 2
+    while candidate.is_file():
+        known = read_track_metadata(str(candidate), probe_fallback=False).duration
+        if abs(known - length) <= _SAME_SONG_TOLERANCE_SEC:
+            return candidate
+        candidate = library / f"{song.stem} ({number}){song.suffix}"
+        number += 1
+    return None
+
+
 def _finished_mp3(work_dir: Path) -> Path | None:
     """The MP3 a download left in its work folder (the newest, should there be more than one)."""
     mp3s = sorted(work_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -378,8 +404,12 @@ def download_audio_worker(
     on_success: Callable[[str], None],
     on_cancelled: Callable[[], None],
     on_error: Callable[[str], None],
+    on_duplicate: Callable[[str], None] | None = None,
 ) -> None:
     """Download one song as an MP3 into the Library on a worker thread.
+
+    With ``on_duplicate``, a song that is already in the Library (``find_same_song``) is not added
+    a second time: ``on_duplicate(name of the song that is there)`` is called instead of ``on_success``.
 
     yt-dlp works in a folder of its own, and the finished MP3 is then copied into the Library
     under a free name ("Song (2).mp3" when "Song.mp3" is there). Downloading straight into the
@@ -460,9 +490,14 @@ def download_audio_worker(
         song = _finished_mp3(work_dir)
         if song is None:
             raise FileNotFoundError("Download finished but the converted MP3 file could not be found.")
-        dest = unused_path(library / song.name)
-        copy_file_atomic(song, dest)
-        on_success(dest.name)
+        same = find_same_song(library, song) if on_duplicate is not None else None
+        if same is not None and on_duplicate is not None:
+            on_duplicate(same.name)
+        else:
+            dest = unused_path(library / song.name)
+            discard_orphan_backup(dest)
+            copy_file_atomic(song, dest)
+            on_success(dest.name)
     except DownloadCancelled:
         on_cancelled()
     except Exception as e:  # last-resort guard: a worker must always report back to the window
@@ -486,11 +521,13 @@ def download_playlist_worker(
     on_cancelled: Callable[[], None] | None = None,
     on_error: Callable[[str], None] | None = None,
     on_track_failed: Callable[[int, int, str, str], None] | None = None,
+    on_track_duplicate: Callable[[int, int, str], None] | None = None,
 ) -> None:
     """Sequentially download each track in a playlist with per-track and overall progress reporting.
 
     A track that cannot be downloaded is reported through ``on_track_failed(idx, total, title, error)``
-    and the batch continues with the next track.
+    and the batch continues with the next track. With ``on_track_duplicate``, a track that is already
+    in the Library is not added again: ``on_track_duplicate(idx, total, name of the song that is there)``.
     """
     os.makedirs(library_folder, exist_ok=True)
     os.makedirs(YT_CACHE_DIR, exist_ok=True)
@@ -517,6 +554,7 @@ def download_playlist_worker(
 
             track_file: list[str | None] = [None]
             track_error: list[str | None] = [None]
+            track_duplicate: list[str | None] = [None]
 
             def _prog(pct: float, spd: str, eta: str, _fin: bool, current_idx: int = idx) -> None:
                 if on_track_progress:
@@ -532,7 +570,13 @@ def download_playlist_worker(
                 log_error(f"download_playlist_worker track {current_idx} failed: {err}")
                 te[0] = err
 
-            download_audio_worker(url, library_folder, cancel_event, _prog, _succ, _canc, _fail)
+            def _dup(name: str, td: list[str | None] = track_duplicate) -> None:
+                td[0] = name
+
+            if on_track_duplicate:
+                download_audio_worker(url, library_folder, cancel_event, _prog, _succ, _canc, _fail, on_duplicate=_dup)
+            else:
+                download_audio_worker(url, library_folder, cancel_event, _prog, _succ, _canc, _fail)
 
             if cancel_event.is_set():
                 if on_cancelled:
@@ -544,6 +588,8 @@ def download_playlist_worker(
                 downloaded_files.append(finished_file)
                 if on_track_finished:
                     on_track_finished(idx, total_tracks, finished_file)
+            elif track_duplicate[0] and on_track_duplicate:
+                on_track_duplicate(idx, total_tracks, track_duplicate[0])
             elif on_track_failed:
                 on_track_failed(idx, total_tracks, track_title, track_error[0] or "Unknown error")
 

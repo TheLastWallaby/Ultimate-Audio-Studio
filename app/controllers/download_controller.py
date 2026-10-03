@@ -119,8 +119,9 @@ class DownloadController:
         on_success: Callable[[str], None],
         on_cancelled: Callable[[], None],
         on_error: Callable[[str], None],
+        on_duplicate: Callable[[str], None] | None = None,
     ) -> None:
-        """Execute audio download in background thread."""
+        """Download one song on a worker; ``on_duplicate(name)`` when it is already in the Library."""
         job = self.reset_cancel()
         self.is_downloading = True
 
@@ -138,6 +139,11 @@ class DownloadController:
             self.is_downloading = False
             on_error(err)
 
+        def _worker_duplicate(name: str) -> None:
+            self.is_downloading = False
+            if on_duplicate:
+                on_duplicate(name)
+
         task_mgr.submit_task(
             download_audio_worker,
             target_url,
@@ -147,6 +153,7 @@ class DownloadController:
             self._for_job(job, _worker_success),
             self._for_job(job, _worker_cancelled),
             self._for_job(job, _worker_error),
+            on_duplicate=self._for_job(job, _worker_duplicate) if on_duplicate else None,
         )
 
     def start_playlist(
@@ -162,6 +169,7 @@ class DownloadController:
         on_cancelled: Callable[[], None],
         on_error: Callable[[str], None],
         probed: dict[str, Any] | None = None,
+        on_track_duplicate: Callable[[int, int, str], None] | None = None,
     ) -> None:
         """Scan a YouTube playlist, then download every track, as one cancellable job.
 
@@ -210,6 +218,7 @@ class DownloadController:
                 on_cancelled=self._for_job(job, _cancelled),
                 on_error=self._for_job(job, _error),
                 on_track_failed=self._for_job(job, on_track_failed),
+                on_track_duplicate=self._for_job(job, on_track_duplicate) if on_track_duplicate else None,
             )
 
         task_mgr.submit_task(_worker)

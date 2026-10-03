@@ -247,6 +247,10 @@ class TestUsbExport(unittest.TestCase):
                     patch.object(app.export_ctrl, "start_usb_export") as start,
                 ):
                     app._export_after_preflight(files)
+                    deadline = time.monotonic() + 5.0  # the drive is read on a worker first
+                    while not start.called and time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.01)
                 self.assertIn("earlier export", ask.call_args[0][2])
                 self.assertTrue(start.call_args.kwargs["clear_existing"])
                 self.assertTrue(app.btn_cancel_export.winfo_manager())  # Stop Export is offered

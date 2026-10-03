@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from pathlib import Path
 from typing import Any
 
 from app.config import YOUTUBE_RE, ffmpeg_path
@@ -11,7 +12,7 @@ from app.core.errors import friendly_error, is_recognised
 from app.models import SearchResult
 from app.ui import dialogs
 from app.ui.error_dialog import show_friendly_error
-from app.ui.features.base import AppBase
+from app.ui.features.base import NEW_SONG_ROW_BG, AppBase
 from app.ui.search_dialog import SearchChoiceDialog
 
 
@@ -164,6 +165,7 @@ class DownloadMixin(AppBase):
         self.lbl_dl_metrics.pack(fill=tk.X)
         self.lbl_dl_metrics.config(text="Fetching playlist info...")
         failures: list[tuple[str, str]] = []
+        duplicates: list[str] = []
 
         def _on_probed(title: str, total: int) -> None:
             self._safe_after(0, self.set_status, f"Starting batch download of {total} tracks from '{title}'...")
@@ -193,6 +195,9 @@ class DownloadMixin(AppBase):
         def _on_failed(_idx: int, _tot: int, track_title: str, err: str) -> None:
             failures.append((track_title, err))
 
+        def _on_duplicate(_idx: int, _tot: int, name: str) -> None:
+            duplicates.append(name)
+
         self.download_ctrl.start_playlist(
             url,
             self.library_folder,
@@ -201,8 +206,9 @@ class DownloadMixin(AppBase):
             on_track_progress=_on_prog,
             on_track_finished=_on_fin,
             on_track_failed=_on_failed,
+            on_track_duplicate=_on_duplicate,
             on_batch_complete=lambda files, tot: self._safe_after(
-                0, self._playlist_download_success, files, tot, list(failures)
+                0, self._playlist_download_success, files, tot, list(failures), len(duplicates)
             ),
             on_cancelled=lambda: self._safe_after(0, self._download_cancelled),
             on_error=lambda err: self._safe_after(0, self._download_error, err),
@@ -219,20 +225,34 @@ class DownloadMixin(AppBase):
         self.refresh_library(preserve_view=True)
 
     def _playlist_download_success(
-        self, downloaded_files: list[str], total: int, failures: list[tuple[str, str]] | None = None
+        self,
+        downloaded_files: list[str],
+        total: int,
+        failures: list[tuple[str, str]] | None = None,
+        already_there: int = 0,
     ) -> None:
-        """Report a finished playlist download truthfully: what was saved and what could not be."""
+        """Report a finished playlist download truthfully: what was saved, skipped, and could not be.
+
+        ``already_there`` songs were in the Library before and were not added a second time.
+        """
         self.entry_url.delete(0, tk.END)
         self._reset_download_ui()
         self.set_busy(False)
         self.refresh_library(preserve_view=True)
         count = len(downloaded_files)
+        had = (
+            f" {already_there} song(s) were already in your Library and were not added again." if already_there else ""
+        )
         if not failures:
-            self.notify_success(
-                f"Playlist download complete: all {count} songs are now in your Library, marked in green."
-            )
+            if not already_there:
+                done = f"all {count} songs are now in your Library, marked in green."
+            elif count:
+                done = f"{count} new song(s) are now in your Library, marked in green.{had}"
+            else:
+                done = f"all {already_there} songs were already in your Library, so nothing was added."
+            self.notify_success(f"Playlist download complete: {done}")
             return
-        self.set_status(f"Playlist download finished: {count} of {total} songs saved to Library.", icon="⚠️")
+        self.set_status(f"Playlist download finished: {count} of {total} songs saved to Library.{had}", icon="⚠️")
         self._look_for_update_after_failure([err for _title, err in failures])
         shown = failures[:8]
         lines = [f"• {title[:60]} — {friendly_error(err, 'download').title}" for title, err in shown]
@@ -242,7 +262,7 @@ class DownloadMixin(AppBase):
         dialogs.show_warning(
             self.root,
             "Some Songs Could Not Be Downloaded",
-            f"{count} of {total} songs were saved to your Library.\n\n"
+            f"{count} of {total} songs were saved to your Library.{had}\n\n"
             f"These {len(failures)} song(s) could not be downloaded:\n{failed_list}\n\n"
             "You can try them again later, or search for a different version of each song.",
         )
@@ -308,13 +328,32 @@ class DownloadMixin(AppBase):
             on_success=lambda fname: self._safe_after(0, self._download_success, fname),
             on_cancelled=lambda: self._safe_after(0, self._download_cancelled),
             on_error=lambda err: self._safe_after(0, self._download_error, err),
+            on_duplicate=lambda name: self._safe_after(0, self._download_duplicate, name),
         )
 
-    def _download_success(self, filename: str) -> None:
+    def _download_duplicate(self, filename: str) -> None:
+        """The song is in the Library already: show which one it is instead of adding a second copy."""
         self.entry_url.delete(0, tk.END)
         self._reset_download_ui()
         self.set_busy(False)
-        if self._reveal_new_song(filename):
+        if self.entry_search.get().strip():
+            self.clear_search()  # the song may be filtered out of the list
+        if filename in self.visible_files:
+            row = self.visible_files.index(filename)
+            self._fresh_songs.add(filename)
+            self.listbox_lib.itemconfig(row, background=NEW_SONG_ROW_BG)
+            self.listbox_lib.see(row)
+        self.set_status(
+            f"'{Path(filename).stem}' is already in your Library (marked in green), so it was not added again.",
+            icon="ℹ️",
+        )
+
+    def _download_success(self, filename: str) -> None:
+        """Show the downloaded song; it is loaded into the player unless a song is being worked on."""
+        self.entry_url.delete(0, tk.END)
+        self._reset_download_ui()
+        self.set_busy(False)
+        if self._reveal_new_song(filename, keep_trim_work=True):
             self.notify_success("Download complete! The new song is ready: press PLAY to listen.")
         else:
             self.notify_success("Download complete! The new song is marked in green in your Library on the left.")

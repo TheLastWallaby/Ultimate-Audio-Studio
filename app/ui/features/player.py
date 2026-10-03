@@ -509,6 +509,10 @@ class PlayerMixin(AppBase):
         if self.is_paused:
             self.pause_audio()
             return
+        if (self.is_playing_main or self.is_playing_playlist) and not self.previewing_clip:
+            # Already playing. Starting it again would take a playlist song out of its playlist, so
+            # the playlist would stop after this song.
+            return
         self.stop_audio()
         path = self.selected_file_path
         start_pos = float(self.scale_progress.get())
