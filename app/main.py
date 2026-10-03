@@ -567,6 +567,7 @@ class UltimateAudioStudio(
             "_search_debounce_timer",
             "_undo_timer",
             "_timer_status_flash",
+            "_pl_skip_timer",
         ):
             tid = getattr(self, timer_attr, None)
             if tid:

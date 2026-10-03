@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from app.config import PREVIEW_CACHE_DIR, ffmpeg_path, log_error, run_ffmpeg
-from app.core.file_utils import copy_file_atomic
+from app.core.file_utils import copy_file_atomic, fsync_file
 from app.core.file_utils import replace_with_retry as _replace_with_retry
 from app.core.process_utils import ffmpeg_timed_out
 from app.services.ffmpeg_args import MP3_VBR_QUALITY, clip_filter_chain, mp3_audio_only_args, mp3_output_args
@@ -65,18 +65,33 @@ def _ensure_original_backup(song: Path) -> Path:
     return backup
 
 
-def restore_original(song_path: str) -> None:
+def restore_original(song_path: str | Path) -> None:
     """Put the untrimmed original back in place of the trimmed song.
 
     The trimmed version goes to the Recycle Bin (under its own name, so it can be recovered).
+    A complete copy of the original is made ready first, so a backup that cannot be read (held by
+    an antivirus scan, a failing drive) is found out while the trimmed song is still in the Library.
     Raises OSError when the backup is missing or a file is locked.
     """
-    backup = original_backup_path(song_path)
-    if not os.path.isfile(backup):
-        raise FileNotFoundError(f"No original backup found for {os.path.basename(song_path)}")
-    if os.path.exists(song_path) and _send2trash is not None:
-        _send2trash(song_path)
-    _replace_with_retry(backup, song_path)
+    song = Path(song_path)
+    backup = Path(original_backup_path(str(song)))
+    if not backup.is_file():
+        raise FileNotFoundError(f"No original backup found for {song.name}")
+    # Not an audio file name, so the Library list never shows it.
+    ready = song.with_name(f"{song.name}.{os.getpid()}.restoring")
+    try:
+        copy_file_atomic(backup, ready)
+        if song.exists() and _send2trash is not None:
+            _send2trash(str(song))
+        _replace_with_retry(ready, song)
+    finally:
+        with contextlib.suppress(OSError):  # gone after a successful swap; the backup still holds the original
+            ready.unlink()
+    try:
+        backup.unlink()
+    except OSError as err:
+        # The song is restored; a leftover backup only keeps the 'Restore Original Song' button showing.
+        logger.warning("Could not remove the used backup %s: %s", backup.name, err)
 
 
 def create_audition_slice(
@@ -202,6 +217,8 @@ def clip_audio_worker(
             # The original is the one thing that cannot be made again: no complete backup, no replace.
             _ensure_original_backup(target)
 
+        # On disk before the swap: a power cut must not leave an empty song where the clip should be.
+        fsync_file(tmp_save)
         # Resilient file replace against Windows file indexing / antivirus locks
         _replace_with_retry(str(tmp_save), str(target))
 

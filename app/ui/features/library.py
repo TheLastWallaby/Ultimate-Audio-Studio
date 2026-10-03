@@ -7,26 +7,94 @@ import logging
 import os
 import time
 import tkinter as tk
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tkinter import filedialog
 from typing import Any
 
-from app.config import AUDIO_EXTS, format_time, log_error, sanitize_filename
+from app.config import AUDIO_EXTS, sanitize_filename
 from app.controllers.library_controller import ImportResult
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.metadata import read_track_metadata
 from app.core.task_manager import task_mgr
+from app.models import SongRow
+from app.platform_utils import has_recycle_bin
 from app.ui import dialogs
 from app.ui.components import listbox_selection
 from app.ui.error_dialog import show_error, show_friendly_error
-from app.ui.features.base import AppBase
+from app.ui.features.base import UNDO_SECONDS, AppBase
 
 logger = logging.getLogger(__name__)
 
 # Background of a just-added library row that was not selected (music was playing at the time).
 NEW_SONG_ROW_BG = "#dcfce7"
+# An import of more songs than this, or of more data, is confirmed first: a whole Music folder dropped
+# by accident would otherwise be copied (and fill the disk) without a word.
+LARGE_IMPORT_SONGS = 200
+LARGE_IMPORT_BYTES = 2 * 1024**3
+LIBRARY_WATCH_MS = 12000
+# Up to this many rows whose details are not in memory yet are looked up at once (a few disk checks
+# each, no file is opened). Above it the rows show their file names until the background reader has
+# been through them, so a long list is never drawn at the speed of the disk.
+SYNC_ROW_LIMIT = 50
+
+
+def _row_label(title: str, artist: str, filename: str) -> str:
+    """'Title — Artist' from the tags when present, else the file name without its extension."""
+    title = title.strip() or Path(filename).stem
+    artist = artist.strip()
+    if artist.endswith(" - Topic"):  # YouTube's auto-generated artist channels
+        artist = artist[: -len(" - Topic")]
+    if artist and artist.lower() not in title.lower():
+        return f"{title} — {artist}"
+    return title
+
+
+def _placeholder_row(path: str) -> SongRow:
+    """The row for a song whose details have not been read yet: its file name."""
+    song = Path(path)
+    return SongRow(label=song.stem, searchable=song.name.lower())
+
+
+def _row_from_details(path: str, details: Mapping[str, Any]) -> SongRow:
+    name = Path(path).name
+    title, artist = str(details.get("title") or ""), str(details.get("artist") or "")
+    return SongRow(
+        label=_row_label(title, artist, name),
+        seconds=float(details.get("duration") or 0.0),
+        searchable=f"{name} {title} {artist}".lower(),
+    )
+
+
+def _remembered_row(path: str) -> SongRow | None:
+    """The row for ``path`` from the details cache (a few disk checks); None when they were never read."""
+    # The cache first: it answers None for a song that is gone as well as for one never read, so a
+    # song that vanishes while this runs is reported missing and never handed on to the tag reader.
+    details = cache_mgr.get_metadata(path)
+    if details is not None:
+        return _row_from_details(path, details)
+    song = Path(path)
+    if not song.is_file():
+        return SongRow(label=song.stem, searchable=song.name.lower(), missing=True)
+    return None
+
+
+def read_song_row(path: str) -> SongRow:
+    """The row for ``path``, reading the song's tags when they are not cached yet (worker threads only)."""
+    row = _remembered_row(path)
+    if row is not None:
+        return row
+    details = read_track_metadata(path)
+    cache_mgr.set_metadata(path, details)
+    return _row_from_details(path, details.to_dict())
+
+
+def _size_text(size_bytes: int) -> str:
+    """A size the way people say it: "350 MB", "4.2 GB"."""
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.1f} GB"
+    return f"{max(1, round(size_bytes / 1024**2))} MB"
 
 
 def _same_song(a: str | None, b: str | None) -> bool:
@@ -45,6 +113,30 @@ class LibraryMixin(AppBase):
     # The chosen Library folder when it was offline at start-up (a USB drive, memory card or network
     # share). The window then shows the default folder, but this one is what gets saved.
     _unavailable_library_folder: str | None = None
+    # True while the Library watcher is reading the folder on a worker (one read at a time).
+    _library_scan_running = False
+
+    def _known_rows(self) -> dict[str, SongRow]:
+        """The rows read so far, by path (as the lists spell it)."""
+        rows: dict[str, SongRow] | None = vars(self).get("_song_rows")
+        if rows is None:
+            rows = self._song_rows = {}
+        return rows
+
+    def _song_rows_for(self, paths: Sequence[str]) -> list[SongRow]:
+        """Rows for drawing a list now, from memory.
+
+        A few rows that are not in memory yet are looked up at once (``SYNC_ROW_LIMIT``); when there
+        are many, they show their file names until the background reader has filled them in.
+        """
+        known = self._known_rows()
+        unknown = [path for path in paths if path not in known]
+        if len(unknown) <= SYNC_ROW_LIMIT:
+            for path in unknown:
+                row = _remembered_row(path)
+                if row is not None:
+                    known[path] = row
+        return [known.get(path) or _placeholder_row(path) for path in paths]
 
     def _library_row_path(self, filename: str) -> str:
         """Path of a Library row, in the exact form the player and the playlists keep it in.
@@ -74,8 +166,42 @@ class LibraryMixin(AppBase):
         self._import_paths(paths, source="dropped")
 
     def _import_paths(self, paths: list[str], source: str = "selected") -> None:
-        """Copy audio files/folders into the Library, asking before replacing existing songs."""
-        planned, dest_exists = self.library_ctrl.build_import_plan(paths, self.library_folder)
+        """Copy audio files/folders into the Library, asking before replacing existing songs.
+
+        A dropped folder can hold thousands of files (or sit on a CD or another computer), so it is
+        searched on a worker; the questions are asked once the songs in it are known.
+        """
+        if self._importing:
+            self.set_status("Still adding songs to your Library. Add these again when it has finished.", icon="⏳")
+            return
+        self._importing = True
+        self.set_busy(True, f"Looking for songs in the {source} files...")
+        library = self.library_folder
+
+        def _worker() -> None:
+            try:
+                planned, dest_exists = self.library_ctrl.build_import_plan(paths, library)
+                total_bytes = sum(Path(src).stat().st_size for src, _dest in planned)
+            except OSError as err:
+                logger.error("Could not read the %s files: %s", source, err)
+                self._safe_after(0, self._import_plan_failed, err)
+                return
+            self._safe_after(0, self._confirm_import, planned, dest_exists, source, total_bytes)
+
+        task_mgr.submit_task(_worker)
+
+    def _import_plan_failed(self, err: OSError) -> None:
+        """The files to import could not be read (a CD or drive removed meanwhile)."""
+        self._importing = False
+        self.set_busy(False, "No songs were added to your Library.")
+        show_friendly_error(self.root, err, "import")
+
+    def _confirm_import(
+        self, planned: list[tuple[str, str]], dest_exists: list[str], source: str, total_bytes: int
+    ) -> None:
+        """Ask the import questions (all of them before anything is copied), then start copying."""
+        self._importing = False
+        self.set_busy(False)
         if not planned and not dest_exists:
             dialogs.show_info(
                 self.root,
@@ -87,24 +213,46 @@ class LibraryMixin(AppBase):
             self.set_status(f"The {source} audio files are already in your Library.")
             return
 
+        if (len(planned) > LARGE_IMPORT_SONGS or total_bytes > LARGE_IMPORT_BYTES) and not dialogs.ask_yes_no(
+            self.root,
+            "Add All These Songs?",
+            f"The {source} files hold {len(planned)} songs ({_size_text(total_bytes)}).\n\n"
+            "They are copied into your Library; the originals stay where they are.",
+            yes=f"Add {len(planned)} songs",
+            no="Cancel",
+            default_yes=False,
+        ):
+            self.set_status("No songs were added to your Library.")
+            return
+
+        already_there = {name.casefold() for name in dest_exists}
         if dest_exists:
+            gone = (
+                "go to the Recycle Bin"
+                if has_recycle_bin(self.library_folder)
+                else "are deleted for good (this drive has no Recycle Bin)"
+            )
             replace = dialogs.ask_yes_no(
                 self.root,
                 "Songs Already in Your Library",
                 f"{len(dest_exists)} of the {source} song(s) are already in your Library.\n\n"
-                "If you replace them, the copies you have now go to the Recycle Bin.",
+                f"If you replace them, the copies you have now {gone}.",
                 yes="Replace them",
                 no="Keep the ones I have",
                 default_yes=False,
             )
             if not replace:
-                planned = [(s, d) for (s, d) in planned if not Path(d).exists()]
+                planned = [(s, d) for (s, d) in planned if Path(d).name.casefold() not in already_there]
 
         if not planned:
             return
 
         # The song in the player is held open, and Windows will not move an open file to the Recycle Bin.
-        if any(_same_song(dest, self.selected_file_path) for _src, dest in planned if Path(dest).exists()):
+        if any(
+            _same_song(dest, self.selected_file_path)
+            for _src, dest in planned
+            if Path(dest).name.casefold() in already_there
+        ):
             self.stop_audio()
             self._release_audio_file()
 
@@ -116,12 +264,15 @@ class LibraryMixin(AppBase):
             on_done=lambda result: self._safe_after(0, self._on_copy_external_done, result),
         )
 
-    def refresh_library(self, select_name: str | None = None, preserve_view: bool = False) -> None:
+    def refresh_library(
+        self, select_name: str | None = None, preserve_view: bool = False, files: list[str] | None = None
+    ) -> None:
         """Show the folder's songs immediately; tags and durations fill in from a background scan.
 
         preserve_view keeps the current selection and scroll position (for background refreshes).
+        ``files`` is the folder's song list when the caller has just read it (the Library watcher).
         """
-        self.library_files = self.library_ctrl.scan_files(self.library_folder)
+        self.library_files = self.library_ctrl.scan_files(self.library_folder) if files is None else files
         self.apply_library_filter(select_name, preserve_view=preserve_view)
         self._warm_library_metadata()
 
@@ -140,87 +291,82 @@ class LibraryMixin(AppBase):
             self.stop_audio()
             return self._load_track_ui(path, filename)
         self._fresh_songs.add(filename)
-        self.refresh_library()
+        self.refresh_library(preserve_view=True)
         if filename in self.visible_files:
             self.listbox_lib.see(self.visible_files.index(filename))
         return False
 
     def _warm_library_metadata(self) -> None:
-        """Read tags/durations for songs not yet cached on a worker thread, then refresh the lists once."""
-        paths = [os.path.join(self.library_folder, f) for f in self.library_files]
-        paths += [f for f in getattr(self, "playlist_files", []) if f not in paths]
-        missing = [p for p in paths if cache_mgr.get_metadata(p) is None]
-        if not missing:
-            return
+        """Read every listed song's details on a worker, then redraw the lists if anything changed.
+
+        This is the only place the lists' details come from the disk: tags of songs that were never
+        read, and whether each song is still there. Drawing a list uses what was read here.
+        """
+        paths = [self._library_row_path(name) for name in self.library_files]
+        listed = set(paths)
+        paths += [path for path in self.playlist_files if path not in listed]
+        known = self._known_rows()
+        unread = sum(1 for path in paths if path not in known)
         self._library_meta_gen += 1
         gen = self._library_meta_gen
-        if len(missing) > 20:
-            self.set_status(f"Reading song details for {len(missing)} songs...", icon="⏳")
+        announce = unread > 20
+        if announce:
+            self.set_status(f"Reading song details for {unread} songs...", icon="⏳")
 
         def _worker() -> None:
-            for path in missing:
-                if getattr(self, "_is_shutting_down", False) or gen != self._library_meta_gen:
+            rows: dict[str, SongRow] = {}
+            for path in paths:
+                if self._is_shutting_down or gen != self._library_meta_gen:
                     return
                 try:
-                    cache_mgr.set_metadata(path, read_track_metadata(path))
-                except Exception as e:
-                    log_error(f"metadata warm-up {path}: {e}")
-            self._safe_after(0, self._on_library_metadata_ready, gen, len(missing))
+                    rows[path] = read_song_row(path)
+                except OSError as err:  # the drive went away mid-read: the row keeps its file name
+                    logger.warning("Could not read the details of %s: %s", Path(path).name, err)
+                    rows[path] = _placeholder_row(path)
+            self._safe_after(0, self._on_library_metadata_ready, gen, rows, announce)
 
         task_mgr.submit_task(_worker)
 
-    def _on_library_metadata_ready(self, gen: int, count: int) -> None:
-        if gen != self._library_meta_gen or getattr(self, "_is_shutting_down", False):
+    def _on_library_metadata_ready(self, gen: int, rows: dict[str, SongRow], announce: bool) -> None:
+        """Keep the rows the worker read; redraw both lists when they differ from what is showing."""
+        if gen != self._library_meta_gen or self._is_shutting_down:
             return
-        self.library_ctrl.invalidate_search_index()
-        self.apply_library_filter(preserve_view=True)
-        pl_selection = listbox_selection(self.listbox_pl)
-        pl_view = self.listbox_pl.yview()[0]
-        self.refresh_playlist_listbox()
-        for idx in pl_selection:
-            self.listbox_pl.selection_set(idx)
-        self.listbox_pl.yview_moveto(pl_view)
-        if count > 20:
+        changed = rows != self._known_rows()
+        self._song_rows = rows
+        if changed:
+            self.apply_library_filter(preserve_view=True)
+            pl_selection = listbox_selection(self.listbox_pl)
+            pl_view = self.listbox_pl.yview()[0]
+            self.refresh_playlist_listbox()
+            for idx in pl_selection:
+                self.listbox_pl.selection_set(idx)
+            self.listbox_pl.yview_moveto(pl_view)
+        if announce:
             self.set_status("Ready. Select a song on the left to play or trim.")
 
     def _display_name(self, path: str, filename: str | None = None) -> str:
         """Friendly row text: 'Title — Artist' from tags when present, else the file name without extension."""
         meta = self._cached_metadata(path, probe=False)
-        stem = os.path.splitext(filename or os.path.basename(path))[0]
-        title = (meta.get("title") or "").strip() or stem
-        artist = (meta.get("artist") or "").strip()
-        if artist.endswith(" - Topic"):
-            artist = artist[: -len(" - Topic")]
-        if artist and artist.lower() not in title.lower():
-            return f"{title} — {artist}"
-        return title
+        return _row_label(str(meta.get("title") or ""), str(meta.get("artist") or ""), filename or Path(path).name)
 
     def apply_library_filter(self, select_name: str | None = None, preserve_view: bool = False) -> None:
+        """Draw the Library list for what is typed in the search box, from memory (no disk access)."""
         query = self.entry_search.get().strip().lower() if hasattr(self, "entry_search") else ""
-        prev_selected = set()
+        prev_selected: set[str] = set()
         prev_view = None
         if preserve_view:
             prev_selected = {
                 self.visible_files[i] for i in listbox_selection(self.listbox_lib) if i < len(self.visible_files)
             }
             prev_view = self.listbox_lib.yview()[0]
-        if hasattr(self, "library_ctrl"):
-            self.visible_files = self.library_ctrl.filter_files(
-                self.library_files,
-                self.library_folder,
-                query,
-                get_metadata_fn=lambda path: self._cached_metadata(path, probe=False),
-            )
-        else:
-            self.visible_files = list(self.library_files)
+        paths = [self._library_row_path(f) for f in self.library_files]
+        rows = dict(zip(self.library_files, self._song_rows_for(paths), strict=True))
+        self.visible_files = [f for f in self.library_files if query in rows[f].searchable]
 
         self.listbox_lib.delete(0, tk.END)
         select_idx = None
         for idx, f in enumerate(self.visible_files):
-            f_path = os.path.join(self.library_folder, f)
-            dur = self._cached_duration(f_path, probe=False)
-            dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
-            self.listbox_lib.insert(tk.END, f"{self._display_name(f_path, f)}{dur_str}")
+            self.listbox_lib.insert(tk.END, rows[f].text)
             if f in self._fresh_songs:
                 self.listbox_lib.itemconfig(idx, background=NEW_SONG_ROW_BG)
             if select_name and f == select_name:
@@ -324,7 +470,7 @@ class LibraryMixin(AppBase):
             cache_mgr.invalidate(path)
             self.library_ctrl.invalidate_search_index(path)
             self._art_cache.pop(path, None)
-        self.refresh_library()
+        self.refresh_library(preserve_view=True)
         reloaded = next(
             (n for n in result.replaced if _same_song(self._library_row_path(n), self.selected_file_path)), None
         )
@@ -339,10 +485,12 @@ class LibraryMixin(AppBase):
                     f" {len(result.renamed)} had the same name as another song, so they were added with a "
                     f"number, like '{result.renamed[0]}'."
                 )
+            bin_note = "is in the Recycle Bin" if has_recycle_bin(self.library_folder) else "was deleted"
             if len(result.replaced) == 1:
-                message += f" The older copy of '{result.replaced[0]}' is in the Recycle Bin."
+                message += f" The older copy of '{result.replaced[0]}' {bin_note}."
             elif result.replaced:
-                message += f" The {len(result.replaced)} older copies they replaced are in the Recycle Bin."
+                were = "are in the Recycle Bin" if bin_note.startswith("is") else "were deleted"
+                message += f" The {len(result.replaced)} older copies they replaced {were}."
             self.notify_success(message)
         else:
             self.set_status("No songs were added to your Library.", icon="⚠️")
@@ -360,16 +508,32 @@ class LibraryMixin(AppBase):
             )
 
     def _watch_library(self) -> None:
-        if not getattr(self, "_is_shutting_down", False):
-            try:
-                # Compare names, not just the count, so renames done in File Explorer show up too.
-                on_disk = self.library_ctrl.scan_files(self.library_folder)
-                if on_disk != self.library_files:
-                    self.refresh_library(preserve_view=True)
-            except Exception:
-                pass
-            if hasattr(self, "root") and self.root and self.root.winfo_exists():
-                self._timer_watch_library = self.root.after(12000, self._watch_library)
+        """Every few seconds, notice songs added, renamed or removed in File Explorer.
+
+        The folder is read on a worker: a Library on a network folder or a sleeping USB drive can take
+        seconds to answer, and the window must not freeze meanwhile.
+        """
+        if self._is_shutting_down:
+            return
+        if not self._library_scan_running:
+            self._library_scan_running = True
+            folder = self.library_folder
+
+            def _worker() -> None:
+                on_disk = self.library_ctrl.scan_files(folder)
+                self._safe_after(0, self._library_scanned, folder, on_disk)
+
+            if task_mgr.submit_task(_worker) is None:
+                self._library_scan_running = False
+        with contextlib.suppress(tk.TclError):
+            self._timer_watch_library = self.root.after(LIBRARY_WATCH_MS, self._watch_library)
+
+    def _library_scanned(self, folder: str, on_disk: list[str]) -> None:
+        """Show what the watcher found, unless the Library folder was changed meanwhile."""
+        self._library_scan_running = False
+        # Compare names, not just the count, so renames done in File Explorer show up too.
+        if folder == self.library_folder and on_disk != self.library_files:
+            self.refresh_library(preserve_view=True, files=on_disk)
 
     def rename_library_file(self) -> None:
         """Rename the selected song; its playlist entries and its trim backup follow it."""
@@ -427,21 +591,29 @@ class LibraryMixin(AppBase):
             return
         names = [self.visible_files[i] for i in sel]
         paths = [self._library_row_path(name) for name in names]
+        one = len(names) == 1
+        # USB sticks, memory cards and network folders have no Recycle Bin: there, deleting is for good.
+        recyclable = has_recycle_bin(self.library_folder)
 
-        if len(names) == 1:
+        if one:
             title = "Delete Song"
-            question = f"Are you sure you want to delete '{names[0]}'?\n\nIt will be moved"
+            question = f"Are you sure you want to delete '{names[0]}'?"
         else:
             title = "Delete Songs"
             listed = "\n".join(f"• {name}" for name in names[:8])
             more = f"\n... and {len(names) - 8} more." if len(names) > 8 else ""
-            question = (
-                f"Are you sure you want to delete these {len(names)} songs?\n\n{listed}{more}\n\nThey will be moved"
+            question = f"Are you sure you want to delete these {len(names)} songs?\n\n{listed}{more}"
+        if recyclable:
+            where = f"{'It' if one else 'They'} will be moved safely to your Windows Recycle Bin."
+        else:
+            where = (
+                f"This drive has no Recycle Bin, so {'it is' if one else 'they are'} deleted for good. "
+                f"You can still press Undo for {UNDO_SECONDS:.0f} seconds afterwards."
             )
         if not dialogs.ask_yes_no(
             self.root,
             title,
-            f"{question} safely to your Windows Recycle Bin.",
+            f"{question}\n\n{where}",
             yes="Delete" if len(names) == 1 else f"Delete {len(names)} songs",
             no="Keep",
             danger=True,
@@ -472,10 +644,16 @@ class LibraryMixin(AppBase):
         self._resync_playlist_index()
         self.save_playlists()
         self.refresh_playlist_listbox()
-        self.refresh_library()
+        # The list stays where it was scrolled to: deleting several songs one by one from the middle
+        # of a long Library must not mean scrolling back down after each.
+        self.refresh_library(preserve_view=True)
         if staged:
             what = f"'{staged[0]}'" if len(staged) == 1 else f"{len(staged)} songs"
-            self.show_undo(f"Moved {what} to Recycle Bin.", callback=self._undo_delete_file)
+            them = "it" if len(staged) == 1 else "them"
+            done = (
+                f"Moved {what} to Recycle Bin." if recyclable else f"Deleted {what}. Press Undo to bring {them} back."
+            )
+            self.show_undo(done, callback=self._undo_delete_file)
         if failed:
             fe = friendly_error(failed[0][1], "generic")
             listed = "\n".join(f"• {name}" for name, _err in failed[:8])
@@ -487,15 +665,24 @@ class LibraryMixin(AppBase):
             )
 
     def _undo_delete_file(self) -> None:
-        try:
-            if self.library_ctrl.undo_delete(self.playlists):
-                self._resync_playlist_index()
-                self.save_playlists()
-                self.refresh_playlist_listbox()
-                self.refresh_library()
-                self.set_status("Restored deleted song(s).", icon="↩️")
-        except Exception as e:
-            log_error(f"_undo_delete_file: {e}")
+        """Undo button after a delete: bring the song(s) back and say so (or offer to try again)."""
+        result = self.library_ctrl.undo_delete(self.playlists)
+        if not result:
+            self.show_undo("The song(s) could not be put back. Press Undo to try again.", self._undo_delete_file)
+            return
+        self._resync_playlist_index()
+        self.save_playlists()
+        self.refresh_playlist_listbox()
+        self.refresh_library(preserve_view=True)
+        message = "Restored deleted song(s)."
+        if result.renamed:
+            message += (
+                f" A newer song has taken the old name, so one came back as '{result.renamed[0]}'."
+                if len(result.renamed) == 1
+                else f" Newer songs have taken {len(result.renamed)} of the old names, so those came back "
+                f"with a number, like '{result.renamed[0]}'."
+            )
+        self.set_status(message, icon="↩️")
 
     def on_library_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         """A Library row was clicked: load it into the player, unless a song is playing or paused.

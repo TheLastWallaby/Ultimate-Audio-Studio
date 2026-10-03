@@ -6,6 +6,27 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.time_utils import format_time
+
+
+@dataclass(slots=True, frozen=True)
+class SongRow:
+    """What a Library or playlist row shows for one song.
+
+    Rows are read from the disk on a worker and kept in memory, so that drawing a list (after every
+    key typed in the search box, every delete, every playlist change) never waits for the disk.
+    """
+
+    label: str  # "Title — Artist", or the file name without its extension
+    seconds: float = 0.0  # the song's length; 0 when it is not known
+    searchable: str = ""  # lower-case file name, title and artist: what the search box looks in
+    missing: bool = False  # the file was not there when the row was read
+
+    @property
+    def text(self) -> str:
+        """The row as shown in a list: the label, then the length when it is known."""
+        return f"{self.label} [{format_time(self.seconds)}]" if self.seconds > 0 else self.label
+
 
 @dataclass(slots=True, frozen=True)
 class TrackMetadata:

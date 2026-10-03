@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pygame
 
-from app.config import PREVIEW_CACHE_DIR, log_error, run_ffmpeg
+from app.config import PREVIEW_CACHE_DIR, run_ffmpeg
 from app.core.metadata import read_track_metadata
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,10 @@ def _conversion_timeout_sec(filepath: str) -> int:
     if duration <= 0:
         return _CONVERT_TIMEOUT_UNKNOWN_SEC
     return int(min(_CONVERT_TIMEOUT_MAX_SEC, max(_CONVERT_TIMEOUT_MIN_SEC, 60 + duration / 2)))
+
+
+class NoAudioDeviceError(pygame.error):
+    """No speakers or headphones could be opened, so nothing can be played."""
 
 
 def _has_content(path: Path) -> bool:
@@ -66,15 +70,31 @@ class AudioEngine:
         self._convert_locks: dict[str, threading.Lock] = {}
         self._init_mixer()
 
-    def _init_mixer(self) -> None:
-        """Single mixer pre_init to avoid audio driver deadlocks on Windows."""
+    def _init_mixer(self) -> bool:
+        """Start the mixer unless it is already running; True when it is running afterwards.
+
+        It is started once and never restarted per track (AGENTS.md). Only a mixer that could not
+        start at all is tried again, by :meth:`ensure_mixer`.
+        """
+        if pygame.mixer.get_init():
+            return True
         try:
-            if not pygame.mixer.get_init():
-                pygame.mixer.pre_init(44100, -16, 2, self.buffer_samples)
-                pygame.mixer.init()
-                pygame.mixer.music.set_volume(0.8)
-        except Exception as e:
-            log_error(f"AudioEngine._init_mixer: {e}")
+            pygame.mixer.pre_init(44100, -16, 2, self.buffer_samples)
+            pygame.mixer.init()
+        except pygame.error as err:
+            logger.warning("No sound output could be opened: %s", err)
+            return False
+        self.set_volume(self._master_volume)
+        return True
+
+    def ensure_mixer(self) -> None:
+        """Start the mixer if there was no sound device when the app started; raises NoAudioDeviceError.
+
+        Bluetooth speakers that connect after the app opens, or a TV that is switched on later, would
+        otherwise leave the app silent until it is closed and opened again.
+        """
+        if not self._init_mixer():
+            raise NoAudioDeviceError("No audio output device is available (mixer not initialized)")
 
     def release_audio_file(self) -> None:
         """Safely stops and unloads pygame mixer handles to prevent Windows file locking."""
@@ -213,7 +233,8 @@ class AudioEngine:
         return self.play_start_offset
 
     def load_and_play(self, filepath: str, start_sec: float = 0.0) -> None:
-        """Load and start playback from start_sec."""
+        """Load and start playback from start_sec; raises NoAudioDeviceError when nothing can be heard."""
+        self.ensure_mixer()
         playable = self.get_playable_audio_path(filepath)
         pygame.mixer.music.load(playable)
         pygame.mixer.music.play(start=start_sec)

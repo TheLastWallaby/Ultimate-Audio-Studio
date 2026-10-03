@@ -206,6 +206,7 @@ class PlaybackController:
     ) -> None:
         """Start clip playback on the UI thread, from a prepared slice or directly from the track."""
         self.stop(user=False)
+        self.audio_engine.ensure_mixer()
         self.loop_preview = bool(loop)
         self.clip_start_time = s_time
         self.clip_end_time = e_time

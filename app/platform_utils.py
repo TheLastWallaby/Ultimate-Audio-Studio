@@ -323,6 +323,26 @@ def kill_process_tree(proc: subprocess.Popen[bytes], timeout_sec: float = 15.0) 
         proc.wait(timeout=timeout_sec)
 
 
+_DRIVE_FIXED = 3
+
+
+def has_recycle_bin(path: str | Path) -> bool:
+    """True when files deleted from ``path``'s drive go to the Recycle Bin.
+
+    Windows keeps a Recycle Bin only on fixed disks (most external hard disks count as fixed). On USB
+    flash drives, memory cards and network folders, "send to the Recycle Bin" deletes for good.
+    """
+    if os.name != "nt":
+        return True
+    anchor = Path(path).absolute().anchor
+    if not anchor:
+        return True
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetDriveTypeW.restype = ctypes.c_uint
+    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    return int(kernel32.GetDriveTypeW(anchor)) == _DRIVE_FIXED
+
+
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 _keep_awake_active = False

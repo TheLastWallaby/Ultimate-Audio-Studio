@@ -6,6 +6,7 @@ import contextlib
 import ctypes
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import AUDIO_EXTS, log_error
-from app.core.file_utils import copy_file_atomic, replace_with_retry
+from app.core.file_utils import copy_file_atomic, replace_with_retry, unused_path
 from app.core.task_manager import task_mgr
 from app.services.clipper import original_backup_path
 
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 MetadataFn = Callable[[str], Mapping[str, Any]]
 
 UNDO_DIR_NAME = ".undo_trash"
+# Temporary files this app makes in the Library folder while it copies, clips or restores a song. Each
+# name carries the id of the process that made it, so no file of the user's can match.
+_WORK_FILE_RE = re.compile(
+    r"^(?:\.clip_tmp_(?P<clip_pid>\d+)_\d+\.(?:mp3|wav)|.+\.(?P<pid>\d+)\.(?:partial|incoming|restoring))$"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,6 +45,17 @@ class ImportResult:
     renamed: tuple[str, ...] = ()  # the copied songs that were given a new name to avoid a clash
     failed: tuple[str, ...] = ()  # songs that could not be copied
     replaced: tuple[str, ...] = ()  # the copied songs that replaced one already there (now in the Recycle Bin)
+
+
+@dataclass(slots=True, frozen=True)
+class UndoResult:
+    """What Undo brought back, by file name; false when nothing came back."""
+
+    restored: tuple[str, ...] = ()  # songs back in the Library (under these names)
+    renamed: tuple[str, ...] = ()  # the restored songs that got a new name because theirs was taken meanwhile
+
+    def __bool__(self) -> bool:
+        return bool(self.restored)
 
 
 def _path_key(path: Path) -> str:
@@ -54,6 +71,31 @@ def _free_name(dest: Path, taken_names: set[str]) -> Path:
         if candidate.name.casefold() not in taken_names and not candidate.exists():
             return candidate
         number += 1
+
+
+def remove_stale_work_files(folder: Path) -> int:
+    """Remove the app's own unfinished temporary files that an earlier run left in ``folder``.
+
+    A run that was ended mid-save (a crash, the power going) leaves its half-made copy or clip
+    behind; a leftover clip even shows up in the Library as a song. Files of this run are kept: one
+    of them may be in use right now. Returns the number of files removed.
+    """
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    for entry in entries:
+        match = _WORK_FILE_RE.match(entry.name)
+        if match is None or int(match.group("clip_pid") or match.group("pid")) == os.getpid():
+            continue
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError as err:
+            logger.warning("Could not remove the leftover file %s: %s", entry.name, err)
+    return removed
 
 
 def _hide_path(path: str) -> None:
@@ -327,34 +369,50 @@ class LibraryController:
         self._pending_deletes.append((filepath, staging_path, filename, affected_playlists))
         return filename
 
-    def undo_delete(self, playlists: dict[str, list[str]]) -> bool:
-        """Restore the staged deleted file(s) back to the library and playlists."""
-        if not self._pending_deletes:
-            return False
+    def undo_delete(self, playlists: dict[str, list[str]]) -> UndoResult:
+        """Put the staged deleted file(s) back in the Library and the playlists.
+
+        A song whose name was taken meanwhile (a download with the same title) comes back as
+        "Name (2).mp3": moving it onto the new song would replace that one. A song that could not be
+        moved back stays staged, so Undo can be tried again.
+        """
         pending, self._pending_deletes = self._pending_deletes, []
-        restored = False
+        restored: list[str] = []
+        renamed: list[str] = []
+        still_staged = []
         # Newest first, so playlist positions are restored in the reverse order they were removed.
-        for orig_path, staging_path, _filename, affected_playlists in reversed(pending):
+        for entry in reversed(pending):
+            orig_path, staging_path, _filename, affected_playlists = entry
+            staged = Path(staging_path)
+            target = orig_path
             try:
-                if os.path.exists(staging_path):
-                    shutil.move(staging_path, orig_path)
-                    staged_backup = original_backup_path(staging_path)
-                    if os.path.exists(staged_backup):
-                        shutil.move(staged_backup, original_backup_path(orig_path))
+                if staged.exists():
+                    free = unused_path(orig_path)
+                    if free.name != Path(orig_path).name:
+                        # Same folder spelling as before; only the file name changes.
+                        target = orig_path[: len(orig_path) - len(Path(orig_path).name)] + free.name
+                        renamed.append(free.name)
+                    replace_with_retry(staged, target)
+                    staged_backup = Path(original_backup_path(staging_path))
+                    if staged_backup.exists():
+                        replace_with_retry(staged_backup, original_backup_path(target))
                     with contextlib.suppress(OSError):
-                        os.rmdir(os.path.dirname(staging_path))
-                self.invalidate_search_index(orig_path)
-                for pl_name, indices in affected_playlists:
-                    if pl_name in playlists:
-                        for idx in indices:
-                            if idx <= len(playlists[pl_name]):
-                                playlists[pl_name].insert(idx, orig_path)
-                            else:
-                                playlists[pl_name].append(orig_path)
-                restored = True
-            except Exception as e:
-                log_error(f"undo_delete: {e}")
-        return restored
+                        staged.parent.rmdir()
+            except OSError as err:
+                logger.error("Undo could not put %s back: %s", Path(orig_path).name, err)
+                still_staged.append(entry)
+                continue
+            self.invalidate_search_index(target)
+            for pl_name, indices in affected_playlists:
+                if pl_name in playlists:
+                    for idx in indices:
+                        if idx <= len(playlists[pl_name]):
+                            playlists[pl_name].insert(idx, target)
+                        else:
+                            playlists[pl_name].append(target)
+            restored.append(Path(target).name)
+        self._pending_deletes = list(reversed(still_staged))
+        return UndoResult(tuple(restored), tuple(renamed))
 
     def flush_pending_trash(self) -> None:
         """Commit pending staged deletes to the Windows Recycle Bin."""
@@ -364,22 +422,27 @@ class LibraryController:
             _trash_staged_file(staging_path, orig_path)
 
     @staticmethod
-    def recover_stranded_deletes(folder: str | None) -> int:
-        """Send files left in the undo area by a crash or forced exit to the Recycle Bin.
+    def recover_stranded_deletes(folder: str | Path | None) -> int:
+        """Tidy the Library folder after a crash or forced exit; returns the number of files handled.
 
-        Returns the number of files handled. Legacy '<name>.undo' files are supported too.
+        Files left in the undo area go to the Recycle Bin (legacy '<name>.undo' files too), and the
+        app's own unfinished temporary files are removed (``remove_stale_work_files``).
         """
-        undo_root = os.path.join(folder or "", UNDO_DIR_NAME)
-        if not folder or not os.path.isdir(undo_root):
+        if not folder:
             return 0
-        handled = 0
+        library = Path(folder)
+        handled = remove_stale_work_files(library)
+        undo_root = library / UNDO_DIR_NAME
+        if not undo_root.is_dir():
+            return handled
+        # os.walk, not Path.walk: that one needs Python 3.12.
         for root_dir, _dirs, files in os.walk(undo_root, topdown=False):
             for name in files:
                 original_name = name[: -len(".undo")] if name.endswith(".undo") else name
-                _trash_staged_file(os.path.join(root_dir, name), os.path.join(folder, original_name))
+                _trash_staged_file(str(Path(root_dir) / name), str(library / original_name))
                 handled += 1
             with contextlib.suppress(OSError):
-                os.rmdir(root_dir)
+                Path(root_dir).rmdir()
         return handled
 
     def import_external_files(

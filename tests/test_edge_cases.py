@@ -28,15 +28,15 @@ class TestEdgeCasesAndFailureScenarios(unittest.TestCase):
     """Test suite hardening the application against real-world errors and failure modes."""
 
     def test_search_youtube_network_drop(self) -> None:
-        """Verify search_youtube handles network timeout/drop gracefully by returning []."""
+        """A dropped connection is reported as a failure, never as "no matches" (an empty list)."""
         with patch("yt_dlp.YoutubeDL") as mock_ydl:
             mock_inst = MagicMock()
             mock_inst.__enter__.return_value = mock_inst
             mock_inst.extract_info.side_effect = TimeoutError("Connection timed out")
             mock_ydl.return_value = mock_inst
 
-            results = search_youtube("test query")
-            self.assertEqual(results, [])
+            with self.assertRaises(TimeoutError):
+                search_youtube("test query")
 
     def test_fetch_preview_network_error(self) -> None:
         """Verify fetch_preview_worker captures network failure and calls on_error callback."""
