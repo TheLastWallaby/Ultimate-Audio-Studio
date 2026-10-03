@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 import time
 import tkinter as tk
 import urllib.request
 from collections.abc import Callable, Iterator
 from http.client import HTTPMessage
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -20,7 +22,7 @@ from app.core.audio_engine import AudioEngine
 from app.core.cache_manager import cache_mgr
 from app.core.errors import ErrorContext, friendly_error
 from app.main import UltimateAudioStudio
-from app.models import DriveInfo
+from app.models import DriveInfo, SearchResult
 from app.services import clipper, exporter
 from app.services.exporter import ExportReport
 from app.services.updater import _GitHubAssetRedirectHandler
@@ -376,3 +378,210 @@ def test_a_short_job_ending_leaves_the_export_shown_as_working(studio: UltimateA
 
     assert not studio._busy
     assert str(studio.root.cget("cursor")) == ""
+
+
+# --- 9. Songs chosen while another is being downloaded wait for their turn --------------------------
+
+
+class _FakeDownloads:
+    """Stands in for the download worker: each download waits until the test lets it end."""
+
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self._ends: dict[str, tuple[threading.Event, str, str]] = {}
+
+    def worker(self, url: str, _folder: str, cancel: threading.Event, *callbacks: Any, **kwargs: Any) -> None:
+        _progress, on_success, on_cancelled, on_error = callbacks
+        done = threading.Event()
+        self._ends[url] = (done, "success", "")
+        self.started.append(url)
+        while not done.wait(0.01):
+            if cancel.is_set():
+                on_cancelled()
+                return
+        _done, outcome, value = self._ends[url]
+        if outcome == "success":
+            on_success(value)
+        elif outcome == "duplicate":
+            kwargs["on_duplicate"](value)
+        else:
+            on_error(value)
+
+    def end(self, url: str, outcome: str, value: str) -> None:
+        done = self._ends[url][0]
+        self._ends[url] = (done, outcome, value)
+        done.set()
+
+
+@pytest.fixture
+def downloads(studio: UltimateAudioStudio, tmp_path: Path) -> Iterator[_FakeDownloads]:
+    fake = _FakeDownloads()
+    studio.library_folder = str(tmp_path / "lib")
+    (tmp_path / "lib").mkdir()
+    with (
+        patch("app.controllers.download_controller.download_audio_worker", side_effect=fake.worker),
+        patch("app.ui.features.download.ffmpeg_path", __file__),  # ffmpeg.exe is absent on CI
+        patch.object(studio, "_check_for_updates_on_launch"),
+    ):
+        yield fake
+
+
+URL_1, URL_2, URL_3 = (f"https://www.youtube.com/watch?v=song{n}" for n in (1, 2, 3))
+
+
+def _enter(window: UltimateAudioStudio, text: str) -> None:
+    window.entry_url.delete(0, tk.END)
+    window.entry_url.insert(0, text)
+    window.start_download()
+
+
+def _finish(window: UltimateAudioStudio, downloads: _FakeDownloads, url: str, name: str) -> None:
+    """Let the download of ``url`` end with the song ``name``, as the real worker leaves it in the Library."""
+    (Path(window.library_folder) / name).write_bytes(b"ID3" + bytes(64))
+    downloads.end(url, "success", name)
+
+
+def test_a_song_chosen_during_a_download_waits_and_is_downloaded_next(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    _enter(studio, URL_1)
+    _pump(studio, lambda: downloads.started == [URL_1])
+    assert str(studio.btn_download.cget("state")) == tk.NORMAL  # the next song can be chosen
+
+    _enter(studio, URL_2)
+    _enter(studio, URL_3)
+
+    assert downloads.started == [URL_1]  # one at a time
+    assert "2 waiting" in studio.status.cget("text")
+    assert studio.entry_url.get() == ""  # the box is free for the next song
+
+    _finish(studio, downloads, URL_1, "One.mp3")
+    _pump(studio, lambda: downloads.started == [URL_1, URL_2])
+    _finish(studio, downloads, URL_2, "Two.mp3")
+    _pump(studio, lambda: downloads.started == [URL_1, URL_2, URL_3])
+    _finish(studio, downloads, URL_3, "Three.mp3")
+    _pump(studio, lambda: not studio._download_kind)
+
+    assert downloads.started == [URL_1, URL_2, URL_3]
+    assert {"One.mp3", "Two.mp3", "Three.mp3"} <= set(studio.library_files)
+    assert studio.btn_download.cget("text") == "⬇ Download MP3"
+    assert str(studio.btn_cancel_dl.cget("state")) == tk.DISABLED
+
+
+def test_a_search_during_a_download_does_not_stop_it(studio: UltimateAudioStudio, downloads: _FakeDownloads) -> None:
+    found = SearchResult("id", "Moon River", "Artist", 200.0, "03:20", URL_2)
+    chosen: list[Any] = []
+
+    with (
+        patch("app.services.downloader.search_youtube", return_value=[found]),
+        patch("app.ui.features.download.SearchChoiceDialog", side_effect=lambda *a, **k: chosen.append(k)),
+    ):
+        _enter(studio, URL_1)
+        _pump(studio, lambda: downloads.started == [URL_1])
+        _enter(studio, "moon river")
+        _pump(studio, lambda: bool(chosen))
+        assert studio.download_ctrl.is_downloading  # the search did not replace the download
+        assert studio.prog_download.winfo_manager() == "pack"  # and its progress bar is still there
+        chosen[0]["on_select"](found)
+
+    assert "'Moon River' will be downloaded after the current song" in studio.status.cget("text")
+    _finish(studio, downloads, URL_1, "One.mp3")
+    _pump(studio, lambda: downloads.started == [URL_1, URL_2])
+    assert downloads.started == [URL_1, URL_2]
+    downloads.end(URL_2, "success", "One.mp3")
+
+
+def test_stop_ends_the_download_and_drops_the_songs_that_were_waiting(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    _enter(studio, URL_1)
+    _pump(studio, lambda: downloads.started == [URL_1])
+    _enter(studio, URL_2)
+
+    studio.cancel_download()
+    _pump(studio, lambda: not studio.download_ctrl.is_downloading)
+    _pump(studio, lambda: False, timeout=0.3)  # the stopped worker reports back; nothing else may start
+
+    assert downloads.started == [URL_1]  # the waiting song was never started
+    assert "1 song(s) that were waiting were not downloaded" in studio.status.cget("text")
+    assert studio.btn_download.cget("text") == "⬇ Download MP3"
+
+
+def test_failures_in_the_queue_are_reported_once_at_the_end(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    with (
+        patch("app.ui.features.download.show_friendly_error") as error_dialog_shown,
+        patch("app.ui.dialogs.show_warning") as warning,
+    ):
+        _enter(studio, URL_1)
+        _pump(studio, lambda: downloads.started == [URL_1])
+        _enter(studio, URL_2)
+        _enter(studio, URL_3)
+        downloads.end(URL_1, "error", "<urlopen error [Errno 11001] getaddrinfo failed>")
+        _pump(studio, lambda: downloads.started == [URL_1, URL_2])
+        assert not warning.called and not error_dialog_shown.called  # nothing pops up while songs are waiting
+        _finish(studio, downloads, URL_2, "Two.mp3")
+        _pump(studio, lambda: downloads.started == [URL_1, URL_2, URL_3])
+        downloads.end(URL_3, "error", "ERROR: Private video")
+        _pump(studio, lambda: warning.called)
+
+    reports = [call.args for call in warning.call_args_list if call.args[1] == "Some Songs Could Not Be Downloaded"]
+    assert len(reports) == 1
+    assert "These 2 song(s)" in reports[0][2]
+    assert "No Internet Connection" in reports[0][2] and "Private Video" in reports[0][2]
+    assert not error_dialog_shown.called
+    assert "Two.mp3" in studio.library_files
+
+
+def test_a_single_failed_download_is_still_explained_at_once(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    with patch("app.ui.features.download.show_friendly_error") as error_dialog_shown:
+        _enter(studio, URL_1)
+        _pump(studio, lambda: downloads.started == [URL_1])
+        downloads.end(URL_1, "error", "ERROR: Private video")
+        _pump(studio, lambda: error_dialog_shown.called)
+
+    assert error_dialog_shown.call_args.args[1] == "ERROR: Private video"
+    assert studio.entry_url.get() == URL_1  # still there, to try again
+
+
+def test_a_playlist_link_waits_until_the_download_has_finished(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    with patch.object(studio.download_ctrl, "probe_playlist") as probe:
+        _enter(studio, URL_1)
+        _pump(studio, lambda: downloads.started == [URL_1])
+        _enter(studio, "https://www.youtube.com/playlist?list=PL123")
+
+    assert not probe.called  # checking the playlist would have stopped the song
+    assert studio.download_ctrl.is_downloading
+    assert "once the current download has finished" in studio.status.cget("text")
+    downloads.end(URL_1, "success", "One.mp3")
+
+
+def test_the_next_song_typed_during_a_download_is_not_wiped_when_it_finishes(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    _enter(studio, URL_1)
+    _pump(studio, lambda: downloads.started == [URL_1])
+    studio.entry_url.delete(0, tk.END)
+    studio.entry_url.insert(0, "the next song I want")
+
+    _finish(studio, downloads, URL_1, "One.mp3")
+    _pump(studio, lambda: not studio._download_kind)
+
+    assert studio.entry_url.get() == "the next song I want"
+
+
+def test_the_link_that_was_downloaded_is_cleared_from_the_box(
+    studio: UltimateAudioStudio, downloads: _FakeDownloads
+) -> None:
+    _enter(studio, URL_1)
+    _pump(studio, lambda: downloads.started == [URL_1])
+
+    _finish(studio, downloads, URL_1, "One.mp3")
+    _pump(studio, lambda: not studio._download_kind)
+
+    assert studio.entry_url.get() == ""

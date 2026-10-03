@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import tkinter as tk
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.config import YOUTUBE_RE, ffmpeg_path
 from app.core.errors import friendly_error, is_recognised
@@ -17,6 +18,25 @@ from app.ui.search_dialog import SearchChoiceDialog
 # A search result longer than this is confirmed before it is downloaded: it is an album, a mix or a
 # "10 hours of..." video far more often than one song.
 LONG_DOWNLOAD_SEC = 20 * 60
+DOWNLOAD_BUTTON_TEXT = "⬇ Download MP3"
+# The button while one song is being downloaded: the next one can be chosen meanwhile.
+DOWNLOAD_ANOTHER_TEXT = "⬇ Download Another Song"
+
+
+@dataclass(slots=True, frozen=True)
+class QueuedSong:
+    """A song that was chosen while another was being downloaded; its turn comes after that one."""
+
+    url: str
+    title: str | None = None
+
+
+@dataclass(slots=True)
+class DownloadQueue:
+    """The songs waiting for their turn, and the ones of this run that could not be downloaded."""
+
+    waiting: list[QueuedSong] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)  # (title, raw error)
 
 
 def _length_in_words(seconds: float) -> str:
@@ -35,6 +55,24 @@ class DownloadMixin(AppBase):
 
     # True when a search preview paused the user's music; it plays on once the results window closes.
     _resume_after_search = False
+    # What the Download button says while a search or a playlist check is running ("" when none is).
+    _searching = ""
+    # What is being downloaded right now. A playlist takes the YouTube box for itself; while a
+    # single song is downloaded, more songs can be chosen, and they wait in ``_download_queue``.
+    _download_kind: Literal["", "song", "playlist"] = ""
+    _download_queue: DownloadQueue
+    # The song being downloaded, as it is named in messages.
+    _downloading_title = ""
+    # What the box held when the running download started: only that text is cleared afterwards,
+    # never the next song that was typed in meanwhile.
+    _box_text_at_start: str | None = None
+
+    def _queue(self) -> DownloadQueue:
+        """The download queue of this window (made when it is first needed)."""
+        queue: DownloadQueue | None = vars(self).get("_download_queue")
+        if queue is None:
+            queue = self._download_queue = DownloadQueue()
+        return queue
 
     def paste_youtube_link(self) -> None:
         try:
@@ -62,16 +100,48 @@ class DownloadMixin(AppBase):
         # The stopped job may take a moment to wind down; the controller drops anything it reports
         # after a newer job starts, so the Download button can be offered again straight away.
         was_downloading = self.download_ctrl.is_downloading
+        queue = self._queue()
+        dropped = len(queue.waiting)
+        queue.waiting.clear()
+        queue.failed.clear()
         self.download_ctrl.cancel()
         self._reset_download_ui()
-        self.set_busy(False, "Download stopped." if was_downloading else "Search stopped.")
+        text = "Download stopped." if was_downloading else "Search stopped."
+        if dropped:
+            text += f" The {dropped} song(s) that were waiting were not downloaded."
+        self.set_busy(False, text)
 
     def _reset_download_ui(self) -> None:
         """Return the YouTube box to its idle state (Download enabled, Stop disabled, no progress)."""
-        self.btn_download.config(text="⬇ Download MP3", state=tk.NORMAL)
-        self.btn_cancel_dl.config(state=tk.DISABLED)
-        self.prog_download.pack_forget()
-        self.lbl_dl_metrics.pack_forget()
+        self._searching = ""
+        self._download_kind = ""
+        self._show_download_controls()
+
+    def _show_download_controls(self) -> None:
+        """Set the YouTube box's buttons and progress bar to match what is running now."""
+        if self._searching:
+            text, usable = self._searching, False
+        elif self._download_kind == "playlist":
+            text, usable = "Downloading...", False
+        elif self._download_kind == "song":
+            text, usable = DOWNLOAD_ANOTHER_TEXT, True
+        else:
+            text, usable = DOWNLOAD_BUTTON_TEXT, True
+        self.btn_download.config(text=text, state=tk.NORMAL if usable else tk.DISABLED)
+        self.btn_cancel_dl.config(state=tk.NORMAL if (self._searching or self._download_kind) else tk.DISABLED)
+        if not self._download_kind:
+            self.prog_download.pack_forget()
+            self.lbl_dl_metrics.pack_forget()
+
+    def _search_finished(self) -> None:
+        """A search or playlist check has ended; a download that runs meanwhile keeps its controls."""
+        self._searching = ""
+        self._show_download_controls()
+
+    def _download_finished(self) -> None:
+        """The running download has ended, one way or another."""
+        self._download_kind = ""
+        self._show_download_controls()
 
     def _update_download_progress(self, pct: float, speed: str = "", eta: str = "", finished: bool = False) -> None:
         if finished:
@@ -87,11 +157,14 @@ class DownloadMixin(AppBase):
             self.lbl_dl_metrics.config(text=" • ".join(parts))
 
     def start_download(self) -> None:
-        """Download MP3 button, and Enter in the box: search for the typed song, or download the pasted link."""
+        """Download MP3 button, and Enter in the box: search for the typed song, or download the pasted link.
+
+        While one song is being downloaded, the next can be chosen: it waits for its turn.
+        """
         if str(self.btn_download.cget("state")) == tk.DISABLED:
             # Enter in the box does not look at the button. A second search would open a second
-            # list of results, and a new job would take the Stop button away from a running download.
-            self.set_status("Still working on the last one. Click 'Stop Download' first to start another.", icon="⏳")
+            # list of results, and a playlist that is being downloaded keeps the box to itself.
+            self.set_status("Still working on the last one. Please wait until it has finished.", icon="⏳")
             return
         query = self.entry_url.get().strip()
         if not query:
@@ -104,15 +177,21 @@ class DownloadMixin(AppBase):
         target_url, is_search = self.download_ctrl.resolve_query(query)
         if not is_search:
             if self.download_ctrl.is_playlist(target_url):
+                if self._download_kind:
+                    # Checking a playlist would stop the song that is being downloaded.
+                    self.set_status(
+                        "A whole playlist can be downloaded once the current download has finished.", icon="⏳"
+                    )
+                    return
                 self._check_playlist(target_url)
                 return
-            # Direct URL: download immediately without search dialog
-            self._start_download_url(target_url)
+            # Direct URL: no search dialog
+            self._download_or_queue(target_url)
             return
 
         # Search query: fetch matching options first and let user select
-        self.btn_download.config(text="Searching...", state=tk.DISABLED)
-        self.btn_cancel_dl.config(state=tk.NORMAL)
+        self._searching = "Searching..."
+        self._show_download_controls()
         self.set_busy(True, f'Searching YouTube for "{query}"...')
 
         self.download_ctrl.start_search(
@@ -124,8 +203,8 @@ class DownloadMixin(AppBase):
 
     def _check_playlist(self, url: str) -> None:
         """Read the playlist first, so the question can say how many songs it would download."""
-        self.btn_download.config(text="Checking...", state=tk.DISABLED)
-        self.btn_cancel_dl.config(state=tk.NORMAL)
+        self._searching = "Checking..."
+        self._show_download_controls()
         self.set_busy(True, "Checking the YouTube playlist...")
         self.download_ctrl.probe_playlist(
             url, on_done=lambda info, error: self._safe_after(0, self._on_playlist_checked, url, info, error)
@@ -133,7 +212,7 @@ class DownloadMixin(AppBase):
 
     def _on_playlist_checked(self, url: str, info: dict[str, Any] | None, error: str | None = None) -> None:
         """Offer the playlist's songs, or explain why it could not be read (offline, YouTube changed...)."""
-        self._reset_download_ui()
+        self._search_finished()
         self.set_busy(False)
         if error and is_recognised(error):
             # Being offline is not "private or empty": say what is wrong, and look for a fix.
@@ -180,8 +259,10 @@ class DownloadMixin(AppBase):
             self.set_status("Ready")
 
     def _start_playlist_download(self, url: str, probed: dict[str, Any] | None = None) -> None:
-        self.btn_download.config(text="Scanning...", state=tk.DISABLED)
-        self.btn_cancel_dl.config(state=tk.NORMAL)
+        """Download every song of a YouTube playlist, one after the other, with one report at the end."""
+        self._download_kind = "playlist"
+        self._box_text_at_start = self.entry_url.get()
+        self._show_download_controls()
         self.set_busy(True, "Scanning playlist tracks...")
         self.prog_download.pack(fill=tk.X, pady=(4, 2))
         self.prog_download["value"] = 0
@@ -258,8 +339,8 @@ class DownloadMixin(AppBase):
 
         ``already_there`` songs were in the Library before and were not added a second time.
         """
-        self.entry_url.delete(0, tk.END)
-        self._reset_download_ui()
+        self._clear_box_if_unchanged()
+        self._download_finished()
         self.set_busy(False)
         self.refresh_library(preserve_view=True)
         count = len(downloaded_files)
@@ -292,7 +373,8 @@ class DownloadMixin(AppBase):
         self._offer_ready_update([err for _title, err in failures])
 
     def _handle_search_results(self, query: str, results: list[SearchResult]) -> None:
-        self._reset_download_ui()
+        """Show the versions that were found, to choose the one to download."""
+        self._search_finished()
         self.set_busy(False)
         if not results:
             dialogs.show_info(
@@ -331,7 +413,8 @@ class DownloadMixin(AppBase):
     def _search_cancelled(self) -> None:
         """The results window was closed without choosing a song."""
         self._resume_after_search_preview()
-        if not (self.is_playing_main or self.is_playing_playlist):
+        # The status of a song that is being downloaded meanwhile stays.
+        if not (self.is_playing_main or self.is_playing_playlist or self._download_kind):
             self.set_status("Ready")
 
     def _search_result_chosen(self, item: SearchResult) -> None:
@@ -351,22 +434,59 @@ class DownloadMixin(AppBase):
         ):
             self.set_status("Nothing was downloaded. Search again to choose a different version.")
             return
-        self._start_download_url(item.url, item.title)
+        self._download_or_queue(item.url, item.title)
 
     def _handle_search_error(self, err: str) -> None:
         """Explain a failed search, and look for a fix when a newer version is the likely cure."""
-        self._reset_download_ui()
+        self._search_finished()
         self.set_busy(False, "Search failed.")
         self._look_for_update_after_failure([err])
         show_friendly_error(self.root, err, "search")
         self._offer_ready_update([err])
 
+    def _download_or_queue(self, url: str, title: str | None = None) -> None:
+        """Download the song now, or after the one that is being downloaded."""
+        if not self._download_kind:
+            self._start_download_url(url, title)
+            return
+        waiting = self._queue().waiting
+        waiting.append(QueuedSong(url, title))
+        self.entry_url.delete(0, tk.END)  # it is taken care of: the box is free for the next song
+        name = f"'{title}'" if title else "The song"
+        self.set_status(
+            f"{name} will be downloaded after the current song ({len(waiting)} waiting). "
+            "You can choose more songs meanwhile.",
+            icon="⬇",
+        )
+
+    def _start_next_download(self) -> bool:
+        """Start the song that has waited longest; False when none is waiting."""
+        waiting = self._queue().waiting
+        if not waiting or self._is_shutting_down:
+            return False
+        song = waiting.pop(0)
+        self._start_download_url(song.url, song.title)
+        self._box_text_at_start = None  # the box was cleared when this song was put in the queue
+        return True
+
+    def _clear_box_if_unchanged(self) -> None:
+        """Empty the YouTube box after a download, unless the next song has been typed into it."""
+        started_with, self._box_text_at_start = self._box_text_at_start, None
+        if started_with is None or self.entry_url.get() == started_with:
+            self.entry_url.delete(0, tk.END)
+
     def _start_download_url(self, target_url: str, display_title: str | None = None) -> None:
+        """Download one song now; the YouTube box stays free to choose the next one."""
         status_text = f'Downloading "{display_title}"...' if display_title else "Downloading from YouTube..."
+        waiting = len(self._queue().waiting)
+        if waiting:
+            status_text += f" {waiting} more waiting."
         metric_text = "Connecting to YouTube..."
 
-        self.btn_download.config(text="Downloading...", state=tk.DISABLED)
-        self.btn_cancel_dl.config(state=tk.NORMAL)
+        self._download_kind = "song"
+        self._downloading_title = display_title or "A song"
+        self._box_text_at_start = self.entry_url.get()
+        self._show_download_controls()
 
         self.prog_download.pack(fill=tk.X, pady=(4, 2))
         self.prog_download["value"] = 0
@@ -389,8 +509,8 @@ class DownloadMixin(AppBase):
 
     def _download_duplicate(self, filename: str) -> None:
         """The song is in the Library already: show which one it is instead of adding a second copy."""
-        self.entry_url.delete(0, tk.END)
-        self._reset_download_ui()
+        self._clear_box_if_unchanged()
+        self._download_finished()
         self.set_busy(False)
         if self.entry_search.get().strip():
             self.clear_search()  # the song may be filtered out of the list
@@ -403,29 +523,68 @@ class DownloadMixin(AppBase):
             f"'{Path(filename).stem}' is already in your Library (marked in green), so it was not added again.",
             icon="ℹ️",
         )
+        self._after_queued_download()
 
     def _download_success(self, filename: str) -> None:
         """Show the downloaded song; it is loaded into the player unless a song is being worked on."""
-        self.entry_url.delete(0, tk.END)
-        self._reset_download_ui()
+        self._clear_box_if_unchanged()
+        self._download_finished()
         self.set_busy(False)
         if self._reveal_new_song(filename, keep_trim_work=True):
             self.notify_success("Download complete! The new song is ready: press PLAY to listen.")
         else:
             self.notify_success("Download complete! The new song is marked in green in your Library on the left.")
+        self._after_queued_download()
 
     def _download_cancelled(self) -> None:
         """The stopped download has wound down: put the YouTube box back to idle."""
-        self._reset_download_ui()
-        self.set_busy(False, "Download stopped.")
+        self._download_finished()
+        # No new status: Stop has said what was stopped (and how many waiting songs went with it).
+        self.set_busy(False)
 
     def _download_error(self, error: str) -> None:
-        """Explain a failed download, and look for a fix when a newer version is the likely cure."""
-        self._reset_download_ui()
+        """Explain a failed download, and look for a fix when a newer version is the likely cure.
+
+        While other songs are waiting, or after others of this run have failed, the failure is kept
+        for one report at the end: a lost connection must not open one message per waiting song.
+        """
+        self._box_text_at_start = None  # the text stays in the box, to try again
+        self._download_finished()
+        queue = self._queue()
+        if queue.waiting or queue.failed:
+            queue.failed.append((self._downloading_title, error))
+            self.set_busy(False)
+            self._after_queued_download()
+            return
         self.set_busy(False, "Download failed.")
         self._look_for_update_after_failure([error])
         show_friendly_error(self.root, error, "download")
         self._offer_ready_update([error])
+
+    def _after_queued_download(self) -> None:
+        """Go on with the next waiting song; after the last one, report those that failed on the way."""
+        if self._start_next_download():
+            return
+        queue = self._queue()
+        failures, queue.failed = queue.failed, []
+        if not failures:
+            return
+        self.set_status(f"{len(failures)} song(s) could not be downloaded.", icon="⚠️")
+        errors = [err for _title, err in failures]
+        self._look_for_update_after_failure(errors)
+        shown = failures[:8]
+        lines = [f"• {title[:60]} — {friendly_error(err, 'download').title}" for title, err in shown]
+        if len(failures) > len(shown):
+            lines.append(f"... and {len(failures) - len(shown)} more.")
+        failed_list = "\n".join(lines)
+        dialogs.show_warning(
+            self.root,
+            "Some Songs Could Not Be Downloaded",
+            f"These {len(failures)} song(s) could not be downloaded:\n{failed_list}\n\n"
+            "The other songs you chose are in your Library.\n\n"
+            "You can try them again later, or search for a different version of each song.",
+        )
+        self._offer_ready_update(errors)
 
     def _look_for_update_after_failure(self, errors: list[str]) -> None:
         """Check for a new version in the background when a download failed in a way an update fixes.
