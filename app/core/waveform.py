@@ -11,8 +11,6 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from pydub import AudioSegment
-
 from app.config import CREATE_NO_WINDOW, ffmpeg_path, log_error
 
 
@@ -236,18 +234,8 @@ def analyze_audio(
             except Exception:
                 pass
 
-    # 4. Resilient fallback to pydub (with file size safety check)
-    try:
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) < 50 * 1024 * 1024:
-            audio = AudioSegment.from_file(audio_path)
-            low_res = audio.set_frame_rate(ANALYSIS_RATE_HZ).set_channels(1).set_sample_width(2)
-            samples = low_res.get_array_of_samples()
-            result = _analysis_from_samples(samples, n_bars, ANALYSIS_RATE_HZ)
-            if result.peaks:
-                return result
-    except Exception as e:
-        log_error(f"analyze_audio (pydub fallback): {e}")
-
+    # A pydub step used to follow here. It ran the same FFmpeg decode that just failed, without a
+    # time limit, so it could only hang; a song FFmpeg cannot read simply has no waveform.
     return empty
 
 

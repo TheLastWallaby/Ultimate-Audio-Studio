@@ -15,14 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydub import AudioSegment
-
 from app.config import AUDIO_EXTS, log_error, run_ffmpeg, sanitize_filename
 from app.core.cache_manager import cache_mgr
 from app.core.errors import friendly_error
 from app.core.file_utils import copy_file_atomic, replace_with_retry
 from app.core.process_utils import CancelToken
-from app.services.ffmpeg_args import mp3_output_args
+from app.services.ffmpeg_args import mp3_audio_only_args, mp3_output_args
 
 logger = logging.getLogger(__name__)
 
@@ -185,25 +183,36 @@ def _encode_mp3(
     FFmpeg writes under a ``.partial`` name that is renamed when complete, so a drive pulled out
     mid-song never leaves a cut-off track that a car stereo would play.
     """
-    dest_file = Path(dest_file)
-    partial = dest_file.with_name(dest_file.name + _PARTIAL_SUFFIX)
     for cover in ("copy", "mjpeg"):
         args = ["-y", "-i", str(filepath)]
         if normalize:
             args += ["-af", loudnorm_filter(stats)]
         args += mp3_output_args("copy" if cover == "copy" else "mjpeg", resample_44k=True)
-        args += ["-f", "mp3", str(partial)]  # the format is named because ".partial" does not tell FFmpeg
-        result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
-        try:
-            if result.returncode == 0 and partial.stat().st_size > 0:
-                replace_with_retry(partial, dest_file)
-                return True
-        except OSError as err:
-            logger.warning("Encoded track %s could not be put in place: %s", dest_file.name, err)
-        with contextlib.suppress(OSError):
-            partial.unlink()
+        if _ffmpeg_to(args, Path(dest_file), "mp3", cancel_event):
+            return True
         if cancel_event is not None and cancel_event.is_set():
             return False
+    return False
+
+
+def _ffmpeg_to(args: list[str], dest_file: Path, fmt: str, cancel_event: CancelToken | None) -> bool:
+    """Run FFmpeg with ``args`` into ``dest_file`` (format ``fmt``); True when a complete file is in place.
+
+    FFmpeg writes under a ``.partial`` name that is renamed only after a clean finish, so a failed,
+    stopped or timed-out run never leaves a cut-off track under the real name.
+    """
+    partial = dest_file.with_name(dest_file.name + _PARTIAL_SUFFIX)
+    # The format is named because ".partial" does not tell FFmpeg which one to write.
+    result = run_ffmpeg([*args, "-f", fmt, str(partial)], timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
+    try:
+        if result.returncode == 0 and partial.stat().st_size > 0:
+            replace_with_retry(partial, dest_file)
+            return True
+        logger.warning("FFmpeg could not make %s (code %s)", dest_file.name, result.returncode)
+    except OSError as err:
+        logger.warning("Track %s could not be put in place: %s", dest_file.name, err)
+    with contextlib.suppress(OSError):  # a leftover is removed by the next export (find_previous_export)
+        partial.unlink()
     return False
 
 
@@ -224,8 +233,14 @@ def _drive_problem(folder: Path, err: BaseException | None = None) -> DriveProbl
     return "full" if free < _MIN_FREE_BYTES else ""
 
 
+class _NotConvertible(Exception):
+    """FFmpeg could not turn this song into a playable track, even without levelling or its picture."""
+
+
 def _skip_reason(err: BaseException) -> str:
     """A short plain-language reason for the export report ("disk is full"), never raw error text."""
+    if isinstance(err, _NotConvertible):
+        return "could not be converted; the file may be damaged"
     return friendly_error(err, "export").title.lower()
 
 
@@ -345,10 +360,15 @@ def usb_export_worker(
                         # FFmpeg failed: still deliver the song, but never call that a levelled export.
                         if is_mp3:
                             copy_file_atomic(source, dest_file)
-                        else:
-                            partial = dest_file.with_name(dest_file.name + _PARTIAL_SUFFIX)
-                            AudioSegment.from_file(filepath).export(str(partial), format="mp3")
-                            replace_with_retry(partial, dest_file)
+                        elif not _ffmpeg_to(
+                            ["-y", "-i", filepath, *mp3_audio_only_args(resample_44k=True)],
+                            dest_file,
+                            "mp3",
+                            cancel_event,
+                        ):
+                            raise _NotConvertible(f"{source.name} could not be converted to MP3")
+                        if _stopping():
+                            break
                         if track_normalize:
                             not_leveled.append(source.name)
                 else:
@@ -454,22 +474,22 @@ def cd_export_worker(
             wav_path = cd_dir / f"{idx:0{width}d} - {sanitize_filename(source.stem)}.wav"
 
             try:
-                args = ["-y", "-i", filepath]
-                if normalize:
-                    args += ["-af", loudnorm_filter(measure_loudnorm(filepath, cancel_event=cancel_event))]
-                args += ["-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", str(wav_path)]
-                result = run_ffmpeg(args, timeout=_ENCODE_TIMEOUT_SEC, cancel_event=cancel_event)
+                cd_audio = ["-vn", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]
+                level = (
+                    ["-af", loudnorm_filter(measure_loudnorm(filepath, cancel_event=cancel_event))] if normalize else []
+                )
+                made = _ffmpeg_to(["-y", "-i", filepath, *level, *cd_audio], wav_path, "wav", cancel_event)
                 if _stopping():
-                    with contextlib.suppress(OSError):
-                        wav_path.unlink()
                     break
-                if result.returncode != 0 or not wav_path.is_file() or wav_path.stat().st_size == 0:
-                    # FFmpeg failed: still deliver the track, but never call that a levelled export.
-                    audio = AudioSegment.from_file(filepath)
-                    audio = audio.set_frame_rate(44100).set_channels(2).set_sample_width(2)
-                    audio.export(str(wav_path), format="wav")
-                    if normalize:
+                if not made and normalize:
+                    # Levelling failed: still deliver the track, but never call that a levelled export.
+                    made = _ffmpeg_to(["-y", "-i", filepath, *cd_audio], wav_path, "wav", cancel_event)
+                    if _stopping():
+                        break
+                    if made:
                         not_leveled.append(source.name)
+                if not made:
+                    raise _NotConvertible(f"{source.name} could not be converted for the CD")
                 success_count += 1
             except Exception as track_err:  # one bad song must not end the whole export
                 logger.error("cd export track %s: %s", filepath, track_err)
