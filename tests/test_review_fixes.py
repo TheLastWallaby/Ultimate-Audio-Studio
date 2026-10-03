@@ -560,3 +560,46 @@ def test_the_library_watcher_reads_the_folder_on_a_worker(studio: Any, tmp_path:
 
     assert studio.library_files == ["a.mp3", "b.mp3"]
     assert scanned_on == [name for name in scanned_on if name != threading.main_thread().name]
+
+
+# --- A click on a slider's bar jumps there --------------------------------------------------------------
+
+
+def test_a_click_on_the_bar_of_a_slider_moves_the_handle_there() -> None:
+    from app.ui.components import jump_to_click
+
+    root = tk.Tk()
+    root.attributes("-alpha", 0.0)  # shown (a hidden window has no size to click in), but not visible
+    root.geometry("+-3000+-3000")
+    try:
+        heard: list[float] = []
+        scale = tk.Scale(
+            root,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            length=300,
+            resolution=0.1,
+            command=lambda value: heard.append(float(value)),
+        )
+        scale.pack()
+        jump_to_click(scale)
+        root.update()
+
+        scale.event_generate("<Button-1>", x=250, y=10)
+        root.update()
+        assert scale.get() > 70  # Tk alone moves one step, to 0.1
+
+        scale.event_generate("<B1-Motion>", x=150, y=10)  # and the handle can be dragged on from there
+        scale.event_generate("<ButtonRelease-1>", x=150, y=10)
+        root.update()
+        assert 30 < scale.get() < 70
+        assert heard and heard[-1] == scale.get()
+    finally:
+        root.destroy()
+
+
+def test_the_timeline_volume_and_boost_sliders_jump_to_a_click(studio: Any) -> None:
+    for scale in (studio.scale_progress, studio.scale_volume, studio.scale_gain):
+        assert "_press" in scale.bind("<ButtonPress-1>"), scale
