@@ -116,6 +116,7 @@ class DownloadMixin(AppBase):
             self.set_status("The YouTube playlist could not be read.", icon="⚠️")
             self._look_for_update_after_failure([error])
             show_friendly_error(self.root, error, "download")
+            self._offer_ready_update([error])
             return
         single_ok = self.download_ctrl.has_video(url)
         if not info or not info.get("entries"):
@@ -245,6 +246,7 @@ class DownloadMixin(AppBase):
             f"These {len(failures)} song(s) could not be downloaded:\n{failed_list}\n\n"
             "You can try them again later, or search for a different version of each song.",
         )
+        self._offer_ready_update([err for _title, err in failures])
 
     def _handle_search_results(self, query: str, results: list[SearchResult]) -> None:
         self._reset_download_ui()
@@ -281,6 +283,7 @@ class DownloadMixin(AppBase):
         self.set_busy(False, "Search failed.")
         self._look_for_update_after_failure([err])
         show_friendly_error(self.root, err, "search")
+        self._offer_ready_update([err])
 
     def _start_download_url(self, target_url: str, display_title: str | None = None) -> None:
         status_text = f'Downloading "{display_title}"...' if display_title else "Downloading from YouTube..."
@@ -328,14 +331,28 @@ class DownloadMixin(AppBase):
         self.set_busy(False, "Download failed.")
         self._look_for_update_after_failure([error])
         show_friendly_error(self.root, error, "download")
+        self._offer_ready_update([error])
 
     def _look_for_update_after_failure(self, errors: list[str]) -> None:
         """Check for a new version in the background when a download failed in a way an update fixes.
 
         YouTube changes several times a year and each change needs a new release. Finding it now
-        means the fix is downloaded while the user reads the message, and installed at the next start.
+        means the fix is downloaded while the user reads the message.
         """
-        if self._available_update is not None:  # already found: its badge is showing
+        if not any(friendly_error(err, "download").suggests_update for err in errors):
+            return
+        # Once it is downloaded, the status bar says how to install it now (see _on_update_staged).
+        self._update_wanted_now = True
+        if self._available_update is None:  # otherwise it is already found: its badge is showing
+            self._check_for_updates_on_launch()
+
+    def _offer_ready_update(self, errors: list[str]) -> None:
+        """After a failure that an update usually fixes: open the update window if the update is ready.
+
+        A downloaded update is otherwise installed only at the next start, and someone who never
+        closes the app would keep a downloader that no longer works.
+        """
+        if self.update_ctrl.pending_update is None or self._available_update is None:
             return
         if any(friendly_error(err, "download").suggests_update for err in errors):
-            self._check_for_updates_on_launch()
+            self._open_update_dialog()

@@ -149,6 +149,7 @@ class AppBase:
         _is_shutting_down: bool
         _is_checking_updates_manual: bool
         _available_update: ReleaseInfo | None
+        _update_wanted_now: bool
         _usb_map: dict[str, str]
         _usb_fs_map: dict[str, str]
         _unmuted_volume: float
@@ -158,6 +159,7 @@ class AppBase:
         _selection_debounce_timer: str | None
         _search_debounce_timer: str | None
         _timer_watch_library: str | None
+        _timer_update_check: str | None
         _timer_hotplug_debounce: str | None
         _monitor_timer: str | None
         _pl_skip_timer: str | None
@@ -252,6 +254,7 @@ class AppBase:
         def _reveal_new_song(self, filename: str) -> bool: ...
         def _load_pending_selection(self) -> bool: ...
         def _check_for_updates_on_launch(self) -> None: ...
+        def _open_update_dialog(self) -> None: ...
         def _update_restore_original_button(self) -> None: ...
         def _release_audio_file(self) -> None: ...
         def _render_waveform(self, full_redraw: bool = False) -> None: ...

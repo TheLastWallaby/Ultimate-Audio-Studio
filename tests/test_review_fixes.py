@@ -664,3 +664,77 @@ def test_a_github_refusal_is_not_explained_as_youtube_refusing_a_download() -> N
 
     assert message.title == "Could Not Check for Updates"
     assert "YouTube" not in message.message and "403" not in message.message
+
+
+# --- The update that fixes downloads is offered when a download fails -----------------------------------
+
+YOUTUBE_CHANGED = "ERROR: [youtube] abc: Signature extraction failed: Some formats may be missing"
+
+
+def _release(tag: str = "v9.9.9") -> Any:
+    from app.models import ReleaseInfo
+
+    return ReleaseInfo(
+        tag_name=tag,
+        name=tag,
+        body="",
+        published_at="",
+        asset_id=1,
+        asset_name="Ultimate Audio Studio.exe",
+        asset_size=1,
+        asset_api_url="",
+        browser_download_url="",
+        html_url="",
+    )
+
+
+def test_a_failed_download_opens_the_update_window_when_the_fix_is_already_downloaded(
+    studio: Any, tmp_path: Path
+) -> None:
+    from app.services.updater import PendingUpdate
+
+    studio._available_update = _release()
+    studio.update_ctrl.pending_update = PendingUpdate("v9.9.9", tmp_path / "new.exe", "0" * 64)
+    with (
+        patch("app.ui.features.download.show_friendly_error"),
+        patch.object(studio, "_open_update_dialog") as opened,
+    ):
+        studio._download_error("ERROR: Private video. Sign in if you have been granted access")
+        opened.assert_not_called()  # an update does not make a private video downloadable
+
+        studio._download_error(YOUTUBE_CHANGED)
+    opened.assert_called_once()
+
+
+def test_without_a_downloaded_update_a_failed_download_only_starts_the_check(studio: Any) -> None:
+    with (
+        patch("app.ui.features.download.show_friendly_error"),
+        patch.object(studio, "_open_update_dialog") as opened,
+        patch.object(studio.update_ctrl, "check_on_launch") as check,
+    ):
+        studio._download_error(YOUTUBE_CHANGED)
+
+    opened.assert_not_called()
+    check.assert_called_once()
+    assert studio._update_wanted_now
+
+
+def test_the_status_bar_says_how_to_install_a_wanted_update_now(studio: Any, tmp_path: Path) -> None:
+    from app.services.updater import PendingUpdate
+
+    studio._update_wanted_now = True
+    studio._on_update_staged(PendingUpdate("v9.9.9", tmp_path / "new.exe", "0" * 64))
+
+    assert "install it now" in studio.status.cget("text")
+
+
+def test_an_open_window_looks_for_updates_again_later_until_one_is_found(studio: Any) -> None:
+    with patch.object(studio.update_ctrl, "check_on_launch") as check:
+        studio._check_for_updates_on_launch()
+        assert studio._timer_update_check is not None  # the next look is scheduled
+        check.assert_called_once()
+
+        studio._available_update = _release()
+        studio._check_for_updates_on_launch()
+    check.assert_called_once()
+    assert studio._timer_update_check is None
