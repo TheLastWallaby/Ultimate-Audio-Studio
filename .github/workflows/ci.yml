@@ -69,6 +69,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
 
+      - name: Profile window start-up (temporary diagnostic)
+        run: python .github/scripts/profile_window_startup.py
+
       - name: Run tests
         # Lists the slowest tests: the suite runs in under a minute on a developer PC but takes
         # about 9 minutes on this runner, and this shows which tests the time goes to.
