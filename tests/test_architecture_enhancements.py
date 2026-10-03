@@ -1,5 +1,6 @@
 """Automated unit tests verifying TaskManager, platform security, and models."""
 
+import os
 import sys
 import time
 import unittest
@@ -127,3 +128,15 @@ def test_app_does_not_use_pydub() -> None:
 
     assert "pydub" not in sys.modules
     assert "audioop_lts" not in sys.modules
+
+
+def test_tests_use_the_silent_audio_driver() -> None:
+    """The mixer must start on any machine: without an audio device it waits 8 s before it gives up."""
+    import pygame
+
+    from app.core.audio_engine import AudioEngine
+
+    AudioEngine()
+
+    assert os.environ.get("SDL_AUDIODRIVER") == "dummy"
+    assert pygame.mixer.get_init() is not None

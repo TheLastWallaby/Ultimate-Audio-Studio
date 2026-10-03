@@ -70,7 +70,9 @@ jobs:
           python -m pip install -r requirements.txt pytest
 
       - name: Run tests
-        run: python -m pytest -q
+        # Lists the slowest tests, so a test that suddenly takes far longer on the runner than on a
+        # developer PC shows up (the cause of a 13-minute run was an 8 s audio-device timeout).
+        run: python -m pytest -q --durations=25 --durations-min=1.0
 
   build:
     name: Build Windows executable
