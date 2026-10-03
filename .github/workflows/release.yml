@@ -47,7 +47,9 @@ jobs:
           }
 
       - name: Run tests
-        run: python -m pytest -q
+        # Lists the slowest tests: the suite runs in under a minute on a developer PC but takes
+        # about 9 minutes on this runner, and this shows which tests the time goes to.
+        run: python -m pytest -q --durations=25 --durations-min=1.0
 
       - name: Install FFmpeg
         run: |
