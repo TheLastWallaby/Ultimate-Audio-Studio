@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pygame
 
-from app.config import PLAYLISTS_PATH, format_time, log_error, sanitize_filename
+from app.config import PLAYLISTS_PATH, log_error, sanitize_filename
 from app.controllers.playlist_controller import PlaylistLoadResult
 from app.ui import dialogs
 from app.ui.components import listbox_nearest, listbox_selection
@@ -115,17 +115,14 @@ class PlaylistMixin(AppBase):
             self.playlist_var.set(names[0])
 
     def refresh_playlist_listbox(self) -> None:
+        """Draw the active playlist from memory (no disk access: it is redrawn on every drag step)."""
         self.listbox_pl.delete(0, tk.END)
         self.playlist_files = self.playlist_ctrl.get_active_tracks(self.active_playlist_name)
-        for idx, f in enumerate(self.playlist_files, 1):
-            name = os.path.basename(f)
+        rows = self._song_rows_for(self.playlist_files)
+        for idx, (path, row) in enumerate(zip(self.playlist_files, rows, strict=True), 1):
             prefix = "▶ " if (self.is_playing_playlist and idx - 1 == self.playlist_index) else f"{idx:02d}. "
-            if not os.path.exists(f):
-                self.listbox_pl.insert(tk.END, f"{prefix}⚠️ [Missing] {name}")
-                continue
-            dur = self._cached_duration(f, probe=False)
-            dur_str = f" [{format_time(dur)}]" if dur > 0 else ""
-            self.listbox_pl.insert(tk.END, f"{prefix}{self._display_name(f)}{dur_str}")
+            text = f"⚠️ [Missing] {Path(path).name}" if row.missing else row.text
+            self.listbox_pl.insert(tk.END, f"{prefix}{text}")
 
     def on_playlist_selected(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         name = self.playlist_var.get()
@@ -417,6 +414,7 @@ class PlaylistMixin(AppBase):
             self._pl_skip_timer = self.root.after(MISSING_SONG_SKIP_MS, self._play_current_pl_track, skipped)
             return
         self.stop_audio(user=True)
+        self._warm_library_metadata()  # the lists learn on a worker which songs are gone, and mark them
         plug_in = "If your music is on a USB drive or memory card, plug it in and try again."
         if skipped >= total:
             self.set_status("None of the songs in this playlist could be found.", icon="⚠️")

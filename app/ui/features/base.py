@@ -12,7 +12,7 @@ import queue
 import threading
 import tkinter as tk
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
         UpdateController,
     )
     from app.core.audio_engine import AudioEngine
-    from app.models import ReleaseInfo
+    from app.models import ReleaseInfo, SongRow
     from app.platform_utils import Win32DragDropHandler
     from app.ui.components import ScrollableFrame
     from app.ui.waveform_view import WaveformView
@@ -138,6 +138,7 @@ class AppBase:
         _ui_callback_queue: queue.Queue[tuple[UiCallback, tuple[Any, ...]]]
         _library_meta_gen: int
         _fresh_songs: set[str]
+        _song_rows: dict[str, SongRow]
         _pending_library_song: str | None
         _pending_play_token: object | None
         _updating_ui: bool
@@ -241,6 +242,9 @@ class AppBase:
         def _cached_duration(self, path: str | None, probe: bool = True) -> float: ...
         def _cached_metadata(self, path: str | None, probe: bool = True) -> Mapping[str, Any]: ...
         def _display_name(self, path: str, filename: str | None = None) -> str: ...
+        def _song_rows_for(self, paths: Sequence[str]) -> list[SongRow]: ...
+        def _warm_library_metadata(self) -> None: ...
+        def _library_row_path(self, filename: str) -> str: ...
         def play_main(self) -> None: ...
         def pause_audio(self) -> None: ...
         def stop_audio(self, user: bool = False) -> None: ...
