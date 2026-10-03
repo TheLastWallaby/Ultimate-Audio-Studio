@@ -238,6 +238,9 @@ def scrolled_listbox(parent: tk.Misc, **kwargs: Any) -> tuple[tk.Frame, tk.Listb
     """
     kwargs.setdefault("height", 6)
     kwargs.setdefault("activestyle", "dotbox")
+    # Tk lets only one widget "own" the selection: without this, clicking a row in the playlist (or a
+    # dialog highlighting its suggested name) silently un-selects the songs chosen in the Library.
+    kwargs.setdefault("exportselection", False)
     frame = tk.Frame(parent, bg=kwargs.get("bg", BG_INPUT))
     scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL)
     listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, **kwargs)

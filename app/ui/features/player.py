@@ -293,15 +293,34 @@ class PlayerMixin(AppBase):
         self.play_guard_until = time.monotonic() + 0.45
         self.is_paused = False
 
+    def _being_replaced(self, path: str) -> bool:
+        """True (and says so) while Save Clip or Restore Original is about to swap ``path``'s file.
+
+        The player holds a playing song's file open, and Windows will not replace an open file:
+        playing it now would make the save fail with "Access is denied".
+        """
+        replacing = self._replacing_song
+        if replacing is None or Path(replacing).absolute() != Path(path).absolute():
+            return False
+        self.set_status("This song is still being saved. Press PLAY again when that has finished.", icon="⏳")
+        return True
+
     def _when_playable(
-        self, path: str, start_fn: Callable[[], None], busy_text: str = "Preparing this song for playback..."
+        self,
+        path: str,
+        start_fn: Callable[[], None],
+        busy_text: str = "Preparing this song for playback...",
+        on_failed: Callable[[], None] | None = None,
     ) -> None:
         """Run start_fn once path can be played, converting (e.g. M4A -> WAV) on a worker if needed.
 
         The conversion can take many seconds, so it never runs on the Tkinter thread. If the user
         stops or picks another song meanwhile, the stale start is dropped. When the conversion
-        fails, the user is told and start_fn is not run.
+        fails, start_fn is not run: ``on_failed`` is called, or without one the user is told. A song
+        whose file is being replaced right now (``_being_replaced``) is not started either.
         """
+        if self._being_replaced(path):
+            return
         if not self.audio_engine.needs_conversion(path):
             self._pending_play_token = None
             start_fn()
@@ -321,6 +340,9 @@ class PlayerMixin(AppBase):
             if not prepared:
                 # Starting now would repeat the failed conversion on this thread and freeze the window.
                 self.set_busy(False, "This song could not be played.")
+                if on_failed is not None:
+                    on_failed()
+                    return
                 show_friendly_error(
                     self.root, f"FFmpeg could not convert '{Path(path).name}' for playback.", "playback"
                 )
@@ -374,6 +396,9 @@ class PlayerMixin(AppBase):
         self._updating_ui = True
         self.scale_progress.config(to=dur)
         self.scale_progress.set(0)
+        # The clock goes back to the start with the slider. It kept the place where the last song (or
+        # a Test Clip) stopped, so +10s on this song jumped to ten seconds past that place.
+        self.play_start_offset = 0.0
         self.lbl_start_time.config(text=f"Start: {format_time(0)}")
         self.lbl_prog_time.config(text=f"{format_time(0)} / {format_time(dur)}")
         self.lbl_end_time.config(text=f"End: {format_time(dur)}")

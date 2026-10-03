@@ -467,10 +467,17 @@ class LibraryMixin(AppBase):
                 self.refresh_playlist_listbox()
 
     def open_library_folder(self) -> None:
+        """Show the Library folder in File Explorer (the 📁 Folder button)."""
         try:
             os.startfile(self.library_folder)
-        except Exception as e:
-            dialogs.show_warning(self.root, "Error", f"Could not open folder:\n{e}")
+        except OSError as err:
+            logger.warning("Could not open the Library folder %s: %s", self.library_folder, err)
+            dialogs.show_warning(
+                self.root,
+                "Folder Could Not Be Opened",
+                f"Your music folder could not be opened:\n{self.library_folder}\n\n"
+                "If it is on a USB drive or memory card, check that it is plugged in, then try again.",
+            )
 
     def add_external_file(self) -> None:
         files = filedialog.askopenfilenames(
