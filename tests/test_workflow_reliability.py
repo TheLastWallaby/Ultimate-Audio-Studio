@@ -19,9 +19,10 @@ from app.core.audio_engine import AudioEngine
 from app.core.file_utils import copy_file_atomic
 from app.core.task_manager import TaskManager, task_mgr
 from app.main import UltimateAudioStudio
+from app.models import DriveInfo
 from app.services import exporter
 from app.services.exporter import ExportReport
-from app.ui.features.export import export_problems
+from app.ui.features.export import DriveAnnounce, export_problems
 
 
 def _names(folder: Path) -> list[str]:
@@ -354,19 +355,29 @@ def test_clip_preview_reports_a_failed_conversion(studio: UltimateAudioStudio, t
 # --- USB drive selection and eject --------------------------------------------------------------------
 
 
+def _refresh_drives(
+    studio: UltimateAudioStudio, drives: list[tuple[str, str, str]], announce: DriveAnnounce = "always"
+) -> None:
+    """Read the drives (on a worker, as the app does) and wait until the window has shown them."""
+    with (
+        patch("app.ui.features.export.list_removable_drives", return_value=drives),
+        patch.object(studio, "_show_usb_drives", wraps=studio._show_usb_drives) as shown,
+    ):
+        studio.refresh_usb_drives(announce)
+        _pump(studio, lambda: shown.called)
+    assert studio._usb_map == {label: root for root, label, _fs in drives}
+
+
 def test_refreshing_the_drive_list_keeps_the_chosen_drive(studio: UltimateAudioStudio) -> None:
     two = [("E:\\", "USB E", "FAT32"), ("F:\\", "USB F", "FAT32")]
     three = [("D:\\", "USB D", "FAT32"), *two]
 
-    with patch("app.ui.features.export.list_removable_drives", return_value=two):
-        studio.refresh_usb_drives()
+    _refresh_drives(studio, two)
     studio.usb_choice.set("USB F")
-    with patch("app.ui.features.export.list_removable_drives", return_value=three):
-        studio.refresh_usb_drives()  # a third drive is plugged in
+    _refresh_drives(studio, three)  # a third drive is plugged in
     assert studio.usb_choice.get() == "USB F"
 
-    with patch("app.ui.features.export.list_removable_drives", return_value=three[:2]):
-        studio.refresh_usb_drives()  # the chosen drive is unplugged
+    _refresh_drives(studio, three[:2])  # the chosen drive is unplugged
     assert studio.usb_choice.get() == "USB D"
 
 
@@ -380,6 +391,7 @@ def test_finished_export_ejects_the_drive_it_was_written_to(studio: UltimateAudi
         patch.object(studio.export_ctrl, "eject_usb_drive", return_value=(True, "")) as eject,
     ):
         studio._usb_export_success(ExportReport(total=1, exported=1), "USB E", "E:\\")
+        _pump(studio, lambda: eject.called and not studio._ejecting)
 
     eject.assert_called_once_with("E:\\")
 
@@ -401,6 +413,7 @@ def test_drive_cannot_be_ejected_while_songs_are_copied_to_it(studio: UltimateAu
 
         studio._end_export("done")
         studio.eject_selected_usb()
+        _pump(studio, lambda: eject.called and not studio._ejecting)
         eject.assert_called_once_with("E:\\")
 
 
@@ -734,3 +747,112 @@ def test_empty_card_reader_slot_is_not_listed() -> None:
     ]
     # Windows' "There is no disk in the drive" box is held back while checking, then allowed again.
     assert kernel32.SetThreadErrorMode.call_count == 2
+
+
+# --- USB drive work stays off the window's thread -----------------------------------------------------
+
+
+def test_drives_are_read_on_a_worker(studio: UltimateAudioStudio) -> None:
+    threads: list[threading.Thread] = []
+
+    def _list() -> list[tuple[str, str, str]]:
+        threads.append(threading.current_thread())
+        return [("E:\\", "USB E", "FAT32")]
+
+    with patch("app.ui.features.export.list_removable_drives", side_effect=_list):
+        studio.refresh_usb_drives()
+        _pump(studio, lambda: "USB E" in studio._usb_map)
+
+    assert threads and threads[0] is not threading.main_thread()
+
+
+def test_eject_keeps_the_window_responsive(studio: UltimateAudioStudio) -> None:
+    studio._usb_map = {"USB E": "E:\\"}
+    studio.usb_choice.set("USB E")
+    windows_lets_go = threading.Event()
+
+    def _slow_eject(_root: str) -> tuple[bool, str]:
+        windows_lets_go.wait(timeout=5)
+        return True, ""
+
+    with (
+        patch.object(studio.export_ctrl, "eject_usb_drive", side_effect=_slow_eject),
+        patch("app.ui.features.export.list_removable_drives", return_value=[]),
+        patch("app.ui.dialogs.show_info") as info,
+    ):
+        studio.eject_selected_usb()  # returns at once; Windows is still working on it
+
+        assert studio._ejecting
+        assert "Ejecting" in studio.status.cget("text")
+        assert str(studio.btn_usb_eject.cget("state")) == tk.DISABLED
+        studio.eject_selected_usb()  # a second click while ejecting does nothing
+
+        windows_lets_go.set()
+        _pump(studio, lambda: info.called)
+
+    assert not studio._ejecting
+    assert info.call_args[0][1] == "Safe to Remove Hardware"
+    assert "safely ejected" in studio.status.cget("text")
+
+
+def test_export_waits_while_its_drive_is_being_ejected(studio: UltimateAudioStudio, tmp_path: Path) -> None:
+    studio._usb_map = {"USB E": str(tmp_path)}
+    studio.usb_choice.set("USB E")
+    studio._ejecting = True
+
+    with (
+        patch("app.ui.dialogs.show_info") as info,
+        patch.object(studio.export_ctrl, "start_usb_export") as start,
+    ):
+        studio._export_to_usb([str(_make_song(tmp_path / "library"))], False)
+
+    start.assert_not_called()
+    assert info.call_args[0][1] == "Drive Is Being Ejected"
+
+
+def test_unrelated_device_change_leaves_the_status_bar_alone(studio: UltimateAudioStudio) -> None:
+    drives = [("E:\\", "USB E", "FAT32")]
+    _refresh_drives(studio, drives, announce="quiet")
+    studio.set_status("Playing: My Song")
+
+    _refresh_drives(studio, drives, announce="changes")  # headphones plugged in: the drives are the same
+
+    assert studio.status.cget("text") == "Playing: My Song"
+
+
+def test_device_change_reports_a_drive_that_came_or_went(studio: UltimateAudioStudio) -> None:
+    _refresh_drives(studio, [], announce="quiet")
+
+    _refresh_drives(studio, [("E:\\", "USB E", "FAT32")], announce="changes")
+    assert studio.status.cget("text") == "USB Flash Drive detected: USB E"
+
+    _refresh_drives(studio, [], announce="changes")
+    assert studio.status.cget("text") == "USB Flash Drive unplugged."
+
+
+def test_device_change_never_covers_up_a_running_job(studio: UltimateAudioStudio) -> None:
+    _refresh_drives(studio, [], announce="quiet")
+    studio.set_busy(True, "Exporting song 3 of 12...")
+
+    _refresh_drives(studio, [("E:\\", "USB E", "FAT32")], announce="changes")
+
+    assert studio.status.cget("text") == "Exporting song 3 of 12..."
+    studio.set_busy(False)
+
+
+def test_refresh_button_always_reports_what_it_found(studio: UltimateAudioStudio) -> None:
+    drives = [("E:\\", "USB E", "FAT32")]
+    _refresh_drives(studio, drives, announce="quiet")
+
+    _refresh_drives(studio, drives)  # the 🔄 button
+
+    assert studio.status.cget("text") == "Found 1 USB flash drive(s)."
+
+
+def test_older_drive_scan_is_not_shown_over_a_newer_one(studio: UltimateAudioStudio) -> None:
+    _refresh_drives(studio, [("F:\\", "USB F", "FAT32")], announce="quiet")
+    stale_scan = studio._usb_scan_id - 1
+
+    studio._show_usb_drives(stale_scan, [DriveInfo("E:\\", "USB E", "FAT32")], "always")
+
+    assert studio._usb_map == {"USB F": "F:\\"}

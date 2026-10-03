@@ -8,10 +8,12 @@ import os
 import tkinter as tk
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 from app.config import sanitize_filename
 from app.core.cache_manager import cache_mgr
 from app.core.task_manager import task_mgr
+from app.models import DriveInfo
 from app.platform_utils import find_windows_media_player, list_removable_drives
 from app.services.exporter import ExportReport
 from app.ui import dialogs
@@ -21,6 +23,9 @@ from app.ui.features.base import AppBase
 logger = logging.getLogger(__name__)
 
 EXPORT_BUTTON_TEXT = "⚡ Export Playlist Now"
+
+# What a drive scan reports in the status bar: everything, only a drive that came or went, or nothing.
+DriveAnnounce = Literal["always", "changes", "quiet"]
 
 
 def _listed(names: Sequence[str], limit: int = 6) -> str:
@@ -61,48 +66,76 @@ class ExportMixin(AppBase):
 
     # Root of the USB drive an export is writing to right now; it must not be ejected meanwhile.
     _export_drive_root: str | None = None
+    # True while a drive is being ejected on a worker; a second eject, or an export, must wait.
+    _ejecting = False
+    # Numbers the drive scans, so the answer of an older, slower scan is not shown over a newer one.
+    _usb_scan_id = 0
 
     def _on_usb_hotplug(self) -> None:
+        """Re-read the drives after Windows reports a device change (debounced: one change sends several)."""
         if getattr(self, "_is_shutting_down", False):
             return
         if self._timer_hotplug_debounce:
-            try:
+            with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(self._timer_hotplug_debounce)
-            except Exception:
-                pass
 
         def _do_hotplug() -> None:
-            if getattr(self, "_is_shutting_down", False):
-                return
-            old_keys = set(self._usb_map.keys())
-            self.refresh_usb_drives()
-            new_keys = set(self._usb_map.keys())
-            added = new_keys - old_keys
-            if added:
-                new_drive = list(added)[0]
-                self.set_status(f"USB Flash Drive detected: {new_drive}", icon="💾")
-            elif old_keys - new_keys:
-                self.set_status("USB Flash Drive unplugged.", icon="ℹ️")
+            self._timer_hotplug_debounce = None
+            if not getattr(self, "_is_shutting_down", False):
+                # Headphones and Bluetooth devices send the same message; only a USB drive that came
+                # or went is worth a word in the status bar.
+                self.refresh_usb_drives(announce="changes")
 
         self._timer_hotplug_debounce = self.root.after(800, _do_hotplug)
 
-    def refresh_usb_drives(self) -> None:
-        """Re-read the plugged-in USB drives, keeping the chosen one selected while it is still there."""
+    def refresh_usb_drives(self, announce: DriveAnnounce = "always") -> None:
+        """Re-read the plugged-in USB drives on a worker; the list updates when they have been read.
+
+        Reading a drive can take seconds (a waking hard disk, a slow card reader), so it never runs
+        on the window's thread. ``announce`` says what the status bar reports: everything (the 🔄
+        button), only a drive that came or went (device changes), or nothing (start-up).
+        """
+        self._usb_scan_id += 1
+        scan_id = self._usb_scan_id
+
+        def _worker() -> None:
+            drives = list_removable_drives()
+            if not getattr(self, "_is_shutting_down", False):
+                self._safe_after(0, self._show_usb_drives, scan_id, drives, announce)
+
+        task_mgr.submit_task(_worker)
+
+    def _show_usb_drives(self, scan_id: int, drives: Sequence[DriveInfo], announce: DriveAnnounce) -> None:
+        """Fill the drive list, keeping the chosen drive selected while it is still plugged in."""
+        if scan_id != self._usb_scan_id or getattr(self, "_is_shutting_down", False):
+            return  # a newer scan is on its way
         previous = self.usb_choice.get()
-        drives = list_removable_drives()
+        old_labels = set(self._usb_map)
         self._usb_map = {label: path for path, label, _ in drives}
         self._usb_fs_map = {label: fs for _, label, fs in drives}
-        options = list(self._usb_map.keys())
+        options = list(self._usb_map)
         self.cmb_usb["values"] = options
         if options:
             # Plugging in a second drive must not switch the export (or the eject) to it unasked.
             self.cmb_usb.current(options.index(previous) if previous in options else 0)
-            self.set_status(f"Found {len(options)} USB flash drive(s).")
         else:
             self.usb_choice.set("No USB drives detected")
-            self.set_status("No USB flash drives found. Plug in a USB drive and click 🔄.")
-        if hasattr(self, "btn_usb_eject") and self.btn_usb_eject:
+        if hasattr(self, "btn_usb_eject") and self.btn_usb_eject and not self._ejecting:
             self.btn_usb_eject.config(state=tk.NORMAL if options else tk.DISABLED)
+
+        added = [label for label in options if label not in old_labels]
+        removed = old_labels - set(options)
+        if announce == "quiet" or self._busy:
+            return  # never cover up the progress of a download or an export
+        if added and announce == "changes":
+            self.set_status(f"USB Flash Drive detected: {added[0]}", icon="💾")
+        elif removed and announce == "changes":
+            self.set_status("USB Flash Drive unplugged.", icon="ℹ️")
+        elif announce == "always":
+            if options:
+                self.set_status(f"Found {len(options)} USB flash drive(s).")
+            else:
+                self.set_status("No USB flash drives found. Plug in a USB drive and click 🔄.")
 
     def eject_selected_usb(self) -> None:
         """Eject the drive chosen in the list (the Eject button)."""
@@ -113,7 +146,11 @@ class ExportMixin(AppBase):
         self._eject_drive(choice, self._usb_map[choice])
 
     def _eject_drive(self, choice: str, drive_path: str) -> None:
-        """Safely eject one specific drive and tell the user whether it can be unplugged."""
+        """Safely eject one specific drive on a worker, then tell the user whether it can be unplugged.
+
+        Windows can take several seconds to let a drive go, so the window stays responsive and says
+        "Ejecting..." meanwhile.
+        """
         exporting_to = self._export_drive_root
         if exporting_to is not None and Path(drive_path) == Path(exporting_to):
             dialogs.show_info(
@@ -123,16 +160,33 @@ class ExportMixin(AppBase):
                 "Wait for the export to finish, or click 'Stop Export' first.",
             )
             return
-        ok, msg = self.export_ctrl.eject_usb_drive(drive_path)
-        self.refresh_usb_drives()
+        if self._ejecting:
+            return
+        self._ejecting = True
+        if hasattr(self, "btn_usb_eject") and self.btn_usb_eject:
+            self.btn_usb_eject.config(state=tk.DISABLED)
+        self.set_busy(True, f"Ejecting the USB drive ({choice})... Please wait before unplugging it.")
+
+        def _worker() -> None:
+            ok, msg = self.export_ctrl.eject_usb_drive(drive_path)
+            self._safe_after(0, self._eject_finished, choice, ok, msg)
+
+        task_mgr.submit_task(_worker)
+
+    def _eject_finished(self, choice: str, ok: bool, msg: str) -> None:
+        """Report the eject, and read the drives again (the ejected one is gone from the list)."""
+        self._ejecting = False
+        self.set_busy(False)
+        self.refresh_usb_drives(announce="quiet")
         if ok:
+            self.set_status(f"USB drive {choice} safely ejected.")
             dialogs.show_info(
                 self.root,
                 "Safe to Remove Hardware",
                 f"The USB drive ({choice}) was safely ejected.\n\nYou may now unplug it.",
             )
-            self.set_status(f"USB drive {choice} safely ejected.")
         else:
+            self.set_status(f"USB drive {choice} was not ejected.", icon="⚠️")
             dialogs.show_warning(
                 self.root,
                 "Ejection Failed",
@@ -183,6 +237,12 @@ class ExportMixin(AppBase):
         if not choice or choice not in self._usb_map:
             dialogs.show_warning(
                 self.root, "No USB Drive", "Please insert a USB flash drive and select it from the list."
+            )
+            return
+
+        if self._ejecting:
+            dialogs.show_info(
+                self.root, "Drive Is Being Ejected", "Wait until the USB drive has been ejected, then try again."
             )
             return
 

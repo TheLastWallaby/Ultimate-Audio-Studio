@@ -281,7 +281,7 @@ class UltimateAudioStudio(
         self.build_column_2()
         self.build_column_3()
         self._balance_columns()
-        self.refresh_usb_drives()
+        self.refresh_usb_drives(announce="quiet")
         self._setup_drag_and_drop()
         self._install_exception_hooks()
         self._watch_settings_changes()
