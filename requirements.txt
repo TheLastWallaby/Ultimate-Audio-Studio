@@ -1,5 +1,5 @@
 pygame>=2.6
-yt-dlp[default,deno]>=2026.8.19
+yt-dlp[default,deno]>=2026.10.21
 tinytag>=2.1
 certifi
 send2trash>=1.8
