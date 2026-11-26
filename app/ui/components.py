@@ -148,6 +148,26 @@ def create_button(
     return btn
 
 
+def wrap_to_width(label: tk.Label) -> None:
+    """Wrap ``label``'s text at the width the label is given, instead of a fixed pixel count.
+
+    A fixed ``wraplength`` is in physical pixels, so at 200% display scaling a song title wrapped
+    after a word or two, grew seven lines tall, and pushed Save Clip below the bottom of the window.
+    The label must be packed with ``fill=tk.X``. It asks for almost no width of its own
+    (``width=1``): a label that asked for its wrap width would hold its column open, so the column
+    could never shrink again when the window does.
+    """
+    label.configure(width=1)
+    inset = 2 * sum(int(str(label.cget(opt))) for opt in ("padx", "borderwidth", "highlightthickness"))
+
+    def _rewrap(event: tk.Event[tk.Misc]) -> None:
+        wrap = max(1, event.width - inset)
+        if str(label.cget("wraplength")) != str(wrap):
+            label.configure(wraplength=wrap)
+
+    label.bind("<Configure>", _rewrap, add="+")
+
+
 class ScrollableFrame(tk.Frame):
     """A panel whose content (built into ``self.body``) scrolls when the window is too small.
 
@@ -182,6 +202,10 @@ class ScrollableFrame(tk.Frame):
         if cw <= 1 or ch <= 1:
             return
         rw, rh = self.body.winfo_reqwidth(), self.body.winfo_reqheight()
+        if self._footer is not None and str(self.canvas.cget("height")) != str(rh):
+            # Asking for the content's full height lets the grid give the canvas only what it needs,
+            # so the footer sits right under the content and drops to the bottom edge only when short.
+            self.canvas.configure(height=rh)
         w, h = max(cw, rw), max(ch, rh)
         self.canvas.itemconfigure(self._window, width=w, height=h)
         self.canvas.configure(scrollregion=(0, 0, w, h))
@@ -194,6 +218,24 @@ class ScrollableFrame(tk.Frame):
             bar.grid(**grid_kwargs)
         elif not show and bar.winfo_ismapped():
             bar.grid_remove()
+
+    _footer: tk.Frame | None = None
+
+    def add_footer(self) -> tk.Frame:
+        """A strip below the scrolling area that always stays in view, for a column's main buttons.
+
+        When the window is too short (a 200% display scaling, a larger Text Size), the panel scrolls;
+        buttons at the end of a scrolled panel are off screen, and people did not find them. While
+        everything fits, the footer follows the content instead of leaving a gap above it.
+        """
+        if self._footer is None:
+            self._footer = tk.Frame(self, bg=self.cget("bg"))
+            self._footer.grid(row=2, column=0, columnspan=2, sticky="ew")
+            # Spare height goes to this empty row below the footer, not to the canvas above it; when
+            # height is short, this row is already empty, so the canvas gives up the difference.
+            self.rowconfigure(3, weight=1_000_000)
+            self._schedule_relayout()
+        return self._footer
 
     def can_scroll(self) -> bool:
         return self.body.winfo_reqheight() > self.canvas.winfo_height()
