@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING
 
-from app.ui.components import ToolTip, create_button, jump_to_click
+from app.ui.components import ToolTip, create_button, jump_to_click, wrap_to_width
 from app.ui.theme import (
     BG_CARD,
     BG_SUB_CARD,
@@ -45,8 +45,12 @@ if TYPE_CHECKING:
     from app.main import UltimateAudioStudio
 
 
-def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
-    """Construct Step 2 UI widgets on parent container and attach references to app."""
+def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio, footer: tk.Misc | None = None) -> None:
+    """Construct Step 2 UI widgets on parent container and attach references to app.
+
+    Test Clip, Save Clip and Restore Original go into ``footer`` when one is given: a strip that
+    stays in view when the rest of the column has to scroll.
+    """
     # Header Badge
     f_hdr = tk.Frame(parent, bg="#fef3c7", padx=8, pady=4, highlightbackground="#fcd34d", highlightthickness=1)
     f_hdr.pack(fill=tk.X, pady=(0, 6))
@@ -74,10 +78,10 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
         font=FONT_HERO_TITLE,
         fg=COLOR_ACCENT,
         bg=BG_SUB_CARD,
-        wraplength=260,
         justify="left",
         anchor="w",
     )
+    wrap_to_width(app.lbl_selected)
     app.lbl_selected.pack(fill=tk.X)
 
     app.lbl_selected_artist = tk.Label(
@@ -86,10 +90,10 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
         font=FONT_HERO_ARTIST,
         fg=TEXT_MUTED,
         bg=BG_SUB_CARD,
-        wraplength=260,
         justify="left",
         anchor="w",
     )
+    wrap_to_width(app.lbl_selected_artist)
     app.lbl_selected_artist.pack(fill=tk.X, pady=(1, 2))
 
     f_state_row = tk.Frame(f_track_info, bg=BG_SUB_CARD)
@@ -480,17 +484,18 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     app.cmb_fade_dur.pack(side=tk.LEFT, padx=(3, 0))
     ToolTip(app.cmb_fade_dur, "Choose fade duration for clip transitions")
 
-    # Gain Boost Control
+    # Gain Boost Control: label, slider and Reset share one row, to keep Save Clip on screen at 200% scaling.
     f_gain = tk.Frame(parent, bg=BG_SUB_CARD, padx=4, pady=2, highlightbackground=BORDER_MAIN, highlightthickness=1)
     f_gain.pack(fill=tk.X, pady=1)
-    f_gain_top = tk.Frame(f_gain, bg=BG_SUB_CARD)
-    f_gain_top.pack(fill=tk.X)
-    app.lbl_gain = tk.Label(f_gain_top, text="Volume Boost: 0 dB", font=FONT_BODY_BOLD, fg=TEXT_DARK, bg=BG_SUB_CARD)
+    # Wide enough for "Volume Boost: +12.0 dB", so the slider does not change length while it is dragged.
+    app.lbl_gain = tk.Label(
+        f_gain, text="Volume Boost: 0 dB", font=FONT_BODY_BOLD, fg=TEXT_DARK, bg=BG_SUB_CARD, width=21, anchor="w"
+    )
     app.lbl_gain.pack(side=tk.LEFT)
     btn_res_gain = create_button(
-        f_gain_top, "Reset", app.reset_gain, bg=COLOR_BTN_NEUTRAL, fg=TEXT_DARK, font=FONT_BTN_SUB, pady=1, padx=4
+        f_gain, "Reset", app.reset_gain, bg=COLOR_BTN_NEUTRAL, fg=TEXT_DARK, font=FONT_BTN_SUB, pady=1, padx=4
     )
-    btn_res_gain.pack(side=tk.RIGHT)
+    btn_res_gain.pack(side=tk.RIGHT, padx=(4, 0))
 
     app.scale_gain = tk.Scale(
         f_gain,
@@ -508,11 +513,12 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     register_scaled(app.scale_gain, width=20, sliderlength=30)
     jump_to_click(app.scale_gain)
     app.scale_gain.set(0.0)
-    app.scale_gain.pack(fill=tk.X)
+    app.scale_gain.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
     # Final Clip Action Buttons
-    f_actions = tk.Frame(parent, bg=BG_CARD)
-    f_actions.pack(fill=tk.X, pady=(3, 0))
+    actions_parent = parent if footer is None else footer
+    f_actions = tk.Frame(actions_parent, bg=BG_CARD)
+    f_actions.pack(fill=tk.X, pady=(6, 0))
 
     if not hasattr(app, "loop_clip"):
         app.loop_clip = tk.BooleanVar(value=False)
@@ -556,7 +562,7 @@ def build_step2_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     ToolTip(app.btn_save_clip, "Save the part between Start and End as a new song in your Library")
 
     # Only shown for a song that a clip was saved over (its untrimmed original is kept as a backup).
-    app.f_restore_original = tk.Frame(parent, bg=BG_CARD)
+    app.f_restore_original = tk.Frame(actions_parent, bg=BG_CARD)
     app.f_restore_original.pack(fill=tk.X)
     app.btn_restore_original = create_button(
         app.f_restore_original,

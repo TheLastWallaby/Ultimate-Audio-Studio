@@ -896,7 +896,7 @@ class UltimateAudioStudio(
         build_step1_view(self.col1.body, self)
 
     def build_column_2(self) -> None:
-        build_step2_view(self.col2.body, self)
+        build_step2_view(self.col2.body, self, footer=self.col2.add_footer())
         self.waveform_view = WaveformView(self.canvas_waveform, self)
 
     def build_column_3(self) -> None:

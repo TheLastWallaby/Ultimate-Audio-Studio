@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING
 
-from app.ui.components import ToolTip, create_button, scrolled_listbox
+from app.ui.components import ToolTip, create_button, scrolled_listbox, wrap_to_width
 from app.ui.theme import (
     BG_CARD,
     BG_INPUT,
@@ -48,15 +48,17 @@ def build_step1_view(parent: tk.Misc, app: UltimateAudioStudio) -> None:
     )
     f_yt_box.pack(fill=tk.X, pady=(0, 6))
 
-    tk.Label(
+    lbl_yt_prompt = tk.Label(
         f_yt_box,
         text="Enter Song & Artist, or Paste YouTube Link:",
         font=FONT_SECTION_HDR,
         fg=TEXT_DARK,
         bg=BG_SUB_CARD,
-        wraplength=300,
         justify="left",
-    ).pack(anchor="w")
+        anchor="w",
+    )
+    wrap_to_width(lbl_yt_prompt)
+    lbl_yt_prompt.pack(fill=tk.X)
     app.entry_url = tk.Entry(
         f_yt_box,
         font=FONT_BODY,
