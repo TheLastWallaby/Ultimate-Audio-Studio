@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from app.config import ffmpeg_path, is_valid_binary
+from app.core.cache_manager import cache_mgr
 from app.core.metadata import read_track_metadata
 from app.core.process_utils import ProcessResult, run_ffmpeg
 from app.main import UltimateAudioStudio
@@ -190,6 +191,9 @@ def test_a_title_that_cannot_be_written_is_reported(studio: UltimateAudioStudio,
     studio.library_folder = str(library)
     studio._load_waveform = lambda _path: None  # type: ignore[method-assign]
     studio._load_album_art = lambda _path: None  # type: ignore[method-assign]
+    # Known details mean no background reader opens the song: Windows would then refuse the rename
+    # ("in use") before the title is ever written, as it did on GitHub's runner.
+    cache_mgr.set_metadata(studio._library_row_path("old.mp3"), {"title": "Old", "artist": "", "duration": 100.0})
     studio.refresh_library()
     studio.listbox_lib.selection_set(studio.visible_files.index("old.mp3"))
     status: list[str] = []
