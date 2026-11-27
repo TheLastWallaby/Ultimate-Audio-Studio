@@ -178,16 +178,24 @@ def create_audition_slice(
 ClipCover = Literal["copy", "mjpeg", "none"]
 
 
-def _clip_args(filepath: str, s_time: float, dur: float, audio_filter: str, wav: bool, cover: ClipCover) -> list[str]:
-    """FFmpeg arguments (without the output file) that cut one clip out of ``filepath``."""
+def _clip_args(
+    filepath: str, s_time: float, dur: float, audio_filter: str, wav: bool, cover: ClipCover, title: str | None = None
+) -> list[str]:
+    """FFmpeg arguments (without the output file) that cut one clip out of ``filepath``.
+
+    ``title`` replaces the song's title tag; without it the clip keeps the song's title.
+    """
+    # The Library list shows the title tag: a clip saved under a new name would otherwise be listed
+    # under the full song's title, and look like a second copy of it.
+    retitle = ["-metadata", f"title={title}"] if title else []
     if wav:
         args = ["-y", "-accurate_seek", "-ss", f"{s_time:.3f}", "-i", filepath, "-t", f"{dur:.3f}"]
-        return args + ["-af", audio_filter, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"]
+        return args + ["-af", audio_filter, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le"] + retitle
     # Place -ss after -i for MP3 so stream 0:v (attached cover art at t=0) is preserved
     args = ["-y", "-i", filepath, "-ss", f"{s_time:.3f}", "-t", f"{dur:.3f}", "-af", audio_filter]
     if cover == "none":
-        return args + mp3_audio_only_args()
-    return args + mp3_output_args(cover)
+        return args + mp3_audio_only_args() + retitle
+    return args + mp3_output_args(cover) + retitle
 
 
 def _has_content(path: Path) -> bool:
@@ -215,11 +223,13 @@ def clip_audio_worker(
     on_success: Callable[[str, str, bool], None] | None = None,
     on_error: Callable[[str], None] | None = None,
     fade_sec: float = 1.5,
+    title: str | None = None,
 ) -> None:
     """Export sample-accurate clipped audio file with backup protection and Windows lock retries.
 
     When the clip replaces the song it was cut from, the song is only replaced once a complete
     backup of the original exists; otherwise the save fails and the song is left as it was.
+    ``title`` is stored as the clip's title tag (for a clip saved as a new song).
     """
     source = str(filepath)
     target = Path(save_name)
@@ -246,7 +256,7 @@ def clip_audio_worker(
             with contextlib.suppress(OSError):
                 tmp_save.unlink()
             result = run_ffmpeg(
-                _clip_args(source, s_time, dur, audio_filter, wav, cover) + [str(tmp_save)], timeout=timeout
+                _clip_args(source, s_time, dur, audio_filter, wav, cover, title) + [str(tmp_save)], timeout=timeout
             )
             if result.returncode == 0 and _has_content(tmp_save):
                 break
