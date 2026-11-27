@@ -389,6 +389,8 @@ class ClipEditorMixin(AppBase):
             _on_succ,
             _on_err,
             fade_sec=fade_sec,
+            # A clip saved as a new song is listed under the name it was given, not the full song's title.
+            title=None if is_self_overwrite else target.stem,
         )
 
     def _save_success(self, name: str, full_path: str, was_self_overwrite: bool, note: str = "") -> None:

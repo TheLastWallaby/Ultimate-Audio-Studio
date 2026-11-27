@@ -20,6 +20,7 @@ from app.core.metadata import read_track_metadata
 from app.core.task_manager import task_mgr
 from app.models import SongRow
 from app.platform_utils import has_recycle_bin
+from app.services.tagger import TitleWriteError, can_write_title, write_title
 from app.ui import dialogs
 from app.ui.components import listbox_selection
 from app.ui.error_dialog import show_error, show_friendly_error
@@ -604,11 +605,24 @@ class LibraryMixin(AppBase):
         old_name = self.visible_files[sel[0]]
         old_path = self._library_row_path(old_name)
         old = Path(old_name)
+        if self._replacing_song is not None:
+            self.set_status("A song is still being saved. Rename this one when that has finished.", icon="⏳")
+            return
 
         answer = dialogs.ask_text(
             self.root, "Rename Song", "Type a new name for this song:", initial=old.stem, ok="Rename song"
         )
-        if answer is None or answer.text == old.stem:
+        if answer is None:
+            return
+        if answer.text == old.stem:
+            # Songs renamed by earlier versions kept their old title: renaming one to the name it already
+            # has puts that name in the list too.
+            shown = str(self._cached_metadata(old_path, probe=False).get("title") or "")
+            if shown and shown != old.stem:
+                is_loaded = _same_song(self.selected_file_path, old_path)
+                if is_loaded:
+                    self.stop_audio()
+                self._write_song_title(old_path, old_name, reload_player=is_loaded)
             return
         new_name = sanitize_filename(answer.text) + old.suffix
         new_path = self._library_row_path(new_name)
@@ -636,12 +650,63 @@ class LibraryMixin(AppBase):
             return
         if _same_song(self._pending_library_song, old_path):
             self._pending_library_song = new_path
+        if is_loaded:
+            self.selected_file_path = new_path  # PLAY waits for the title (``_being_replaced``), then plays it
         self.save_playlists()
         self.refresh_playlist_listbox()
         self.refresh_library(select_name=new_name)
-        if is_loaded:
-            self._load_track_ui(new_path, new_name)
-        self.set_status(f"Renamed song to: {new_name}")
+        self._write_song_title(new_path, new_name, reload_player=is_loaded)
+
+    def _write_song_title(self, path: str, name: str, reload_player: bool) -> None:
+        """Store the song's file name as its title on a worker, so the list and the player show it.
+
+        The lists, the player and car stereos show the title inside the song: renaming only the file
+        left the old title showing. ``reload_player`` puts the song back in the player afterwards.
+        """
+        if not can_write_title(path):
+            if reload_player:
+                self._load_track_ui(path, name)
+            self.set_status(f"Renamed song to: {Path(name).stem}")
+            return
+        if reload_player:
+            self._release_audio_file()  # Windows will not replace a file the player holds open
+        self._replacing_song = path
+        self.set_busy(True, f"Renaming song to: {Path(name).stem}...")
+
+        def _worker() -> None:
+            try:
+                write_title(path, Path(name).stem)
+            except TitleWriteError as err:
+                logger.warning("The title of %s could not be changed: %s", name, err)
+                self._safe_after(0, self._song_title_written, path, name, reload_player, False)
+                return
+            self._safe_after(0, self._song_title_written, path, name, reload_player, True)
+
+        if task_mgr.submit_task(_worker) is None:  # the app is closing
+            self._replacing_song = None
+            self.set_busy(False)
+
+    def _song_title_written(self, path: str, name: str, reload_player: bool, written: bool) -> None:
+        """Show a renamed song under its new title (``written``) or say that its old title stays."""
+        if _same_song(self._replacing_song, path):
+            self._replacing_song = None
+        cache_mgr.invalidate(path)
+        self.library_ctrl.invalidate_search_index(path)
+        self._known_rows().pop(path, None)
+        self._art_cache.pop(path, None)
+        self.refresh_library(preserve_view=True)
+        self.refresh_playlist_listbox()
+        if reload_player and _same_song(self.selected_file_path, path):
+            self._load_track_ui(path, name)
+        if written:
+            self.set_busy(False, f"Renamed song to: {Path(name).stem}")
+            return
+        self.set_busy(False)
+        self.set_status(
+            f"The song file is now called '{name}', but the name shown in the list could not be changed. "
+            "Close any other program that is using the song, then rename it again.",
+            icon="⚠️",
+        )
 
     def delete_library_file(self) -> None:
         """Move every selected song to the Recycle Bin (one confirmation, one Undo)."""
